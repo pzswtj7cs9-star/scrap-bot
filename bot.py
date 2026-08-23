@@ -475,6 +475,61 @@ def main():
 import psycopg2
 from psycopg2.extras import RealDictCursor
 from contextlib import contextmanager
+async def cmd_prices(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_ID:
+        await update.message.reply_text("هذا الأمر للأدمن فقط.")
+        return
+    try:
+        catalog = get_catalog_from_db()
+        text = "📋 *الأسعار الحالية من قاعدة البيانات:*\n\n"
+        for p in catalog:
+            text += f"{p['part_id']}. {p['name']}\n   شراء: {p['buy_min']}-{p['buy_max']} | بيع: {p['sell_min']}-{p['sell_max']}\n"
+            if len(text) > 3500:
+                await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
+                text = ""
+        if text:
+            await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
+    except Exception as e:
+        await update.message.reply_text(f"خطأ: {e}")
+
+async def cmd_update_price(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_ID:
+        await update.message.reply_text("هذا الأمر للأدمن فقط.")
+        return
+    
+    # الاستخدام: /update_price 1 3 5 6 18
+    # المعنى: رقم القطعة | شراء أدنى | شراء أعلى | بيع أدنى | بيع أعلى
+    args = context.args
+    if len(args) != 5:
+        await update.message.reply_text(
+            "الاستخدام:\n/update_price رقم_القطعة شراء_أدنى شراء_أعلى بيع_أدنى بيع_أعلى\n\n"
+            "مثال:\n/update_price 1 3 5 6 18"
+        )
+        return
+    
+    try:
+        part_id = int(args[0])
+        buy_min = float(args[1])
+        buy_max = float(args[2])
+        sell_min = float(args[3])
+        sell_max = float(args[4])
+        
+        with get_db() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    UPDATE prices 
+                    SET buy_min = %s, buy_max = %s, sell_min = %s, sell_max = %s
+                    WHERE part_id = %s
+                """, (buy_min, buy_max, sell_min, sell_max, part_id))
+                
+                if cur.rowcount == 0:
+                    await update.message.reply_text("ما لقيت قطعة بهذا الرقم.")
+                    return
+        
+        await update.message.reply_text(f"✅ تم تحديث القطعة رقم {part_id} بنجاح.")
+    except Exception as e:
+        await update.message.reply_text(f"خطأ: {e}")
 if __name__ == "__main__":
 
-main()
+main(    init_db()   # إنشاء الجدول وإدخال البيانات إذا لزم    app.add_handler(CommandHandler("prices", cmd_prices))
+    app.add_handler(CommandHandler("update_price", cmd_update_price)
