@@ -532,7 +532,7 @@ async def cmd_update_price(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         await update.message.reply_text(f"خطأ: {e}")
 def main():
-    init_db()
+    # init_db()
 
     if not TELEGRAM_TOKEN:
         log.error("TELEGRAM_BOT_TOKEN غير موجود")
