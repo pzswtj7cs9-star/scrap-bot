@@ -26,7 +26,72 @@ from telegram.ext import (
 )
 
 load_dotenv()
+DATABASE_URL = os.getenv("DATABASE_URL")
+ADMIN_ID = 678180992
 
+@contextmanager
+def get_db():
+    conn = psycopg2.connect(DATABASE_URL)
+    try:
+        yield conn
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+def init_db():
+    with get_db() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS prices (
+                    id SERIAL PRIMARY KEY,
+                    part_id INTEGER UNIQUE NOT NULL,
+                    name VARCHAR(100) NOT NULL,
+                    weight_kg VARCHAR(20),
+                    weight_avg DECIMAL(6,2),
+                    type VARCHAR(50),
+                    buy_min DECIMAL(8,2),
+                    buy_max DECIMAL(8,2),
+                    sell_min DECIMAL(8,2),
+                    sell_max DECIMAL(8,2),
+                    notes TEXT DEFAULT ''
+                );
+            """)
+            cur.execute("SELECT COUNT(*) FROM prices;")
+            count = cur.fetchone()[0]
+            if count == 0:
+                with open(CATALOG_PATH, "r", encoding="utf-8") as f:
+                    catalog = json.load(f)
+                for p in catalog:
+                    cur.execute("""
+                        INSERT INTO prices (part_id, name, weight_kg, weight_avg, type, 
+                                           buy_min, buy_max, sell_min, sell_max, notes)
+                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                        ON CONFLICT (part_id) DO NOTHING;
+                    """, (
+                        p["id"], p["name"], p.get("weight_kg"), p.get("weight_avg"),
+                        p.get("type"), p.get("buy_min"), p.get("buy_max"),
+                        p.get("sell_min"), p.get("sell_max"), p.get("notes", "")
+                    ))
+                log.info("تم إدخال بيانات الكتالوج في قاعدة البيانات")
+
+def get_catalog_from_db():
+    with get_db() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("SELECT * FROM prices ORDER BY part_id;")
+            return [dict(row) for row in cur.fetchall()]
+
+def build_catalog_text(catalog):
+    lines = []
+    for p in catalog:
+        line = (f"{p['part_id']}. {p['name']} | وزن {p['weight_kg']} كجم | نوع: {p['type']} | "
+                f"بيع {p['sell_min']}-{p['sell_max']} ر.س | شراء {p['buy_min']}-{p['buy_max']} ر.س")
+        if p.get("notes"):
+            line += f" | ملاحظة: {p['notes']}"
+        lines.append(line)
+    return "\n".join(lines)
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.7-flash")
@@ -407,6 +472,9 @@ def main():
     log.info("Bot started | model=%s", GEMINI_MODEL)
     app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
 
-
+import psycopg2
+from psycopg2.extras import RealDictCursor
+from contextlib import contextmanager
 if __name__ == "__main__":
-    main()
+
+main()
