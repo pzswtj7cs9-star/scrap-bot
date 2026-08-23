@@ -11,7 +11,9 @@ import logging
 import time
 from pathlib import Path
 from collections import defaultdict
-
+import psycopg2
+from psycopg2.extras import RealDictCursor
+from contextlib import contextmanager
 from dotenv import load_dotenv
 import google.generativeai as genai
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
