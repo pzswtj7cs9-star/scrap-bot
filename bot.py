@@ -556,7 +556,7 @@ def main():
     app.add_handler(CallbackQueryHandler(on_callback))
 
     log.info("البوت بدأ التشغيل...")
-    app.run_polling(allowed_updates=Update.ALL_TYPES)
+    app.run_polling()
 
 if __name__ == "__main__":
     main()
