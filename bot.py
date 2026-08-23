@@ -529,12 +529,16 @@ async def cmd_update_price(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"✅ تم تحديث القطعة رقم {part_id} بنجاح.")
     except Exception as e:
         await update.message.reply_text(f"خطأ: {e}")
-if __name__ == "__main__":
-    def main():
-    init_db()   # هذا السطر في البداية داخل الدالة
+def main():
+    init_db()
+
+    if not TELEGRAM_TOKEN:
+        log.error("TELEGRAM_BOT_TOKEN غير موجود")
+        return
 
     app = Application.builder().token(TELEGRAM_TOKEN).build()
 
+    # الأوامر
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(CommandHandler("table", cmd_table))
@@ -542,8 +546,15 @@ if __name__ == "__main__":
     app.add_handler(CommandHandler("prices", cmd_prices))
     app.add_handler(CommandHandler("update_price", cmd_update_price))
 
-    # باقي الـ handlers الموجودة عندك (MessageHandler وغيرها)
+    # استقبال الصور
+    app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
+    app.add_handler(MessageHandler(filters.Document.IMAGE, handle_document_image))
 
-    app.run_polling()
+    # الأزرار
+    app.add_handler(CallbackQueryHandler(on_callback))
 
-(    
+    log.info("البوت بدأ التشغيل...")
+    app.run_polling(allowed_updates=Update.ALL_TYPES)
+
+if __name__ == "__main__":
+    main()
