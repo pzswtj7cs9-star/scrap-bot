@@ -71,86 +71,158 @@ class PerformanceLog:
     def all_signals(self) -> list[dict[str, Any]]:
         return self._load()
 
-    def update_open_outcomes(self) -> list[dict[str, Any]]:
-        """يفحص الإشارات المفتوحة مقابل الأسعار الحالية/التاريخية."""
+    def update_open_outcomes(self, prefer_intraday: bool = True) -> list[dict[str, Any]]:
+        """يفحص الإشارات المفتوحة. يعيد قائمة الأحداث الجديدة للتنبيه."""
         rows = self._load()
-        changed: list[dict[str, Any]] = []
+        events: list[dict[str, Any]] = []
+        dirty = False
         for row in rows:
             if row.get("status") != "open":
                 continue
-            updated = self._evaluate_row(row)
-            if updated:
-                changed.append(row)
-        if changed:
+            row.setdefault("hit_tp1", False)
+            row.setdefault("hit_tp2", False)
+            row.setdefault("hit_tp3", False)
+            new_events = self._evaluate_row(row, prefer_intraday=prefer_intraday)
+            if new_events:
+                dirty = True
+                for ev in new_events:
+                    events.append(ev)
+        if dirty:
             self._save(rows)
-        return changed
+        return events
 
-    def _evaluate_row(self, row: dict[str, Any]) -> bool:
+    def _fetch_bars(self, symbol: str, opened: datetime, prefer_intraday: bool):
+        t = yf.Ticker(symbol)
+        age_hours = (_now() - opened).total_seconds() / 3600
+        # للإشارات الحديثة: شموع 5 دقائق أدق لمتابعة الوقف/الأهداف
+        if prefer_intraday and age_hours <= 72:
+            try:
+                df5 = t.history(period="5d", interval="5m", auto_adjust=True)
+                if df5 is not None and not df5.empty:
+                    return df5, "5m"
+            except Exception:
+                pass
+        start = (opened - timedelta(days=1)).strftime("%Y-%m-%d")
+        df = t.history(start=start, interval="1d", auto_adjust=True)
+        return df, "1d"
+
+    def _evaluate_row(self, row: dict[str, Any], prefer_intraday: bool = True) -> list[dict[str, Any]]:
         symbol = row["symbol"]
+        events: list[dict[str, Any]] = []
         try:
             opened = datetime.fromisoformat(row["opened_at"])
             if opened.tzinfo is None:
                 opened = opened.replace(tzinfo=NY)
-            # اجلب من يوم الفتح إلى الآن
-            start = (opened - timedelta(days=1)).strftime("%Y-%m-%d")
-            df = yf.Ticker(symbol).history(start=start, interval="1d", auto_adjust=True)
+            df, tf = self._fetch_bars(symbol, opened, prefer_intraday)
             if df is None or df.empty:
-                return False
-            # فلتر الأيام بعد الفتح
-            df = df[df.index.tz_localize(None) >= opened.replace(tzinfo=None).date() if False else df.index]
+                return []
+
             stop = float(row["stop_loss"])
             tp1 = float(row["tp1"])
             tp2 = float(row["tp2"])
             tp3 = float(row["tp3"])
             entry = float(row["entry"])
 
-            for idx, bar in df.iterrows():
-                low = float(bar["Low"])
-                high = float(bar["High"])
-                close = float(bar["Close"])
-                # الوقف أولاً (تحفظي)
-                if low <= stop:
-                    row["status"] = "closed"
-                    row["result"] = "stop"
-                    row["exit_price"] = round(stop, 4)
-                    row["exit_at"] = str(idx)
-                    row["pnl_pct"] = round((stop - entry) / entry * 100, 2)
-                    return True
-                if high >= tp3:
-                    row["status"] = "closed"
-                    row["result"] = "tp3"
-                    row["exit_price"] = round(tp3, 4)
-                    row["exit_at"] = str(idx)
-                    row["pnl_pct"] = round((tp3 - entry) / entry * 100, 2)
-                    return True
-                if high >= tp2:
-                    row["status"] = "closed"
-                    row["result"] = "tp2"
-                    row["exit_price"] = round(tp2, 4)
-                    row["exit_at"] = str(idx)
-                    row["pnl_pct"] = round((tp2 - entry) / entry * 100, 2)
-                    return True
-                if high >= tp1:
-                    row["status"] = "closed"
-                    row["result"] = "tp1"
-                    row["exit_price"] = round(tp1, 4)
-                    row["exit_at"] = str(idx)
-                    row["pnl_pct"] = round((tp1 - entry) / entry * 100, 2)
-                    return True
+            # أعلى/أدنى منذ الفتح (تقريبي)
+            try:
+                # صفوف بعد وقت الفتح قدر الإمكان
+                highs = df["High"].astype(float)
+                lows = df["Low"].astype(float)
+                last_close = float(df["Close"].iloc[-1])
+                max_high = float(highs.max())
+                min_low = float(lows.min())
+            except Exception:
+                return []
 
-            # إذا مر أكثر من 15 يوم تداول وما وصل شيء — إغلاق عند آخر سعر
+            def _evt(kind: str, price: float, close_trade: bool) -> dict[str, Any]:
+                pnl = round((price - entry) / entry * 100, 2)
+                if close_trade:
+                    row["status"] = "closed"
+                    row["result"] = kind
+                    row["exit_price"] = round(price, 4)
+                    row["exit_at"] = _now().isoformat()
+                    row["pnl_pct"] = pnl
+                return {
+                    "symbol": symbol,
+                    "name": row.get("name") or symbol,
+                    "kind": kind,
+                    "price": round(price, 4),
+                    "entry": entry,
+                    "pnl_pct": pnl,
+                    "closed": close_trade,
+                    "timeframe": tf,
+                }
+
+            # الوقف أولاً (تحفظي)
+            if min_low <= stop:
+                events.append(_evt("stop", stop, True))
+                return events
+
+            # أهداف تدريجية: ينبّه عند كل هدف، ويغلق عند الثالث
+            if max_high >= tp1 and not row.get("hit_tp1"):
+                row["hit_tp1"] = True
+                events.append(_evt("tp1", tp1, False))
+            if max_high >= tp2 and not row.get("hit_tp2"):
+                row["hit_tp2"] = True
+                events.append(_evt("tp2", tp2, False))
+            if max_high >= tp3 and not row.get("hit_tp3"):
+                row["hit_tp3"] = True
+                events.append(_evt("tp3", tp3, True))
+                return events
+
+            # انتهاء زمني
             age_days = (_now() - opened).days
-            if age_days >= 15 and len(df) > 0:
-                last = float(df["Close"].iloc[-1])
-                row["status"] = "closed"
-                row["result"] = "timeout"
-                row["exit_price"] = round(last, 4)
-                row["exit_at"] = str(df.index[-1])
-                row["pnl_pct"] = round((last - entry) / entry * 100, 2)
-                return True
+            if age_days >= 15 and row.get("status") == "open":
+                events.append(_evt("timeout", last_close, True))
+                return events
+
+            # حفظ أعلام الأهداف حتى لو ما في إغلاق
+            if events:
+                row["last_price"] = round(last_close, 4)
+                return events
+            row["last_price"] = round(last_close, 4)
         except Exception as exc:
             log.warning("تقييم %s فشل: %s", symbol, exc)
-        return False
+        return events
+
+    @staticmethod
+    def format_event_ar(ev: dict[str, Any]) -> str:
+        kind = ev.get("kind")
+        sym = ev.get("symbol")
+        name = ev.get("name") or sym
+        price = ev.get("price")
+        entry = ev.get("entry")
+        pnl = ev.get("pnl_pct") or 0
+        if kind == "stop":
+            title = f"🛑 ضرب الوقف — {sym}"
+            body = f"تم لمس وقف الخسارة عند {price:.2f} $"
+        elif kind == "tp1":
+            title = f"🎯 الهدف 1 — {sym}"
+            body = f"وصل الهدف الأول عند {price:.2f} $"
+        elif kind == "tp2":
+            title = f"🎯 الهدف 2 — {sym}"
+            body = f"وصل الهدف الثاني عند {price:.2f} $"
+        elif kind == "tp3":
+            title = f"🏁 الهدف 3 (إغلاق) — {sym}"
+            body = f"وصل الهدف الثالث عند {price:.2f} $"
+        elif kind == "timeout":
+            title = f"⏰ انتهاء مدة الصفقة — {sym}"
+            body = f"أُغلقت بعد 15 يوماً عند {price:.2f} $"
+        else:
+            title = f"📋 تحديث — {sym}"
+            body = f"نتيجة: {kind}"
+        lines = [
+            title,
+            name,
+            body,
+            f"الدخول: {entry:.2f} $ | النتيجة: {pnl:+.2f}%",
+        ]
+        if not ev.get("closed") and kind in {"tp1", "tp2"}:
+            lines.append("الصفقة ما زالت مفتوحة لمتابعة الأهداف التالية / الوقف.")
+        elif ev.get("closed"):
+            lines.append("تم إغلاق الصفقة في السجل.")
+        lines.append("متابعة تقريبية — ليست تنفيذاً آلياً للأوامر.")
+        return "\n".join(lines)
 
     def stats_text(self) -> str:
         self.update_open_outcomes()

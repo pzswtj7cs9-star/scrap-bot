@@ -768,15 +768,16 @@ async def weekly_report_job(context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def perf_update_job(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """متابعة الصفقات المفتوحة: وقف / أهداف."""
     try:
-        changed = await asyncio.to_thread(PERF.update_open_outcomes)
-        if changed and SUBSCRIBERS:
-            lines = ["📋 تحديث نتائج إشارات:"]
-            for r in changed[-5:]:
-                lines.append(
-                    f"• {r['symbol']}: {r.get('result')} | {r.get('pnl_pct'):+.2f}%"
-                )
-            await broadcast(context.bot, "\n".join(lines))
+        prefer_intra = is_us_regular_session()
+        events = await asyncio.to_thread(PERF.update_open_outcomes, prefer_intra)
+        if not events or not SUBSCRIBERS:
+            return
+        for ev in events:
+            text = PERF.format_event_ar(ev)
+            await broadcast(context.bot, text)
+            await asyncio.sleep(0.4)
     except Exception as exc:
         log.warning("perf job: %s", exc)
 
@@ -809,7 +810,8 @@ def build_app() -> Application:
 
     if app.job_queue:
         app.job_queue.run_repeating(live_scan_job, interval=LIVE_SCAN_SECONDS, first=25, name="live")
-        app.job_queue.run_repeating(perf_update_job, interval=3600, first=120, name="perf")
+        # متابعة الصفقات كل 3 دقائق (أدق أثناء السوق)
+        app.job_queue.run_repeating(perf_update_job, interval=180, first=90, name="perf")
         app.job_queue.run_repeating(daily_close_job, interval=300, first=40, name="daily-close")
         app.job_queue.run_repeating(weekly_report_job, interval=300, first=50, name="weekly")
     return app
