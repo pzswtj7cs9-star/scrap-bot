@@ -1,0 +1,22 @@
+services:
+  - type: web
+    name: halal-us-stock-bot
+    runtime: python
+    plan: starter
+    buildCommand: pip install -r requirements.txt
+    startCommand: python main.py
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.12.7
+      - key: MIN_SCORE
+        value: "85"
+      - key: DAILY_MAX_ALERTS
+        value: "5"
+      - key: ALERT_EVERY_MINUTES
+        value: "90"
+      - key: LIVE_SCAN_SECONDS
+        value: "60"
+      - key: BOT_TOKEN
+        sync: false
+      - key: OWNER_CHAT_ID
+        sync: false
