@@ -30,6 +30,7 @@ load_dotenv()
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.7-flash")
+ADMIN_ID = 678180992
 
 BASE_DIR = Path(__file__).resolve().parent
 CATALOG_PATH = BASE_DIR / "catalog.json"
@@ -40,47 +41,59 @@ logging.basicConfig(
 )
 log = logging.getLogger("scrap-bot")
 
-# جلسات المستخدمين: تجميع صور متعددة
 user_sessions = defaultdict(lambda: {"photos": [], "last_report": None, "ts": 0})
 
 with open(CATALOG_PATH, "r", encoding="utf-8") as f:
     CATALOG = json.load(f)
 
-CATALOG_TEXT = "\n".join(
-    f"{p['id']}. {p['name']} | وزن {p['weight_kg']} كجم | نوع: {p['type']} | "
-    f"بيع {p['sell_sar']} ر.س | شراء {p['buy_sar']} ر.س"
-    + (f" | ملاحظة: {p['notes']}" if p.get("notes") else "")
-    for p in CATALOG
-)
+def build_catalog_text():
+    return "\n".join(
+        f"{p['id']}. {p['name']} | وزن {p['weight_kg']} كجم | نوع: {p['type']} | "
+        f"بيع {p['sell_sar']} ر.س | شراء {p['buy_sar']} ر.س"
+        + (f" | ملاحظة: {p['notes']}" if p.get("notes") else "")
+        for p in CATALOG
+    )
 
-SYSTEM_PROMPT = f"""أنت خبير سكراب قطع سيارات في السعودية (سوق الرياض والمنطقة).
-مهمتك: تحليل صور كومة سكراب وتحديد القطع الظاهرة من الجدول فقط، ثم تقدير أسعار الشراء والبيع.
+CATALOG_TEXT = build_catalog_text()
 
-جدول القطع (ريال سعودي):
+SYSTEM_PROMPT = f"""أنت خبير سكراب قطع سيارات محترف في السعودية (سوق الرياض).
+مهمتك: تحليل صور كومة السكراب بدقة عالية.
+
+أولاً: حدد كل القطع الظاهرة من الجدول فقط، واحسب عدد كل نوع بدقة.
+ثانياً: صنف القطع حسب نوع المعدن (حديد/زهر - ألمنيوم - نحاس - رصاص - مختلط - بلاستيك).
+ثالثاً: قدر أسعار الشراء والبيع.
+
+جدول القطع المعتمد (ريال سعودي):
 {CATALOG_TEXT}
 
-أسعار تقريبية إضافية للحديد المختلط غير المفرز (للكيلو):
+أسعار تقريبية إضافية للكيلو (إذا القطعة غير موجودة في الجدول):
 - حديد عادي/زهر: شراء 0.4–0.8 | بيع 0.8–1.5
 - ألمنيوم نظيف: شراء 3–6 | بيع 6–10
 - نحاس: شراء 15–25 | بيع 25–35
-- رصاص بطاريات: حسب البطارية في الجدول
+- رصاص بطاريات: حسب البطارية
 
-قواعد صارمة:
-1. لا تخترع قطعاً غير ظاهرة.
-2. قدّر العدد والحالة (سليمة / مكسورة / صدئة / ناقصة).
-3. إذا الصورة غير واضحة قل ذلك بصدق وخفّض مستوى الثقة.
-4. الماكينة والقير: كن متحفظاً جداً واذكر أن السعر حسب الوزن الحقيقي.
-5. البلاستيك والديكور قيمة منخفضة.
-6. إذا أرسل المستخدم أكثر من صورة لنفس الكومة، اعتبرها زوايا مختلفة لنفس الكومة وادمج التقدير.
-7. الأسعار تقريبية حسب الجدول المعطى فقط.
+قواعد صارمة جداً:
+1. لا تخترع قطعاً غير ظاهرة بوضوح.
+2. احسب العدد بدقة (مثال: 3 هوبات، 2 رديتر، 1 دينمو...).
+3. إذا القطعة مكسورة أو صدئة أو ناقصة اذكر ذلك.
+4. إذا الصورة غير واضحة قل ذلك بصدق وخفّض الثقة.
+5. الماكينة والقير: كن متحفظاً جداً واذكر أن السعر يعتمد على الوزن الحقيقي.
+6. إذا أرسل أكثر من صورة، اعتبرها زوايا لنفس الكومة وادمجها.
 
-صيغة الرد الإلزامية (عربي واضح):
+صيغة الرد الإلزامية (التزم بها تماماً):
 
-🔎 **القطع الظاهرة**
+🔎 **القطع الظاهرة (مع العدد)**
 - اسم القطعة × العدد — الحالة — شراء: س–ص ر.س — بيع: ع–غ ر.س
 
 📦 **غير واضح / مختلط**
 - ...
+
+🔩 **فرز حسب نوع المعدن**
+• حديد / زهر: ...
+• ألمنيوم: ...
+• نحاس: ...
+• رصاص: ...
+• مختلط / أخرى: ...
 
 💰 **إجمالي تقديري للكومة**
 • شراء تقريبي: من X إلى Y ريال
@@ -119,7 +132,6 @@ def main_keyboard():
 
 
 def analyze_images(image_list: list, user_note: str = "") -> str:
-    """image_list: list of (bytes, mime)"""
     if not model:
         raise RuntimeError("مفتاح GEMINI_API_KEY غير موجود")
 
@@ -134,7 +146,7 @@ def analyze_images(image_list: list, user_note: str = "") -> str:
 
     parts.append("فرز القطع حسب الجدول وقدّر الشراء والبيع. كن صادقاً إذا غير واضح.")
 
-    content = [ "\n".join(parts) ]
+    content = ["\n".join(parts)]
     for data, mime in image_list:
         content.append({"mime_type": mime, "data": data})
 
@@ -157,6 +169,7 @@ START_TEXT = """🔧 *بوت تقدير سكراب السيارات* (نسخة �
 
 المميزات:
 • فرز القطع حسب جدولك (40 قطعة)
+• عدّ القطع بدقة + فرز حسب نوع المعدن
 • دعم *عدة صور* لنفس الكومة
 • تقدير شراء وبيع بالريال
 • أزرار سريعة بعد كل تحليل
@@ -171,6 +184,7 @@ START_TEXT = """🔧 *بوت تقدير سكراب السيارات* (نسخة �
 /table — الجدول
 /clear — مسح الصور المجمّعة
 /help — مساعدة
+/prices — عرض الأسعار (أدمن)
 """
 
 HELP_TEXT = """*طريقة الاستخدام*
@@ -194,7 +208,6 @@ def format_table_chunks():
             f"   وزن {p['weight_kg']} | شراء {p['buy_sar']} | بيع {p['sell_sar']}"
         )
     full = "📋 *ملخص الجدول*\n\n" + "\n".join(lines)
-    # split if needed
     if len(full) <= 4000:
         return [full]
     mid = len(CATALOG) // 2
@@ -230,6 +243,117 @@ async def cmd_clear(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("تم مسح الصور المجمّعة. أرسل صورة جديدة.")
 
 
+async def cmd_prices(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_ID:
+        await update.message.reply_text("هذا الأمر للأدمن فقط.")
+        return
+    text = "📋 *الأسعار الحالية:*\n\n"
+    for p in CATALOG:
+        text += f"{p['id']}. {p['name']}\n   شراء: {p['buy_sar']} | بيع: {p['sell_sar']}\n"
+        if len(text) > 3500:
+            await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
+            text = ""
+    if text:
+        await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
+
+
+async def cmd_update_price(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_ID:
+        await update.message.reply_text("هذا الأمر للأدمن فقط.")
+        return
+
+    args = context.args
+    if len(args) != 3:
+        await update.message.reply_text(
+            "الاستخدام:\n/update_price رقم_القطعة سعر_الشراء سعر_البيع\n\n"
+            "مثال:\n/update_price 1 3-5 6-18"
+        )
+        return
+
+    try:
+        part_id = int(args[0])
+        buy_sar = args[1]
+        sell_sar = args[2]
+
+        found = False
+        for p in CATALOG:
+            if p["id"] == part_id:
+                p["buy_sar"] = buy_sar
+                p["sell_sar"] = sell_sar
+                found = True
+                break
+
+        if not found:
+            await update.message.reply_text("ما لقيت قطعة بهذا الرقم.")
+            return
+
+        global CATALOG_TEXT, SYSTEM_PROMPT, model
+        CATALOG_TEXT = build_catalog_text()
+
+        # إعادة بناء الـ Prompt
+        SYSTEM_PROMPT = f"""أنت خبير سكراب قطع سيارات محترف في السعودية (سوق الرياض).
+مهمتك: تحليل صور كومة السكراب بدقة عالية.
+
+أولاً: حدد كل القطع الظاهرة من الجدول فقط، واحسب عدد كل نوع بدقة.
+ثانياً: صنف القطع حسب نوع المعدن (حديد/زهر - ألمنيوم - نحاس - رصاص - مختلط - بلاستيك).
+ثالثاً: قدر أسعار الشراء والبيع.
+
+جدول القطع المعتمد (ريال سعودي):
+{CATALOG_TEXT}
+
+أسعار تقريبية إضافية للكيلو (إذا القطعة غير موجودة في الجدول):
+- حديد عادي/زهر: شراء 0.4–0.8 | بيع 0.8–1.5
+- ألمنيوم نظيف: شراء 3–6 | بيع 6–10
+- نحاس: شراء 15–25 | بيع 25–35
+- رصاص بطاريات: حسب البطارية
+
+قواعد صارمة جداً:
+1. لا تخترع قطعاً غير ظاهرة بوضوح.
+2. احسب العدد بدقة (مثال: 3 هوبات، 2 رديتر، 1 دينمو...).
+3. إذا القطعة مكسورة أو صدئة أو ناقصة اذكر ذلك.
+4. إذا الصورة غير واضحة قل ذلك بصدق وخفّض الثقة.
+5. الماكينة والقير: كن متحفظاً جداً واذكر أن السعر يعتمد على الوزن الحقيقي.
+6. إذا أرسل أكثر من صورة، اعتبرها زوايا لنفس الكومة وادمجها.
+
+صيغة الرد الإلزامية (التزم بها تماماً):
+
+🔎 **القطع الظاهرة (مع العدد)**
+- اسم القطعة × العدد — الحالة — شراء: س–ص ر.س — بيع: ع–غ ر.س
+
+📦 **غير واضح / مختلط**
+- ...
+
+🔩 **فرز حسب نوع المعدن**
+• حديد / زهر: ...
+• ألمنيوم: ...
+• نحاس: ...
+• رصاص: ...
+• مختلط / أخرى: ...
+
+💰 **إجمالي تقديري للكومة**
+• شراء تقريبي: من X إلى Y ريال
+• بيع سكراب تقريبي: من A إلى B ريال
+• هامش تقريبي: ...
+
+📊 **مستوى الثقة:** منخفض / متوسط / جيد
+⚠️ **تنبيه:** تقدير بصري فقط بدون ميزان. السوق يتغير. لا تعتمد عليه كعرض ملزم.
+📝 ملاحظات: ...
+"""
+
+        if GEMINI_API_KEY:
+            model = genai.GenerativeModel(
+                model_name=GEMINI_MODEL,
+                system_instruction=SYSTEM_PROMPT,
+            )
+
+        await update.message.reply_text(
+            f"✅ تم تحديث القطعة رقم {part_id}\nشراء: {buy_sar} | بيع: {sell_sar}\n\n"
+            "ملاحظة: التغيير مؤقت لين يعمل البوت Restart."
+        )
+    except Exception as e:
+        await update.message.reply_text(f"خطأ: {e}")
+
+
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message or not update.message.photo:
         return
@@ -239,7 +363,6 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     uid = update.effective_user.id
     session = user_sessions[uid]
-    # تنظيف جلسات قديمة (أكثر من ساعة)
     if time.time() - session.get("ts", 0) > 3600:
         session["photos"] = []
         session["last_report"] = None
@@ -260,7 +383,6 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         count = len(session["photos"])
 
         if count == 1:
-            # تحليل فوري للصورة الأولى
             await status.edit_text("⏳ جاري الفرز والتقدير...")
             report = analyze_images(session["photos"], session.get("note", ""))
             session["last_report"] = report
@@ -290,7 +412,6 @@ async def handle_document_image(update: Update, context: ContextTypes.DEFAULT_TY
     doc = update.message.document
     if not doc or not (doc.mime_type or "").startswith("image/"):
         return
-    # treat as photo path by converting conceptually — reuse photo logic via download
     if not GEMINI_API_KEY:
         await update.message.reply_text("مفتاح GEMINI غير موجود.")
         return
@@ -358,7 +479,6 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await context.bot.send_chat_action(update.effective_chat.id, ChatAction.TYPING)
             report = analyze_images(session["photos"], session.get("note", ""))
             session["last_report"] = report
-            # لا نمسح الصور تلقائياً عشان يقدر يعيد
             if len(report) > 4000:
                 await status.edit_text(report[:4000])
                 await query.message.reply_text(report[4000:8000], reply_markup=main_keyboard())
@@ -399,6 +519,8 @@ def main():
     app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(CommandHandler("table", cmd_table))
     app.add_handler(CommandHandler("clear", cmd_clear))
+    app.add_handler(CommandHandler("prices", cmd_prices))
+    app.add_handler(CommandHandler("update_price", cmd_update_price))
     app.add_handler(CallbackQueryHandler(on_callback))
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     app.add_handler(MessageHandler(filters.Document.IMAGE, handle_document_image))
