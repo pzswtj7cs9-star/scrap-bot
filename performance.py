@@ -92,19 +92,26 @@ class PerformanceLog:
         return events
 
     def _fetch_bars(self, symbol: str, opened: datetime, prefer_intraday: bool):
-        t = yf.Ticker(symbol)
         age_hours = (_now() - opened).total_seconds() / 3600
-        # للإشارات الحديثة: شموع 5 دقائق أدق لمتابعة الوقف/الأهداف
         if prefer_intraday and age_hours <= 72:
             try:
-                df5 = t.history(period="5d", interval="5m", auto_adjust=True)
+                from market_data import fetch_intraday
+
+                df5 = fetch_intraday(symbol, period="5d", interval="5m")
                 if df5 is not None and not df5.empty:
                     return df5, "5m"
             except Exception:
                 pass
-        start = (opened - timedelta(days=1)).strftime("%Y-%m-%d")
-        df = t.history(start=start, interval="1d", auto_adjust=True)
-        return df, "1d"
+        try:
+            from market_data import fetch_history
+
+            df = fetch_history(symbol, period="3mo")
+            return df, "1d"
+        except Exception:
+            t = yf.Ticker(symbol)
+            start = (opened - timedelta(days=1)).strftime("%Y-%m-%d")
+            df = t.history(start=start, interval="1d", auto_adjust=True)
+            return df, "1d"
 
     def _evaluate_row(self, row: dict[str, Any], prefer_intraday: bool = True) -> list[dict[str, Any]]:
         symbol = row["symbol"]

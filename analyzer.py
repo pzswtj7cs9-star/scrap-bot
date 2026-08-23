@@ -96,16 +96,18 @@ def _fmt_cap(cap: Optional[float]) -> Optional[str]:
 
 
 def fetch_history(symbol: str, period: str = "1y") -> pd.DataFrame:
-    ticker = yf.Ticker(symbol)
-    df = ticker.history(period=period, interval="1d", auto_adjust=True)
+    from market_data import fetch_history as _fh
+
+    df = _fh(symbol, period=period)
     if df is None or df.empty or len(df) < 60:
         raise ValueError(f"لا توجد بيانات كافية لـ {symbol}")
     return df.dropna(subset=["Close", "High", "Low", "Volume"])
 
 
 def fetch_intraday(symbol: str, interval: str = "5m", period: str = "5d") -> pd.DataFrame:
-    ticker = yf.Ticker(symbol)
-    df = ticker.history(period=period, interval=interval, auto_adjust=True, prepost=False)
+    from market_data import fetch_intraday as _fi
+
+    df = _fi(symbol, period=period, interval=interval)
     if df is None or df.empty:
         raise ValueError(f"لا توجد بيانات لحظية لـ {symbol}")
     return df.dropna(subset=["Close", "High", "Low", "Volume"])

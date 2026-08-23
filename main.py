@@ -146,13 +146,12 @@ def save_reports(data: dict) -> None:
 def ping_yahoo() -> tuple[bool, str]:
     global LAST_YF_OK, LAST_YF_NOTE
     try:
-        import yfinance as yf
+        from market_data import ping_sources
 
-        info = yf.Ticker("SPY").fast_info
-        last = getattr(info, "last_price", None)
-        LAST_YF_OK = last is not None
-        LAST_YF_NOTE = f"SPY ≈ {float(last):.2f}" if last else "بدون سعر"
-        return LAST_YF_OK, LAST_YF_NOTE
+        ok, note = ping_sources()
+        LAST_YF_OK = ok
+        LAST_YF_NOTE = note
+        return ok, note
     except Exception as exc:
         LAST_YF_OK = False
         LAST_YF_NOTE = str(exc)[:80]
@@ -426,7 +425,7 @@ def health_text() -> str:
         session_label(),
         f"التشغيل: {hours}س {mins}د",
         f"المشتركون: {len(SUBSCRIBERS)}",
-        f"Yahoo Finance: {'يعمل' if ok else 'تعثر'} — {note}",
+        f"مصدر البيانات: {'يعمل' if ok else 'تعثر'} — {note}",
         f"آخر مسح: {last_scan}",
         f"آخر تنبيه تلقائي: {state.get('last_sent_at') or '—'}",
         f"حصة اليوم: {len(state.get('sent', []))}/{DAILY_MAX}",
