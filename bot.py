@@ -530,6 +530,20 @@ async def cmd_update_price(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         await update.message.reply_text(f"خطأ: {e}")
 if __name__ == "__main__":
+    def main():
+    init_db()   # هذا السطر في البداية داخل الدالة
 
-main(    init_db()   # إنشاء الجدول وإدخال البيانات إذا لزم    app.add_handler(CommandHandler("prices", cmd_prices))
-    app.add_handler(CommandHandler("update_price", cmd_update_price)
+    app = Application.builder().token(TELEGRAM_TOKEN).build()
+
+    app.add_handler(CommandHandler("start", cmd_start))
+    app.add_handler(CommandHandler("help", cmd_help))
+    app.add_handler(CommandHandler("table", cmd_table))
+    app.add_handler(CommandHandler("clear", cmd_clear))
+    app.add_handler(CommandHandler("prices", cmd_prices))
+    app.add_handler(CommandHandler("update_price", cmd_update_price))
+
+    # باقي الـ handlers الموجودة عندك (MessageHandler وغيرها)
+
+    app.run_polling()
+
+(    
