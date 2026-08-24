@@ -1,9 +1,12 @@
 #!/usr/bin/env python3
 """
-بوت تليجرام لأسهم السوق الأمريكي الحلال
-- حد 85+ وتأكيد لحظي
-- سهم واحد كل 90 دقيقة، بحد 5 يومياً
-- سجل أداء + حاسبة حجم + رسم + تجنب إعلانات + باكتست
+بوت تليجرام لأسهم السوق الأمريكي الحلال — النسخة المحسّنة
+
+التحسينات:
+• تسجيل الإشارة + تحديث تلقائي للأوزان (Adaptive Weights)
+• وقف خسارة محسّن (هيكل + ATR ديناميكي + قاع 15د)
+• إطار 15 دقيقة للتأكيد
+• فلتر قوة السوق العام (SPY regime) — يرفع الحد أو يوقف التنبيهات عند الهبوط
 """
 
 from __future__ import annotations
@@ -34,15 +37,18 @@ from charting import build_signal_chart
 from cooldown import CooldownBook
 from earnings import is_near_earnings
 from market import (
+    get_market_regime,
     is_friday_post_close,
     is_post_close_window,
     is_us_regular_session,
     now_ny,
+    regime_label,
     session_label,
 )
 from performance import PerformanceLog
 from position import calc_position, format_position_ar
 from stocks import CORE_WATCHLIST, HALAL_STOCKS, display_name, is_known_halal
+from weights import WEIGHTS
 
 load_dotenv()
 
@@ -66,7 +72,12 @@ STATE_FILE = DATA_DIR / "daily_state.json"
 PERF_FILE = DATA_DIR / "signals_log.json"
 COOL_FILE = DATA_DIR / "cooldown.json"
 REPORTS_FILE = DATA_DIR / "reports_state.json"
+WEIGHTS_FILE = DATA_DIR / "weights_state.json"
 CHART_DIR = DATA_DIR / "charts"
+
+# ربط مسار الأوزان
+WEIGHTS.path = WEIGHTS_FILE
+WEIGHTS._load()
 
 PERF = PerformanceLog(PERF_FILE)
 COOL = CooldownBook(COOL_FILE, days=COOLDOWN_DAYS)
@@ -215,19 +226,21 @@ def main_keyboard() -> InlineKeyboardMarkup:
 
 WELCOME = """بسم الله الرحمن الرحيم
 
-بوت الأسهم الأمريكية الحلال — النسخة المتكاملة.
+بوت الأسهم الأمريكية الحلال — النسخة المحسّنة.
 
 التنبيه التلقائي:
-• حد 85/100 + تأكيد لحظي
+• حد أساسي 85/100 + تأكيد 5د + تأكيد 15د
+• فلتر نظام السوق (SPY): يرفع الحد أو يوقف التنبيهات عند الهبوط
 • سهم واحد كل 90 دقيقة (الأقوى)
 • سقف 5 أسهم يومياً
 • يتجنب الأسهم قرب إعلان الأرباح
+• وقف خسارة محسّن + أوزان تكيفية من نتائج سابقة
 
-أدوات إضافية:
-/size 10000 1 NVDA — حاسبة حجم الصفقة
-/chart NVDA — رسم مع مناطق الشراء/الوقف/الأهداف
-/perf — سجل أداء الإشارات
-/backtest — باكتست مبسّط لآخر سنة
+أدوات:
+/size 10000 1 NVDA — حاسبة حجم
+/chart NVDA — رسم
+/perf — سجل أداء + الأوزان
+/backtest — باكتست
 /analyze NVDA | /scan | /today | /status | /health | /weekly
 
 تحليل تعليمي وليس توصية. تحقق من الحكم الشرعي قبل الشراء."""
@@ -245,7 +258,7 @@ HELP = """الأوامر
 مثال: /size 10000 1 NVDA
 
 الأداء:
-/perf — نتائج الإشارات المسجّلة
+/perf — نتائج الإشارات + الأوزان التكيفية
 /backtest — اختبار تاريخي مبسّط
 
 التنبيه:
@@ -253,11 +266,12 @@ HELP = """الأوامر
 /today | /status | /health | /weekly
 
 الإعدادات الحالية:
-حد التنبيه: {min_score}
+حد التنبيه الأساسي: {min_score}
 سقف اليوم: {daily_max}
 المباعدة: {interval} دقيقة
 تهدئة السهم: {cool} أيام تداول
-تجنب الإعلانات: خلال يومين من تاريخ الأرباح"""
+تجنب الإعلانات: خلال يومين من تاريخ الأرباح
+فلتر السوق: SPY فوق/تحت متوسط 50 و200"""
 
 
 def _watch(context: ContextTypes.DEFAULT_TYPE) -> list[str]:
@@ -299,15 +313,18 @@ def today_summary() -> str:
     state = load_state()
     sent = state["sent"]
     scores = state.get("scores", {})
+    regime = get_market_regime("SPY")
     lines = [
         "📡 " + session_label(),
-        f"🎯 حد التنبيه: {MIN_SCORE}/100",
+        regime_label(),
+        f"🎯 حد التنبيه الأساسي: {MIN_SCORE}/100 → المعدّل الآن: {regime['min_score_adj']}",
         f"⏱ إرسال: سهم واحد كل {ALERT_EVERY_MINUTES} دقيقة",
         f"📦 حصة اليوم: {len(sent)}/{DAILY_MAX}",
         f"⏳ المتبقي: {remaining_slots()}",
         f"🕒 {next_alert_text(state)}",
         f"🚫 يتجنب الإعلانات خلال {EARNINGS_DAYS} يوم",
         f"🔁 لا يكرر السهم قبل {COOLDOWN_DAYS} أيام تداول",
+        f"🤖 تنبيهات تلقائية: {'مفعّلة' if regime['allow_auto'] else 'موقوفة (سوق هابط)'}",
         "",
     ]
     if sent:
@@ -420,9 +437,11 @@ def health_text() -> str:
     last_scan = LAST_SCAN_AT.strftime("%H:%M:%S") if LAST_SCAN_AT else "لا يوجد بعد"
     blocked = COOL.blocked_list()
     state = load_state()
+    regime = get_market_regime("SPY")
     lines = [
         "🩺 صحة النظام",
         session_label(),
+        regime_label(),
         f"التشغيل: {hours}س {mins}د",
         f"المشتركون: {len(SUBSCRIBERS)}",
         f"مصدر البيانات: {'يعمل' if ok else 'تعثر'} — {note}",
@@ -430,6 +449,7 @@ def health_text() -> str:
         f"آخر تنبيه تلقائي: {state.get('last_sent_at') or '—'}",
         f"حصة اليوم: {len(state.get('sent', []))}/{DAILY_MAX}",
         f"تهدئة الأسهم: {COOLDOWN_DAYS} أيام تداول",
+        f"تنبيهات تلقائية: {'نعم' if regime['allow_auto'] else 'موقوفة (سوق هابط)'}",
     ]
     if blocked:
         lines.append("في فترة تهدئة:")
@@ -467,7 +487,6 @@ async def cmd_backtest(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
 
 async def cmd_size(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """/size 10000 1 NVDA  أو  /size 10000 1  مع تحليل مسبق"""
     if len(context.args) < 2:
         await update.message.reply_text(
             "الاستخدام:\n/size رأس_المال نسبة_المخاطرة الرمز\nمثال:\n/size 10000 1 NVDA"
@@ -492,7 +511,7 @@ async def cmd_size(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         text = (
             f"{format_position_ar(pos)}\n\n"
             f"مرجع الإشارة: {sig.symbol} @ {sig.price:.2f} | درجة {sig.score}/100\n"
-            f"منطقة الشراء {sig.buy_low:.2f}-{sig.buy_high:.2f} | وقف {sig.stop_loss:.2f}"
+            f"منطقة الشراء {sig.buy_low:.2f}-{sig.buy_high:.2f} | وقف {sig.stop_loss:.2f} ({sig.sl_method})"
         )
         await msg.edit_text(text)
     except Exception as exc:
@@ -531,8 +550,10 @@ async def analyze_and_reply(update: Update, symbol: str) -> None:
         near, edt = await asyncio.to_thread(is_near_earnings, symbol, EARNINGS_DAYS)
         if near:
             extra += f"\n\n🚫 قرب إعلان أرباح ({edt}) — تجنّب الدخول التلقائي."
+        regime = await asyncio.to_thread(get_market_regime, "SPY")
+        extra += f"\n\n{regime_label()}"
         sig = await asyncio.to_thread(analyze, symbol, display_name(symbol), True)
-        await msg.edit_text(format_signal_ar(sig, MIN_SCORE) + extra)
+        await msg.edit_text(format_signal_ar(sig, regime["min_score_adj"]) + extra)
         path = await asyncio.to_thread(build_signal_chart, sig, CHART_DIR)
         if path and path.exists():
             with open(path, "rb") as f:
@@ -558,11 +579,20 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def run_scan_message(target_message, symbols: list[str]) -> None:
+    regime = await asyncio.to_thread(get_market_regime, "SPY")
     status = await target_message.reply_text(
-        f"{session_label()}\nجاري الترتيب (حد {MIN_SCORE} + بدون إعلانات قريبة)..."
+        f"{session_label()}\n{regime_label()}\n"
+        f"جاري الترتيب (حد {regime['min_score_adj']} + بدون إعلانات قريبة)..."
     )
     hits = await asyncio.to_thread(
-        scan_symbols, symbols, HALAL_STOCKS, MIN_SCORE, True, DAILY_MAX, True, EARNINGS_DAYS
+        scan_symbols,
+        symbols,
+        HALAL_STOCKS,
+        regime["min_score_adj"],
+        True,
+        DAILY_MAX,
+        True,
+        EARNINGS_DAYS,
     )
     skipped = getattr(scan_symbols, "last_skipped_earnings", [])
     if not hits:
@@ -575,13 +605,13 @@ async def run_scan_message(target_message, symbols: list[str]) -> None:
                 extra += f"\n{i}. {s.symbol} {s.score}/100"
         skip_txt = f"\nتم استبعاد قرب أرباح: {', '.join(skipped)}" if skipped else ""
         await status.edit_text(
-            f"لا يوجد تأكيد 85+ مع لحظة حالياً.{skip_txt}{extra}\n\n{today_summary()}"
+            f"لا يوجد تأكيد {regime['min_score_adj']}+ مع لحظة حالياً.{skip_txt}{extra}\n\n{today_summary()}"
         )
         return
     skip_txt = f"\n(استُبعد قرب أرباح: {', '.join(skipped)})" if skipped else ""
     await status.edit_text(f"أقوى {len(hits)} تأكيد:{skip_txt}")
     for i, sig in enumerate(hits, 1):
-        await target_message.reply_text(format_signal_ar(sig, MIN_SCORE, rank=i))
+        await target_message.reply_text(format_signal_ar(sig, regime["min_score_adj"], rank=i))
         path = await asyncio.to_thread(build_signal_chart, sig, CHART_DIR)
         if path and path.exists():
             with open(path, "rb") as f:
@@ -638,6 +668,7 @@ async def broadcast(bot, text: str) -> None:
 
 
 async def live_scan_job(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """المسح التلقائي مع فلتر نظام السوق."""
     global LAST_SCAN_AT
     LAST_SCAN_AT = now_ny()
     if not SUBSCRIBERS or not is_us_regular_session() or remaining_slots() <= 0:
@@ -646,6 +677,14 @@ async def live_scan_job(context: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     async with _scan_lock:
+        # ---- فلتر نظام السوق ----
+        regime = await asyncio.to_thread(get_market_regime, "SPY")
+        if not regime.get("allow_auto", True):
+            log.info("live_scan skipped — market regime bear: %s", regime.get("detail"))
+            return
+
+        effective_min = max(MIN_SCORE, int(regime.get("min_score_adj", MIN_SCORE)))
+
         state = load_state()
         already = set(state["sent"])
         if len(already) >= DAILY_MAX:
@@ -658,7 +697,7 @@ async def live_scan_job(context: ContextTypes.DEFAULT_TYPE) -> None:
             scan_symbols,
             CORE_WATCHLIST,
             HALAL_STOCKS,
-            MIN_SCORE,
+            effective_min,
             True,
             12,
             True,
@@ -684,9 +723,10 @@ async def live_scan_job(context: ContextTypes.DEFAULT_TYPE) -> None:
         header = (
             f"🔔 سهم واحد — الدفعة {slot}/{DAILY_MAX}\n"
             f"{session_label()}\n"
+            f"{regime_label()}\n"
             f"التالي بعد {ALERT_EVERY_MINUTES} دقيقة إن وُجد تأكيد جديد."
         )
-        body = format_signal_ar(sig, MIN_SCORE, rank=slot)
+        body = format_signal_ar(sig, effective_min, rank=slot)
         for chat_id in list(SUBSCRIBERS):
             try:
                 await context.bot.send_message(chat_id=chat_id, text=header + "\n\n" + body)
@@ -716,6 +756,7 @@ def build_daily_close_text() -> str:
     lines = [
         "🌆 ملخص ما بعد الإغلاق",
         session_label(),
+        regime_label(),
         spy_day_change(),
         "",
         f"تنبيهات اليوم: {len(sent)}/{DAILY_MAX}",
@@ -767,10 +808,10 @@ async def weekly_report_job(context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def perf_update_job(context: ContextTypes.DEFAULT_TYPE) -> None:
-    """متابعة الصفقات المفتوحة: وقف / أهداف."""
+    """متابعة الصفقات المفتوحة: وقف / أهداف + تحديث الأوزان."""
     try:
-        prefer_intra = is_us_regular_session()
-        events = await asyncio.to_thread(PERF.update_open_outcomes, prefer_intra)
+        prefer_intraday = is_us_regular_session()
+        events = await asyncio.to_thread(PERF.update_open_outcomes, prefer_intraday)
         if not events or not SUBSCRIBERS:
             return
         for ev in events:
@@ -809,7 +850,6 @@ def build_app() -> Application:
 
     if app.job_queue:
         app.job_queue.run_repeating(live_scan_job, interval=LIVE_SCAN_SECONDS, first=25, name="live")
-        # متابعة الصفقات كل 3 دقائق (أدق أثناء السوق)
         app.job_queue.run_repeating(perf_update_job, interval=180, first=90, name="perf")
         app.job_queue.run_repeating(daily_close_job, interval=300, first=40, name="daily-close")
         app.job_queue.run_repeating(weekly_report_job, interval=300, first=50, name="weekly")
@@ -820,7 +860,7 @@ def main() -> None:
     start_health_server()
     application = build_app()
     log.info(
-        "جاهز | حد=%s | سقف=%s | كل %s د | إعلانات±%s",
+        "جاهز | حد=%s | سقف=%s | كل %s د | إعلانات±%s | أوزان تكيفية + فلتر نظام السوق",
         MIN_SCORE,
         DAILY_MAX,
         ALERT_EVERY_MINUTES,

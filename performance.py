@@ -40,6 +40,8 @@ class PerformanceLog:
 
     def add_signal(self, sig: SignalResult, source: str = "auto") -> dict[str, Any]:
         rows = self._load()
+        # factors: لربط الإشارة بنظام الأوزان التكيفية (إن وُجد)
+        factors = list(getattr(sig, "factor_keys", None) or [])
         row = {
             "id": f"{sig.symbol}-{_now().strftime('%Y%m%d%H%M%S')}",
             "symbol": sig.symbol,
@@ -54,6 +56,7 @@ class PerformanceLog:
             "tp2": round(sig.tp2, 4),
             "tp3": round(sig.tp3, 4),
             "score": sig.score,
+            "factors": factors,
             "status": "open",
             "exit_price": None,
             "exit_at": None,
@@ -149,6 +152,15 @@ class PerformanceLog:
                     row["exit_price"] = round(price, 4)
                     row["exit_at"] = _now().isoformat()
                     row["pnl_pct"] = pnl
+                    # تحديث الأوزان التكيفية عند الإغلاق
+                    factors = row.get("factors") or []
+                    if factors:
+                        try:
+                            from weights import WEIGHTS
+                            won = pnl > 0
+                            WEIGHTS.record_outcome(factors, won=won)
+                        except Exception:
+                            pass
                 return {
                     "symbol": symbol,
                     "name": row.get("name") or symbol,
@@ -271,6 +283,12 @@ class PerformanceLog:
             lines.append("مفتوحة الآن:")
             for r in [x for x in rows if x.get("status") == "open"][-5:]:
                 lines.append(f"  {r['symbol']} | دخول {r['entry']} | وقف {r['stop_loss']} | TP1 {r['tp1']}")
+        try:
+            from weights import WEIGHTS
+            lines.append("")
+            lines.append(WEIGHTS.summary_text())
+        except Exception:
+            pass
         lines.append("")
         lines.append("ملاحظة: التقييم تقريبي على بيانات يومية وليس تنفيذاً حقيقياً.")
         return "\n".join(lines)

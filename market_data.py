@@ -15,7 +15,6 @@ log = logging.getLogger("halal-bot.data")
 
 APCA_KEY = os.getenv("APCA_API_KEY_ID", "").strip()
 APCA_SECRET = os.getenv("APCA_API_SECRET_KEY", "").strip()
-# بيانات السوق دائماً من data.alpaca.markets حتى لو الحساب Paper
 DATA_URL = os.getenv("APCA_DATA_URL", "https://data.alpaca.markets").rstrip("/")
 
 _LAST_SOURCE = "none"
@@ -77,7 +76,13 @@ def _bars_to_df(bars: list) -> pd.DataFrame:
     return df
 
 
-def fetch_alpaca_bars(symbol: str, timeframe: str, start: datetime, end: Optional[datetime] = None, limit: int = 10000) -> pd.DataFrame:
+def fetch_alpaca_bars(
+    symbol: str,
+    timeframe: str,
+    start: datetime,
+    end: Optional[datetime] = None,
+    limit: int = 10000,
+) -> pd.DataFrame:
     if not alpaca_configured():
         raise RuntimeError("Alpaca keys missing")
     end = end or datetime.now(timezone.utc)
@@ -91,7 +96,7 @@ def fetch_alpaca_bars(symbol: str, timeframe: str, start: datetime, end: Optiona
         "end": end.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
         "limit": min(limit, 10000),
         "adjustment": "split",
-        "feed": "iex",  # مناسب للخطة المجانية
+        "feed": "iex",
     }
     url = f"{DATA_URL}/v2/stocks/{symbol.upper()}/bars"
     r = requests.get(url, headers=_alpaca_headers(), params=params, timeout=20)
@@ -99,7 +104,6 @@ def fetch_alpaca_bars(symbol: str, timeframe: str, start: datetime, end: Optiona
         raise RuntimeError(f"Alpaca {r.status_code}: {r.text[:180]}")
     data = r.json() or {}
     bars = data.get("bars") or []
-    # pagination بسيط
     next_token = data.get("next_page_token")
     while next_token and len(bars) < limit:
         params["page_token"] = next_token
@@ -139,8 +143,8 @@ def fetch_history(symbol: str, period: str = "1y") -> pd.DataFrame:
 
 
 def fetch_intraday(symbol: str, period: str = "5d", interval: str = "5m") -> pd.DataFrame:
-    """لحظي 5 دقائق: Alpaca ثم Yahoo."""
-    days = 5 if period.endswith("d") else 5
+    """لحظي: يدعم 5m و 15m."""
+    days = 5
     try:
         days = int(period.replace("d", ""))
     except Exception:
@@ -157,11 +161,13 @@ def fetch_intraday(symbol: str, period: str = "5d", interval: str = "5m") -> pd.
                 _set_status("alpaca")
                 return df
         except Exception as exc:
-            log.warning("Alpaca intra %s: %s", symbol, exc)
+            log.warning("Alpaca intra %s %s: %s", symbol, interval, exc)
             _set_status("yahoo", str(exc)[:120])
 
     try:
-        df = yf.Ticker(symbol).history(period=period, interval=interval, auto_adjust=True, prepost=False)
+        df = yf.Ticker(symbol).history(
+            period=period, interval=interval, auto_adjust=True, prepost=False
+        )
         if df is None or df.empty:
             raise RuntimeError("Yahoo empty")
         _set_status("yahoo" if not alpaca_configured() else "yahoo-fallback")
@@ -197,7 +203,6 @@ def ping_sources() -> tuple[bool, str]:
             notes.append(f"Yahoo يعمل — SPY ≈ {float(last):.2f}")
             ok = True
         else:
-            # fallback history
             df = yf.Ticker("SPY").history(period="5d", interval="1d")
             if df is not None and not df.empty:
                 notes.append(f"Yahoo يعمل — SPY ≈ {float(df['Close'].iloc[-1]):.2f}")
