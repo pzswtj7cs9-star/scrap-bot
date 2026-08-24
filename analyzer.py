@@ -57,6 +57,9 @@ class SignalResult:
     factor_keys: list[str] = field(default_factory=list)
     regime: str = "neutral"
     sl_method: str = ""
+    quality_ok: bool = True
+    atr_pct: float = 0.0
+    ext_sma20: float = 0.0
 
 
 def _sma(s: pd.Series, n: int) -> pd.Series:
@@ -455,6 +458,26 @@ def analyze(symbol: str, name: str = "", with_live: bool = True) -> SignalResult
     if not uptrend_ok and not stacked:
         score = min(score, 84)
 
+    # ---- فلتر جودة الدخول ----
+    # 1) امتداد عن متوسط 20  2) تذبذب ATR٪  3) حجم حقيقي
+    atr_pct = (last_atr / price * 100) if price else 0.0
+    quality_ok = True
+    if ext_from_sma20 > 6.0:
+        quality_ok = False
+        warnings.append(f"ممتد بعيداً عن متوسط 20 ({ext_from_sma20:.1f}%) — تجنّب المطاردة")
+        score = min(score, 84)
+    if atr_pct > 5.5:
+        quality_ok = False
+        warnings.append(f"تذبذب عالي ATR={atr_pct:.1f}% — سهم هايج")
+        score = min(score, 84)
+    if vol_ratio < 0.95:
+        quality_ok = False
+        warnings.append(f"الحجم ضعيف جداً ({vol_ratio:.2f}x) — لا دعم شرائي كافٍ")
+        score = min(score, 84)
+    elif vol_ratio < 1.15 and quality_ok:
+        # حجم مقبول بالكاد: لا يفشل الفلتر لكنه لا يُفضَّل للتنبيه التلقائي القوي
+        warnings.append(f"الحجم دون المثالي ({vol_ratio:.2f}x)")
+
     score_i = int(max(0, min(100, round(score))))
     grade, bias = _grade(score_i)
 
@@ -542,6 +565,9 @@ def analyze(symbol: str, name: str = "", with_live: bool = True) -> SignalResult
         timeframe_note=tf_note,
         factor_keys=factors,
         sl_method=sl_method,
+        quality_ok=quality_ok,
+        atr_pct=round(atr_pct, 2),
+        ext_sma20=round(ext_from_sma20, 2),
     )
 
 
@@ -576,6 +602,8 @@ def format_signal_ar(sig: SignalResult, min_score: int = 85, rank: int | None = 
     risks = sig.warnings[:2]
     if sig.score < min_score or not sig.live_ok:
         risks.append(f"تحت شرط التنبيه ({min_score}+ وتأكيد لحظي)")
+    if not getattr(sig, "quality_ok", True):
+        risks.append("فشل فلتر جودة الدخول (امتداد/تذبذب/حجم)")
     if risks:
         lines.append("مخاطر:")
         for w in risks:
@@ -626,6 +654,11 @@ def scan_symbols(
             if require_live and not sig.live_ok:
                 continue
             if require_m15 and not sig.m15_ok:
+                continue
+            # فلتر جودة الدخول للتنبيه التلقائي
+            if not getattr(sig, "quality_ok", True):
+                continue
+            if getattr(sig, "volume_ratio", 0) < 1.10:
                 continue
             results.append(sig)
         except Exception:

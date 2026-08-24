@@ -260,6 +260,36 @@ class PerformanceLog:
         avg_pnl = sum(r.get("pnl_pct") or 0 for r in closed) / len(closed) if closed else 0
         win_rate = len(wins) / len(closed) * 100 if closed else 0
 
+        # متوسط R المتحقق: pnl / المخاطرة الأولية لكل صفقة
+        r_multiples = []
+        equity = [0.0]
+        for r in closed:
+            entry = float(r.get("entry") or 0)
+            stop = float(r.get("stop_loss") or 0)
+            pnl = float(r.get("pnl_pct") or 0)
+            risk_pct = ((entry - stop) / entry * 100) if entry and stop and entry > stop else 0
+            if risk_pct > 0:
+                r_multiples.append(pnl / risk_pct)
+            equity.append(equity[-1] + pnl)
+        avg_r = sum(r_multiples) / len(r_multiples) if r_multiples else 0.0
+        # أقصى انخفاض (drawdown) على منحنى مجموع العوائد %
+        peak = equity[0]
+        max_dd = 0.0
+        for v in equity:
+            if v > peak:
+                peak = v
+            dd = peak - v
+            if dd > max_dd:
+                max_dd = dd
+
+        # نسبة النجاح حسب شريحة الدرجة
+        def _bucket_stats(lo: int, hi: int) -> str:
+            subset = [r for r in closed if lo <= int(r.get("score") or 0) <= hi]
+            if not subset:
+                return f"{lo}-{hi}: لا بيانات"
+            w = [r for r in subset if (r.get("pnl_pct") or 0) > 0]
+            return f"{lo}-{hi}: {len(w)}/{len(subset)} ({len(w)/len(subset)*100:.0f}%)"
+
         lines = [
             "📈 سجل أداء الإشارات",
             f"الإجمالي: {len(rows)} | مفتوحة: {open_n} | مغلقة: {len(closed)}",
@@ -268,6 +298,11 @@ class PerformanceLog:
             lines += [
                 f"نسبة الربح (إشارات مغلقة): {win_rate:.1f}%",
                 f"متوسط العائد/الخسارة: {avg_pnl:+.2f}%",
+                f"متوسط R المتحقق: {avg_r:+.2f}R",
+                f"أقصى انخفاض تراكمي: {max_dd:.2f}%",
+                "حسب الدرجة:",
+                f"  • {_bucket_stats(85, 89)}",
+                f"  • {_bucket_stats(90, 100)}",
                 "التفصيل:",
             ]
             for k, v in sorted(by_result.items()):
