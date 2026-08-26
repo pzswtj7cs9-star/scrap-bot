@@ -99,7 +99,7 @@ def get_market_regime(symbol: str = "SPY") -> dict:
         if df is None or len(df) < 210:
             return {
                 "regime": "neutral",
-                "min_score_adj": 85,
+                "min_score_adj": 84,
                 "allow_auto": True,
                 "detail": "بيانات السوق غير كافية — وضع محايد",
                 "spy_price": None,
@@ -123,12 +123,12 @@ def get_market_regime(symbol: str = "SPY") -> dict:
 
         if above_50 and above_200 and stacked and rising_50:
             regime = "strong_bull"
-            min_adj = 85
+            min_adj = 84
             allow = True
             detail = f"{symbol} قوي جداً — فوق 50 و200 ومتوسط 50 صاعد"
         elif above_50 and above_200 and stacked:
             regime = "bull"
-            min_adj = 85
+            min_adj = 84
             allow = True
             detail = f"{symbol} صاعد — فوق 50 و200"
         elif above_50 and above_200:

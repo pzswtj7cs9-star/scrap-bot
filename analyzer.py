@@ -60,6 +60,114 @@ class SignalResult:
     quality_ok: bool = True
     atr_pct: float = 0.0
     ext_sma20: float = 0.0
+    structure_zone: str = "محايدة"  # تجميع / توزيع / محايدة — معلومة فقط
+    pattern_note: str = ""
+    pattern_target: float | None = None
+
+
+def _detect_structure_zone(df: pd.DataFrame, price: float, vol_ratio: float) -> str:
+    """تقدير بسيط لمكان السعر في النطاق — معلومة فقط ولا يؤثر على الإرسال."""
+    try:
+        window = df.tail(40)
+        hi = float(window["High"].max())
+        lo = float(window["Low"].min())
+        if hi <= lo:
+            return "محايدة"
+        pos = (price - lo) / (hi - lo)
+        # تجميع: الثلث السفلي + حجم لا يضعف
+        if pos <= 0.35 and vol_ratio >= 0.9:
+            return "تجميع محتمل"
+        # توزيع: الثلث العلوي
+        if pos >= 0.75:
+            return "توزيع/ضغط بيع محتمل"
+        return "محايدة"
+    except Exception:
+        return "محايدة"
+
+
+def _detect_classical_patterns(df: pd.DataFrame, price: float) -> tuple[str, float | None]:
+    """
+    أنماط كلاسيكية تقديرية (معلومة فقط — ليست إشارة تنفيذ).
+    يشمل تقريباً: قاع/قمة مزدوجة، رأس وكتفين، مثلث، علم، وتد، قناة/وولف مبسط.
+    """
+    try:
+        if len(df) < 35:
+            return "", None
+        tail = df.tail(40)
+        highs = tail["High"].astype(float)
+        lows = tail["Low"].astype(float)
+        closes = tail["Close"].astype(float)
+        hi = float(highs.max())
+        lo = float(lows.min())
+        rng = hi - lo
+        if rng <= 0:
+            return "", None
+
+        last_hi = float(highs.iloc[-8:].max())
+        last_lo = float(lows.iloc[-8:].min())
+        mid_hi = float(highs.iloc[-20:-8].max())
+        mid_lo = float(lows.iloc[-20:-8].min())
+        old_hi = float(highs.iloc[-35:-20].max())
+        old_lo = float(lows.iloc[-35:-20].min())
+
+        # قاع مزدوج
+        if abs(old_lo - last_lo) / price < 0.015 and last_hi > old_lo * 1.03 and price > (old_lo + last_hi) / 2:
+            tgt = last_hi + abs(last_hi - old_lo)
+            return "قاع مزدوج محتمل (تقديري)", round(tgt, 2)
+
+        # قمة مزدوجة
+        if abs(old_hi - last_hi) / price < 0.015 and last_lo < old_hi * 0.97 and price < (old_hi + last_lo) / 2:
+            tgt = last_lo - abs(old_hi - last_lo)
+            return "قمة مزدوجة محتملة (تقديري)", round(tgt, 2)
+
+        # رأس وكتفين مبسط: كتف-رأس-كتف
+        if mid_hi > old_hi * 1.02 and mid_hi > last_hi * 1.02 and abs(old_hi - last_hi) / price < 0.03:
+            neck = min(mid_lo, last_lo)
+            tgt = neck - (mid_hi - neck)
+            return "رأس وكتفين محتمل (تقديري)", round(tgt, 2)
+
+        # رأس وكتفين مقلوب
+        if mid_lo < old_lo * 0.98 and mid_lo < last_lo * 0.98 and abs(old_lo - last_lo) / price < 0.03:
+            neck = max(mid_hi, last_hi)
+            tgt = neck + (neck - mid_lo)
+            return "رأس وكتفين مقلوب محتمل (تقديري)", round(tgt, 2)
+
+        # مثلث ضاغط
+        if (old_hi - last_hi) / rng > 0.15 and (last_lo - old_lo) / rng > 0.15:
+            tgt = price + rng * 0.5
+            return "مثلث متماثل/ضاغط (تقديري)", round(tgt, 2)
+
+        # وتد هابط (غالباً صاعد بعد الكسر)
+        if last_hi < old_hi and last_lo < old_lo and (old_hi - last_hi) > (old_lo - last_lo) and price > last_hi:
+            tgt = price + abs(old_hi - last_lo) * 0.6
+            return "وتد هابط / كسر لأعلى (تقديري)", round(tgt, 2)
+
+        # وتد صاعد (غالباً هابط بعد الكسر)
+        if last_hi > old_hi and last_lo > old_lo and price < last_lo:
+            tgt = price - abs(last_hi - old_lo) * 0.6
+            return "وتد صاعد / كسر لأسفل (تقديري)", round(tgt, 2)
+
+        # علم صاعد بعد عمود
+        pole = float(closes.iloc[-25]) 
+        if price > pole * 1.08 and (last_hi - last_lo) / price < 0.04:
+            tgt = price + abs(price - pole) * 0.7
+            return "علم/توطيد بعد صعود (تقديري)", round(tgt, 2)
+
+        # قناة/وولف مبسط صاعد
+        h1, h2 = float(highs.iloc[-18]), float(highs.iloc[-6])
+        l1, l2 = float(lows.iloc[-18]), float(lows.iloc[-6])
+        if h2 < h1 and l2 < l1 and price > h2:
+            tgt = price + abs(h1 - l1) * 0.8
+            return "قناة/وولف مبسط صاعد (تقديري)", round(tgt, 2)
+
+        # قناة/وولف مبسط هابط
+        if h2 > h1 and l2 > l1 and price < l2:
+            tgt = price - abs(h2 - l2) * 0.8
+            return "قناة/وولف مبسط هابط (تقديري)", round(tgt, 2)
+
+        return "لا يوجد نمط كلاسيكي واضح", None
+    except Exception:
+        return "", None
 
 
 def _sma(s: pd.Series, n: int) -> pd.Series:
@@ -462,7 +570,7 @@ def analyze(symbol: str, name: str = "", with_live: bool = True) -> SignalResult
     # 1) امتداد عن متوسط 20  2) تذبذب ATR٪  3) حجم حقيقي
     atr_pct = (last_atr / price * 100) if price else 0.0
     quality_ok = True
-    if ext_from_sma20 > 6.0:
+    if ext_from_sma20 > 7.0:
         quality_ok = False
         warnings.append(f"ممتد بعيداً عن متوسط 20 ({ext_from_sma20:.1f}%) — تجنّب المطاردة")
         score = min(score, 84)
@@ -470,13 +578,16 @@ def analyze(symbol: str, name: str = "", with_live: bool = True) -> SignalResult
         quality_ok = False
         warnings.append(f"تذبذب عالي ATR={atr_pct:.1f}% — سهم هايج")
         score = min(score, 84)
-    if vol_ratio < 0.95:
+    if vol_ratio < 0.90:
         quality_ok = False
         warnings.append(f"الحجم ضعيف جداً ({vol_ratio:.2f}x) — لا دعم شرائي كافٍ")
         score = min(score, 84)
-    elif vol_ratio < 1.15 and quality_ok:
-        # حجم مقبول بالكاد: لا يفشل الفلتر لكنه لا يُفضَّل للتنبيه التلقائي القوي
+    elif vol_ratio < 1.05 and quality_ok:
         warnings.append(f"الحجم دون المثالي ({vol_ratio:.2f}x)")
+
+    # مناطق الهيكل + نمط تقديري — معلومة فقط (لا تؤثر على الإرسال)
+    structure_zone = _detect_structure_zone(df, price, vol_ratio)
+    pattern_note, pattern_target = _detect_classical_patterns(df, price)
 
     score_i = int(max(0, min(100, round(score))))
     grade, bias = _grade(score_i)
@@ -568,10 +679,13 @@ def analyze(symbol: str, name: str = "", with_live: bool = True) -> SignalResult
         quality_ok=quality_ok,
         atr_pct=round(atr_pct, 2),
         ext_sma20=round(ext_from_sma20, 2),
+        structure_zone=structure_zone,
+        pattern_note=pattern_note,
+        pattern_target=pattern_target,
     )
 
 
-def format_signal_ar(sig: SignalResult, min_score: int = 85, rank: int | None = None) -> str:
+def format_signal_ar(sig: SignalResult, min_score: int = 84, rank: int | None = None) -> str:
     arrow = "▲" if sig.change_pct >= 0 else "▼"
     conf = []
     if sig.m15_ok:
@@ -591,7 +705,14 @@ def format_signal_ar(sig: SignalResult, min_score: int = 85, rank: int | None = 
         f"وقف: {sig.stop_loss:.2f} ({sig.sl_method})  |  مخاطرة {sig.risk_pct:.2f}%",
         f"أهداف: {sig.tp1:.2f}  |  {sig.tp2:.2f}  |  {sig.tp3:.2f}",
         f"عائد/مخاطرة ≈ 1:{sig.reward_r:.1f}",
+        f"المنطقة: {getattr(sig, 'structure_zone', 'محايدة')} (معلومة فقط)",
     ]
+    if getattr(sig, "pattern_note", ""):
+        pt = getattr(sig, "pattern_target", None)
+        if pt:
+            lines.append(f"نمط: {sig.pattern_note} | هدف تقديري {pt:.2f}")
+        else:
+            lines.append(f"نمط: {sig.pattern_note}")
 
     why = sig.reasons[:3]
     if why:
@@ -616,7 +737,7 @@ def format_signal_ar(sig: SignalResult, min_score: int = 85, rank: int | None = 
 def scan_symbols(
     symbols: list[str],
     names: dict,
-    min_score: int = 85,
+    min_score: int = 84,
     require_live: bool = True,
     limit: int = 5,
     skip_earnings: bool = True,
@@ -629,6 +750,11 @@ def scan_symbols(
         from earnings import is_near_earnings
     except Exception:
         is_near_earnings = None
+
+    try:
+        from stocks import MAX_AUTO_PRICE
+    except Exception:
+        MAX_AUTO_PRICE = 200.0
 
     # فلتر نظام السوق
     try:
@@ -649,6 +775,9 @@ def scan_symbols(
                     continue
             sig = analyze(sym, names.get(sym, sym), with_live=True)
             sig.regime = regime.get("regime", "neutral")
+            # حد السعر للتنبيه التلقائي
+            if sig.price > float(MAX_AUTO_PRICE):
+                continue
             if sig.score < effective_min:
                 continue
             if require_live and not sig.live_ok:
@@ -658,7 +787,7 @@ def scan_symbols(
             # فلتر جودة الدخول للتنبيه التلقائي
             if not getattr(sig, "quality_ok", True):
                 continue
-            if getattr(sig, "volume_ratio", 0) < 1.10:
+            if getattr(sig, "volume_ratio", 0) < 1.00:
                 continue
             results.append(sig)
         except Exception:

@@ -60,7 +60,7 @@ log = logging.getLogger("halal-bot")
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 OWNER_CHAT_ID = os.getenv("OWNER_CHAT_ID", "").strip()
-MIN_SCORE = int(os.getenv("MIN_SCORE", "85"))
+MIN_SCORE = int(os.getenv("MIN_SCORE", "84"))
 DAILY_MAX = int(os.getenv("DAILY_MAX_ALERTS", "5"))
 ALERT_EVERY_MINUTES = int(os.getenv("ALERT_EVERY_MINUTES", "90"))
 LIVE_SCAN_SECONDS = int(os.getenv("LIVE_SCAN_SECONDS", "60"))
@@ -229,7 +229,7 @@ WELCOME = """بسم الله الرحمن الرحيم
 بوت الأسهم الأمريكية الحلال — النسخة المحسّنة.
 
 التنبيه التلقائي:
-• حد أساسي 85/100 + تأكيد 5د + تأكيد 15د
+• حد أساسي 84/100 + تأكيد 5د + تأكيد 15د + فلتر سعر ≤200$
 • فلتر نظام السوق (SPY): يرفع الحد أو يوقف التنبيهات عند الهبوط
 • سهم واحد كل 90 دقيقة (الأقوى)
 • سقف 5 أسهم يومياً

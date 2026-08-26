@@ -1,56 +1,73 @@
 """
-قائمة أسهم أمريكية شائعة التصنيف كحلال وفق معايير AAOIFI
-(نشاط مباح + نسب الدين/الفائدة ضمن الحدود المتعارف عليها).
+قائمة أسهم أمريكية شائعة التصنيف كحلال وفق معايير AAOIFI.
+المسح التلقائي: 35 سهماً مختارة لتكون عادة تحت 200$ + فلتر سعر وقت المسح.
 
-تنبيه مهم:
-- التصنيف الشرعي يتغير مع القوائم المالية الفصلية.
-- هذه القائمة نقطة بداية تعليمية وليست فتوى دائمة.
-- راجع Zoya / Musaffa / HalalScreener / HalalWallet قبل الشراء.
+تنبيه:
+- التصنيف الشرعي يتغير فصلياً. راجع Zoya / Musaffa قبل الشراء.
+- الأسعار تتحرك؛ أي سهم يتجاوز MAX_AUTO_PRICE يُستبعد من التنبيه التلقائي.
 """
 
+MAX_AUTO_PRICE = 200.0
+
 HALAL_STOCKS = {
+    "INTC": "Intel",
+    "ON": "ON Semiconductor",
+    "SWKS": "Skyworks",
+    "MCHP": "Microchip",
+    "QCOM": "Qualcomm",
+    "MRVL": "Marvell",
+    "QRVO": "Qorvo",
+    "SMTC": "Semtech",
+    "CRUS": "Cirrus Logic",
+    "STM": "STMicroelectronics",
+    "AMKR": "Amkor",
+    "UMC": "United Microelectronics",
+    "ASX": "ASE Technology",
+    "GLW": "Corning",
+    "CSCO": "Cisco",
+    "HPQ": "HP",
+    "FTNT": "Fortinet",
+    "PYPL": "PayPal",
+    "PEP": "PepsiCo",
+    "ABBV": "AbbVie",
+    "ABT": "Abbott",
+    "AMGN": "Amgen",
+    "MDT": "Medtronic",
+    "GILD": "Gilead",
+    "BMY": "Bristol-Myers",
+    "PFE": "Pfizer",
+    "FAST": "Fastenal",
+    "PAYX": "Paychex",
+    "ROST": "Ross Stores",
+    "NKE": "Nike",
+    "SBUX": "Starbucks",
+    "TGT": "Target",
+    "DIOD": "Diodes",
+    "KLIC": "Kulicke & Soffa",
+    "SIMO": "Silicon Motion",
     "NVDA": "NVIDIA",
     "AAPL": "Apple",
     "MSFT": "Microsoft",
     "GOOGL": "Alphabet",
-    "GOOG": "Alphabet Class C",
-    "TSLA": "Tesla",
-    "META": "Meta Platforms",
     "AMD": "AMD",
-    "AVGO": "Broadcom",
     "AMZN": "Amazon",
-    "TSM": "TSMC",
-    "ASML": "ASML",
-    "AMAT": "Applied Materials",
-    "QCOM": "Qualcomm",
+    "META": "Meta Platforms",
+    "TSLA": "Tesla",
     "MU": "Micron",
+    "TSM": "TSMC",
+    "AMAT": "Applied Materials",
     "ADBE": "Adobe",
     "CRM": "Salesforce",
-    "INTU": "Intuit",
-    "NOW": "ServiceNow",
-    "PANW": "Palo Alto Networks",
-    "KLAC": "KLA",
-    "LRCX": "Lam Research",
-    "SNPS": "Synopsys",
-    "CDNS": "Cadence",
-    "PEP": "PepsiCo",
-    "ABBV": "AbbVie",
-    "ABT": "Abbott",
     "LLY": "Eli Lilly",
-    "AMGN": "Amgen",
-    "ACN": "Accenture",
-    "ADI": "Analog Devices",
-    "ANET": "Arista Networks",
-    "APH": "Amphenol",
-    "TDG": "TransDigm",
-    "CTAS": "Cintas",
 }
 
-# الأسهم الأساسية للمسح السريع (أقل ضغط على yfinance)
 CORE_WATCHLIST = [
-    "NVDA", "AAPL", "MSFT", "GOOGL", "TSLA", "META",
-    "AMD", "AVGO", "AMZN", "TSM", "AMAT", "QCOM",
-    "ADBE", "CRM", "LLY", "ABBV", "PEP", "MU",
+    "INTC", "ON", "SWKS", "MCHP", "QCOM", "MRVL",
+    "QRVO", "SMTC", "CRUS", "STM", "AMKR", "UMC",
+    "ASX", "GLW", "CSCO", "HPQ", "FTNT", "PYPL",
+    "PEP", "ABBV", "ABT", "AMGN", "MDT", "GILD",
+    "BMY", "PFE", "FAST", "PAYX", "ROST", "NKE",
+    "SBUX", "TGT", "DIOD", "KLIC", "SIMO",
 ]
 
 

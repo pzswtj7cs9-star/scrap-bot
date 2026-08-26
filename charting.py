@@ -1,4 +1,4 @@
-"""رسم شموع مع منطقة الشراء والوقف والأهداف."""
+"""رسم شموع مع منطقة الشراء والوقف والأهداف + معلومات الهيكل/النمط."""
 
 from __future__ import annotations
 
@@ -35,7 +35,22 @@ def build_signal_chart(sig: SignalResult, out_dir: Path) -> Optional[Path]:
             ax.plot([dates[i], dates[i]], [l, h], color=color, linewidth=1)
             ax.plot([dates[i], dates[i]], [o, c], color=color, linewidth=3.2)
 
-        # مستويات
+        # نطاق آخر 40 شمعة لتظليل التجميع/التوزيع (معلومة بصرية فقط)
+        try:
+            w = df.tail(40)
+            rng_hi = float(w["High"].max())
+            rng_lo = float(w["Low"].min())
+            zone = getattr(sig, "structure_zone", "") or ""
+            if "تجميع" in zone:
+                mid = rng_lo + (rng_hi - rng_lo) * 0.35
+                ax.axhspan(rng_lo, mid, color="#86efac", alpha=0.12, label="تجميع محتمل")
+            elif "توزيع" in zone:
+                mid = rng_lo + (rng_hi - rng_lo) * 0.75
+                ax.axhspan(mid, rng_hi, color="#fca5a5", alpha=0.12, label="توزيع محتمل")
+        except Exception:
+            pass
+
+        # مستويات الصفقة
         ax.axhspan(sig.buy_low, sig.buy_high, color="#22c55e", alpha=0.18, label="منطقة الشراء")
         ax.axhline(sig.stop_loss, color="#ef4444", linestyle="--", linewidth=1.4, label=f"وقف {sig.stop_loss:.2f}")
         ax.axhline(sig.tp1, color="#3b82f6", linestyle=":", linewidth=1.2, label=f"هدف1 {sig.tp1:.2f}")
@@ -43,11 +58,20 @@ def build_signal_chart(sig: SignalResult, out_dir: Path) -> Optional[Path]:
         ax.axhline(sig.tp3, color="#1d4ed8", linestyle=":", linewidth=1.2, label=f"هدف3 {sig.tp3:.2f}")
         ax.axhline(sig.price, color="#111827", linestyle="-", linewidth=1.0, alpha=0.7, label=f"السعر {sig.price:.2f}")
 
-        ax.set_title(f"{sig.name} ({sig.symbol}) — درجة {sig.score}/100", fontsize=13)
+        # هدف النمط التقديري (وولف مبسط وغيره)
+        pt = getattr(sig, "pattern_target", None)
+        if pt:
+            ax.axhline(float(pt), color="#a855f7", linestyle="-.", linewidth=1.3, label=f"هدف نمط {float(pt):.2f}")
+
+        title = f"{sig.name} ({sig.symbol}) — درجة {sig.score}/100"
+        zone = getattr(sig, "structure_zone", "")
+        if zone and zone != "محايدة":
+            title += f" | {zone}"
+        ax.set_title(title, fontsize=12)
         ax.set_ylabel("السعر $")
         ax.xaxis.set_major_formatter(mdates.DateFormatter("%m-%d"))
         ax.grid(True, alpha=0.25)
-        ax.legend(loc="upper left", fontsize=8, framealpha=0.9)
+        ax.legend(loc="upper left", fontsize=7, framealpha=0.9)
         fig.autofmt_xdate()
         fig.tight_layout()
 
