@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any, Optional
 from zoneinfo import ZoneInfo
 
+import pandas as pd
 import yfinance as yf
 
 from analyzer import SignalResult
@@ -133,12 +134,34 @@ class PerformanceLog:
             tp3 = float(row["tp3"])
             entry = float(row["entry"])
 
-            # أعلى/أدنى منذ الفتح (تقريبي)
+            # أعلى/أدنى منذ الفتح فقط (لا نستخدم قيعان ما قبل الإشارة)
             try:
-                # صفوف بعد وقت الفتح قدر الإمكان
-                highs = df["High"].astype(float)
-                lows = df["Low"].astype(float)
-                last_close = float(df["Close"].iloc[-1])
+                work = df.copy()
+                # توحيد الفهرس الزمني وفلترة ما بعد وقت الدخول
+                if not isinstance(work.index, pd.DatetimeIndex):
+                    for col in ("Datetime", "Date", "index"):
+                        if col in work.columns:
+                            work = work.set_index(col)
+                            break
+                if isinstance(work.index, pd.DatetimeIndex):
+                    idx = work.index
+                    if idx.tz is None:
+                        idx = idx.tz_localize(NY, ambiguous="NaT", nonexistent="NaT")
+                    else:
+                        idx = idx.tz_convert(NY)
+                    work = work.copy()
+                    work.index = idx
+                    work = work[~work.index.isna()]
+                    # ابدأ من شمعة الدخول تقريباً (هامش دقيقتين)
+                    work = work[work.index >= (opened - timedelta(minutes=2))]
+                if work.empty:
+                    # لا نغلق الصفقة إذا ما قدرنا نعزل فترة ما بعد الدخول
+                    return []
+
+                highs = work["High"].astype(float)
+                lows = work["Low"].astype(float)
+                closes = work["Close"].astype(float)
+                last_close = float(closes.iloc[-1])
                 max_high = float(highs.max())
                 min_low = float(lows.min())
             except Exception:
@@ -152,7 +175,6 @@ class PerformanceLog:
                     row["exit_price"] = round(price, 4)
                     row["exit_at"] = _now().isoformat()
                     row["pnl_pct"] = pnl
-                    # تحديث الأوزان التكيفية عند الإغلاق
                     factors = row.get("factors") or []
                     if factors:
                         try:
@@ -172,9 +194,29 @@ class PerformanceLog:
                     "timeframe": tf,
                 }
 
-            # الوقف أولاً (تحفظي)
-            if min_low <= stop:
-                events.append(_evt("stop", stop, True))
+            # الوقف: نطلب تأكيداً أقوى من لمسة وهمية واحدة
+            # 1) إغلاق شمعة تحت/عند الوقف، أو
+            # 2) قاعان متتاليان تحت الوقف على 5م
+            stop_hit = False
+            stop_px = stop
+            try:
+                below = (closes <= stop) | (lows <= stop)
+                if bool((closes <= stop).iloc[-3:].any()):
+                    stop_hit = True
+                    stop_px = float(min(stop, float(closes.iloc[-3:].min())))
+                elif tf == "5m" and len(lows) >= 2:
+                    if float(lows.iloc[-1]) <= stop and float(lows.iloc[-2]) <= stop:
+                        stop_hit = True
+                        stop_px = stop
+                elif tf == "1d" and float(lows.iloc[-1]) <= stop and float(closes.iloc[-1]) <= stop * 1.002:
+                    # يومي: قاع اليوم + إغلاق قريب من الوقف
+                    stop_hit = True
+                    stop_px = stop
+            except Exception:
+                stop_hit = min_low <= stop and last_close <= stop
+
+            if stop_hit:
+                events.append(_evt("stop", stop_px, True))
                 return events
 
             # أهداف تدريجية: ينبّه عند كل هدف، ويغلق عند الثالث
@@ -189,13 +231,11 @@ class PerformanceLog:
                 events.append(_evt("tp3", tp3, True))
                 return events
 
-            # انتهاء زمني
             age_days = (_now() - opened).days
             if age_days >= 15 and row.get("status") == "open":
                 events.append(_evt("timeout", last_close, True))
                 return events
 
-            # حفظ أعلام الأهداف حتى لو ما في إغلاق
             if events:
                 row["last_price"] = round(last_close, 4)
                 return events
