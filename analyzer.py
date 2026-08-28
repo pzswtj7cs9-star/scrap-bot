@@ -612,10 +612,13 @@ def analyze(symbol: str, name: str = "", with_live: bool = True) -> SignalResult
     risk = price - stop_loss
     tp1 = price + risk * 1.6
     tp2 = price + risk * 2.6
-    tp3 = min(
-        price + risk * 4.0,
-        swing_high * 1.03 if swing_high > price else price + risk * 4.0,
-    )
+    tp3 = price + risk * 4.0
+    if swing_high and swing_high > price:
+        swing_tp = swing_high * 1.03
+        if swing_tp > tp2:
+            tp3 = min(tp3, swing_tp)
+    if not (tp1 < tp2 < tp3):
+        tp1, tp2, tp3 = price + risk * 1.6, price + risk * 2.6, price + risk * 4.0
     risk_pct = risk / price * 100 if price else 0
     reward_r = (tp2 - price) / risk if risk > 0 else 0
 
