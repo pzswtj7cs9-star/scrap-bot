@@ -63,6 +63,9 @@ class SignalResult:
     structure_zone: str = "محايدة"  # تجميع / توزيع / محايدة — معلومة فقط
     pattern_note: str = ""
     pattern_target: float | None = None
+    near_new_high: bool = False
+    dist_from_high_pct: float = 0.0
+    period_high: float = 0.0
 
 
 def _detect_structure_zone(df: pd.DataFrame, price: float, vol_ratio: float) -> str:
@@ -226,6 +229,20 @@ def fetch_history(symbol: str, period: str = "1y") -> pd.DataFrame:
     return df.dropna(subset=["Close", "High", "Low", "Volume"])
 
 
+def _historic_high(symbol: str, fallback_df: pd.DataFrame, price: float) -> float:
+    """أعلى قمة في كل تاريخ السهم المتاح — بدون حد سنوات."""
+    try:
+        from market_data import fetch_history as _fh
+        long_df = _fh(symbol, period="max")
+        if long_df is not None and not long_df.empty and "High" in long_df.columns:
+            return float(long_df["High"].max())
+    except Exception:
+        pass
+    if fallback_df is not None and not fallback_df.empty:
+        return float(fallback_df["High"].max())
+    return price
+
+
 def fetch_intraday(symbol: str, interval: str = "5m", period: str = "5d") -> pd.DataFrame:
     from market_data import fetch_intraday as _fi
 
@@ -350,6 +367,10 @@ def analyze(symbol: str, name: str = "", with_live: bool = True) -> SignalResult
 
     swing_low = float(df["Low"].iloc[-12:].min())
     swing_high = float(df["High"].iloc[-20:].max())
+    # قمة تاريخية طويلة المدى: نمنع فقط إذا يصنع قمة جديدة الآن
+    period_high = _historic_high(symbol, df, price)
+    dist_from_high_pct = ((period_high - price) / period_high * 100) if period_high else 0.0
+    near_new_high = dist_from_high_pct < 2.0
     recent_low = float(df["Low"].iloc[-5:].min())
 
     score = 0.0
@@ -685,6 +706,9 @@ def analyze(symbol: str, name: str = "", with_live: bool = True) -> SignalResult
         structure_zone=structure_zone,
         pattern_note=pattern_note,
         pattern_target=pattern_target,
+        near_new_high=near_new_high,
+        dist_from_high_pct=round(dist_from_high_pct, 2),
+        period_high=round(period_high, 2),
     )
 
 
@@ -710,6 +734,10 @@ def format_signal_ar(sig: SignalResult, min_score: int = 84, rank: int | None = 
         f"عائد/مخاطرة ≈ 1:{sig.reward_r:.1f}",
         f"المنطقة: {getattr(sig, 'structure_zone', 'محايدة')} (معلومة فقط)",
     ]
+    if getattr(sig, "near_new_high", False):
+        lines.append(
+            f"قرب قمة تاريخية جديدة: أعلى قمة {getattr(sig, 'period_high', 0):.2f} | المسافة {getattr(sig, 'dist_from_high_pct', 0):.2f}% (حد الإرسال 2%+)"
+        )
     if getattr(sig, "pattern_note", ""):
         pt = getattr(sig, "pattern_target", None)
         if pt:
@@ -797,6 +825,8 @@ def scan_symbols(
             if not getattr(sig, "quality_ok", True):
                 continue
             if getattr(sig, "volume_ratio", 0) < vol_gate:
+                continue
+            if getattr(sig, "near_new_high", False):
                 continue
             results.append(sig)
         except Exception:
