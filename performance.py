@@ -58,6 +58,12 @@ class PerformanceLog:
             "tp3": round(sig.tp3, 4),
             "score": sig.score,
             "factors": factors,
+            "regime": getattr(sig, "regime", "") or "",
+            "volume_ratio": round(float(getattr(sig, "volume_ratio", 0) or 0), 3),
+            "ext_sma20": round(float(getattr(sig, "ext_sma20", 0) or 0), 2),
+            "atr_pct": round(float(getattr(sig, "atr_pct", 0) or 0), 2),
+            "structure_zone": getattr(sig, "structure_zone", "") or "",
+            "quality_ok": bool(getattr(sig, "quality_ok", True)),
             "status": "open",
             "exit_price": None,
             "exit_at": None,
@@ -74,6 +80,30 @@ class PerformanceLog:
 
     def all_signals(self) -> list[dict[str, Any]]:
         return self._load()
+
+    def reopen_symbol(self, symbol: str) -> dict[str, Any] | None:
+        """يعيد فتح آخر صفقة مغلقة لنفس الرمز (مثلاً بعد إغلاق وقف خاطئ)."""
+        symbol = symbol.upper().strip()
+        rows = self._load()
+        for row in reversed(rows):
+            if row.get("symbol") != symbol:
+                continue
+            if row.get("status") == "open":
+                return {"ok": False, "reason": "already_open", "row": row}
+            row["status"] = "open"
+            row["exit_price"] = None
+            row["exit_at"] = None
+            row["result"] = None
+            row["pnl_pct"] = None
+            row["hit_tp1"] = False
+            row["hit_tp2"] = False
+            row["hit_tp3"] = False
+            note = (row.get("notes") or "").strip()
+            tag = "reopened_after_false_stop"
+            row["notes"] = f"{note} | {tag}".strip(" |")
+            self._save(rows)
+            return {"ok": True, "row": row}
+        return None
 
     def update_open_outcomes(self, prefer_intraday: bool = True) -> list[dict[str, Any]]:
         """يفحص الإشارات المفتوحة. يعيد قائمة الأحداث الجديدة للتنبيه."""
@@ -93,6 +123,11 @@ class PerformanceLog:
                     events.append(ev)
         if dirty:
             self._save(rows)
+            try:
+                from auto_tune import AUTO
+                AUTO.recompute_from_rows(self._load())
+            except Exception:
+                pass
         return events
 
     def _fetch_bars(self, symbol: str, opened: datetime, prefer_intraday: bool):
@@ -330,6 +365,46 @@ class PerformanceLog:
             w = [r for r in subset if (r.get("pnl_pct") or 0) > 0]
             return f"{lo}-{hi}: {len(w)}/{len(subset)} ({len(w)/len(subset)*100:.0f}%)"
 
+        def _r_of(r: dict[str, Any]) -> float | None:
+            entry = float(r.get("entry") or 0)
+            stop = float(r.get("stop_loss") or 0)
+            pnl = float(r.get("pnl_pct") or 0)
+            risk_pct = ((entry - stop) / entry * 100) if entry and stop and entry > stop else 0
+            if risk_pct <= 0:
+                return None
+            return pnl / risk_pct
+
+        def _regime_line(label: str, keys: set[str]) -> str:
+            subset = [r for r in closed if str(r.get("regime") or "") in keys]
+            if not subset:
+                return f"{label}: لا بيانات"
+            w = [r for r in subset if (r.get("pnl_pct") or 0) > 0]
+            return f"{label}: {len(w)}/{len(subset)} نجاح ({len(w)/len(subset)*100:.0f}%)"
+
+        fail_counts: dict[str, int] = {}
+        for r in losses:
+            reasons = []
+            vol = float(r.get("volume_ratio") or 0)
+            ext = float(r.get("ext_sma20") or 0)
+            zone = str(r.get("structure_zone") or "")
+            regime = str(r.get("regime") or "")
+            if vol and vol < 1.05:
+                reasons.append("حجم ضعيف")
+            if ext > 7:
+                reasons.append("امتداد عن متوسط 20")
+            if "توزيع" in zone:
+                reasons.append("قرب توزيع")
+            if regime in {"weak", "bear"}:
+                reasons.append("سوق ضعيف")
+            if r.get("result") == "stop":
+                reasons.append("ضرب وقف")
+            if r.get("result") == "timeout":
+                reasons.append("انتهاء مهلة")
+            if not reasons:
+                reasons.append("غير مصنّف")
+            for reason in reasons:
+                fail_counts[reason] = fail_counts.get(reason, 0) + 1
+
         lines = [
             "📈 سجل أداء الإشارات",
             f"الإجمالي: {len(rows)} | مفتوحة: {open_n} | مغلقة: {len(closed)}",
@@ -340,18 +415,42 @@ class PerformanceLog:
                 f"متوسط العائد/الخسارة: {avg_pnl:+.2f}%",
                 f"متوسط R المتحقق: {avg_r:+.2f}R",
                 f"أقصى انخفاض تراكمي: {max_dd:.2f}%",
+                "",
+                "تفصيل النتائج:",
+                f"  • وقف: {by_result.get('stop', 0)}",
+                f"  • لمس هدف 1: {sum(1 for r in rows if r.get('hit_tp1'))}",
+                f"  • لمس هدف 2: {sum(1 for r in rows if r.get('hit_tp2'))}",
+                f"  • لمس هدف 3: {sum(1 for r in rows if r.get('hit_tp3')) or by_result.get('tp3', 0)}",
+                f"  • انتهاء مهلة: {by_result.get('timeout', 0)}",
+                "",
                 "حسب الدرجة:",
-                f"  • {_bucket_stats(85, 89)}",
-                f"  • {_bucket_stats(90, 100)}",
-                "التفصيل:",
+                f"  • {_bucket_stats(84, 89)}",
+                f"  • {_bucket_stats(90, 94)}",
+                f"  • {_bucket_stats(95, 100)}",
+                "",
+                "حسب نظام السوق:",
+                f"  • {_regime_line('قوي/صاعد', {'strong_bull', 'bull'})}",
+                f"  • {_regime_line('محايد', {'neutral'})}",
+                f"  • {_regime_line('ضعيف/هابط', {'weak', 'bear'})}",
             ]
-            for k, v in sorted(by_result.items()):
-                lines.append(f"  • {k}: {v}")
+            if fail_counts:
+                lines.append("")
+                lines.append("أكثر أسباب الخسارة المتكررة:")
+                for k, v in sorted(fail_counts.items(), key=lambda x: -x[1])[:6]:
+                    lines.append(f"  • {k}: {v}")
+            extra = [k for k in sorted(by_result) if k not in {"stop", "tp1", "tp2", "tp3", "timeout"}]
+            if extra:
+                lines.append("")
+                lines.append("نتائج أخرى:")
+                for k in extra:
+                    lines.append(f"  • {k}: {by_result[k]}")
             lines.append("")
-            lines.append("آخر 5 مغلقة:")
+            lines.append("آخر 5 صفقات:")
             for r in closed[-5:][::-1]:
+                rr = _r_of(r)
+                rtxt = f"{rr:+.1f}R" if rr is not None else "—"
                 lines.append(
-                    f"  {r['symbol']} | {r.get('result')} | {r.get('pnl_pct'):+.2f}% | دخول {r['entry']}"
+                    f"  {r.get('symbol')} | {r.get('score')} | {r.get('result') or '?'} | {rtxt}"
                 )
         if open_n:
             lines.append("")
@@ -362,6 +461,12 @@ class PerformanceLog:
             from weights import WEIGHTS
             lines.append("")
             lines.append(WEIGHTS.summary_text())
+        except Exception:
+            pass
+        try:
+            from auto_tune import AUTO
+            lines.append("")
+            lines.append(AUTO.summary_text())
         except Exception:
             pass
         lines.append("")

@@ -46,6 +46,7 @@ from market import (
     session_label,
 )
 from performance import PerformanceLog
+from auto_tune import AUTO
 from position import calc_position, format_position_ar
 from stocks import CORE_WATCHLIST, HALAL_STOCKS, display_name, is_known_halal
 from weights import WEIGHTS
@@ -78,6 +79,8 @@ CHART_DIR = DATA_DIR / "charts"
 # ربط مسار الأوزان
 WEIGHTS.path = WEIGHTS_FILE
 WEIGHTS._load()
+AUTO.path = DATA_DIR / "auto_tune.json"
+AUTO._load()
 
 PERF = PerformanceLog(PERF_FILE)
 COOL = CooldownBook(COOL_FILE, days=COOLDOWN_DAYS)
@@ -478,6 +481,36 @@ async def cmd_perf(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await msg.edit_text(text)
 
 
+async def cmd_reopen(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """إعادة فتح صفقة أُغلقت بالخطأ في السجل (مثلاً وقف وهمي)."""
+    if not context.args:
+        await update.message.reply_text("الاستخدام:\n/reopen SBUX")
+        return
+    sym = context.args[0].upper().strip()
+    msg = await update.message.reply_text(f"جاري إعادة فتح {sym} في السجل...")
+
+    def _do():
+        return PERF.reopen_symbol(sym)
+
+    res = await asyncio.to_thread(_do)
+    if not res:
+        await msg.edit_text(f"ما لقيت صفقة مغلقة لـ {sym} في السجل.")
+        return
+    if not res.get("ok"):
+        row = res.get("row") or {}
+        await msg.edit_text(
+            f"{sym} مفتوحة أصلاً في السجل.\nدخول: {row.get('entry')} | وقف: {row.get('stop_loss')}"
+        )
+        return
+    row = res["row"]
+    await msg.edit_text(
+        f"تمت إعادة فتح {sym} في السجل ✅\n"
+        f"دخول: {row.get('entry')} | وقف: {row.get('stop_loss')}\n"
+        f"TP1: {row.get('tp1')} | TP2: {row.get('tp2')} | TP3: {row.get('tp3')}\n"
+        f"المتابعة تشتغل بالمنطق الجديد (بعد الإصلاح)."
+    )
+
+
 async def cmd_backtest(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     msg = await update.message.reply_text(
         "جاري الباكتست على آخر سنة (قد يستغرق دقيقة)..."
@@ -684,6 +717,7 @@ async def live_scan_job(context: ContextTypes.DEFAULT_TYPE) -> None:
             return
 
         effective_min = max(MIN_SCORE, int(regime.get("min_score_adj", MIN_SCORE)))
+        effective_min = AUTO.effective_floor(effective_min)
 
         state = load_state()
         already = set(state["sent"])
@@ -840,6 +874,7 @@ def build_app() -> Application:
     app.add_handler(CommandHandler("status", cmd_status))
     app.add_handler(CommandHandler("today", cmd_today))
     app.add_handler(CommandHandler("perf", cmd_perf))
+    app.add_handler(CommandHandler("reopen", cmd_reopen))
     app.add_handler(CommandHandler("backtest", cmd_backtest))
     app.add_handler(CommandHandler("size", cmd_size))
     app.add_handler(CommandHandler("chart", cmd_chart))

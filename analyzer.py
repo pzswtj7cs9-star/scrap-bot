@@ -765,6 +765,12 @@ def scan_symbols(
     except Exception:
         effective_min = min_score
         regime = {"regime": "neutral", "allow_auto": True}
+    try:
+        from auto_tune import AUTO
+        effective_min = AUTO.effective_floor(int(effective_min))
+        vol_gate = AUTO.volume_gate()
+    except Exception:
+        vol_gate = 1.00
 
     for sym in symbols:
         try:
@@ -787,7 +793,7 @@ def scan_symbols(
             # فلتر جودة الدخول للتنبيه التلقائي
             if not getattr(sig, "quality_ok", True):
                 continue
-            if getattr(sig, "volume_ratio", 0) < 1.00:
+            if getattr(sig, "volume_ratio", 0) < vol_gate:
                 continue
             results.append(sig)
         except Exception:
