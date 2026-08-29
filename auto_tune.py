@@ -26,6 +26,7 @@ class AutoTune:
         self.vol_gate = 1.00
         self.require_above_vwap = False
         self.require_vol_at_level = False
+        self.require_strong_reclaim = False
         self.last_note = "بانتظار 20 صفقة مغلقة للتعديل التلقائي"
         self._load()
 
@@ -38,6 +39,7 @@ class AutoTune:
             self.vol_gate = float(data.get("vol_gate", 1.00))
             self.require_above_vwap = bool(data.get("require_above_vwap", False))
             self.require_vol_at_level = bool(data.get("require_vol_at_level", False))
+            self.require_strong_reclaim = bool(data.get("require_strong_reclaim", False))
             self.last_note = str(data.get("last_note") or self.last_note)
         except Exception as exc:
             log.warning("auto_tune load: %s", exc)
@@ -51,6 +53,7 @@ class AutoTune:
                         "vol_gate": round(self.vol_gate, 2),
                         "require_above_vwap": self.require_above_vwap,
                         "require_vol_at_level": self.require_vol_at_level,
+                        "require_strong_reclaim": self.require_strong_reclaim,
                         "last_note": self.last_note,
                     },
                     ensure_ascii=False,
@@ -147,6 +150,18 @@ class AutoTune:
             changed = True
             notes.append("إلغاء شرط الحجم عند المستوى لأن النتائج بدونه مقبولة")
 
+        rec = [r for r in closed if r.get("dumped_then_reclaimed")]
+        wr_rec = wr(rec)
+        if wr_rec is not None and wr_rec < 0.40:
+            if not self.require_strong_reclaim:
+                self.require_strong_reclaim = True
+                changed = True
+                notes.append("تشديد ارتداد القمة لأن الإشارات بعد السقوط فشلت كثيراً")
+        elif wr_rec is not None and wr_rec >= 0.55 and self.require_strong_reclaim:
+            self.require_strong_reclaim = False
+            changed = True
+            notes.append("تخفيف ارتداد القمة لأن نتائج ما بعد السقوط مقبولة")
+
         self.last_note = " | ".join(notes) if notes else "لا تعديل — النتائج ضمن النطاق"
         self.save()
         return changed
@@ -158,6 +173,7 @@ class AutoTune:
             f"• بوابة الحجم: {self.vol_gate:.2f}x\n"
             f"• شرط فوق VWAP: {'نعم' if self.require_above_vwap else 'لا'}\n"
             f"• شرط الحجم عند المستوى: {'نعم' if self.require_vol_at_level else 'لا'}\n"
+            f"• تشديد ارتداد القمة: {'نعم' if self.require_strong_reclaim else 'لا'}\n"
             f"• {self.last_note}"
         )
 

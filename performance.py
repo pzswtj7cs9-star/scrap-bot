@@ -66,6 +66,7 @@ class PerformanceLog:
             "quality_ok": bool(getattr(sig, "quality_ok", True)),
             "vwap_day_note": getattr(sig, "vwap_day_note", "") or "",
             "vol_at_level": bool(getattr(sig, "vol_at_level", False)),
+            "dumped_then_reclaimed": bool(getattr(sig, "dumped_then_reclaimed", False)),
             "status": "open",
             "exit_price": None,
             "exit_at": None,

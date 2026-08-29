@@ -71,6 +71,7 @@ class SignalResult:
     dump_from_peak: bool = False
     dump_note: str = ""
     dump_unrecovered: bool = False
+    dumped_then_reclaimed: bool = False
 
 
 def _detect_structure_zone(df: pd.DataFrame, price: float, vol_ratio: float) -> str:
@@ -679,6 +680,7 @@ def analyze(symbol: str, name: str = "", with_live: bool = True) -> SignalResult
     )
 
     dump_unrecovered = False
+    dumped_then_reclaimed = False
     try:
         win7 = df["High"].iloc[-7:]
         peak7 = float(win7.max())
@@ -688,6 +690,7 @@ def analyze(symbol: str, name: str = "", with_live: bool = True) -> SignalResult
         reclaimed = (last_sma20 and price >= last_sma20 * 0.999) or (
             "فوق" in str(vwap_day_note or "")
         )
+        dumped_then_reclaimed = bool(dumped_week and reclaimed)
         if dumped_week and not reclaimed:
             dump_unrecovered = True
             if not dump_note:
@@ -766,6 +769,7 @@ def analyze(symbol: str, name: str = "", with_live: bool = True) -> SignalResult
         dump_from_peak=dump_from_peak,
         dump_note=dump_note,
         dump_unrecovered=dump_unrecovered,
+        dumped_then_reclaimed=dumped_then_reclaimed,
     )
 
 
@@ -878,6 +882,15 @@ def scan_symbols(
                 continue
             if getattr(sig, "dump_from_peak", False) or getattr(sig, "dump_unrecovered", False):
                 continue
+            try:
+                from auto_tune import AUTO
+                if getattr(AUTO, "require_strong_reclaim", False) and getattr(sig, "dumped_then_reclaimed", False):
+                    above_vwap = "فوق" in str(getattr(sig, "vwap_day_note", "") or "")
+                    above_ma = bool(sig.sma20 and sig.price >= sig.sma20 * 0.999)
+                    if not (above_vwap and above_ma):
+                        continue
+            except Exception:
+                pass
             try:
                 from auto_tune import AUTO
                 if AUTO.require_above_vwap and "تحت" in str(getattr(sig, "vwap_day_note", "") or ""):
