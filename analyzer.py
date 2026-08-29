@@ -66,6 +66,8 @@ class SignalResult:
     near_new_high: bool = False
     dist_from_high_pct: float = 0.0
     period_high: float = 0.0
+    vwap_day_note: str = "—"
+    vol_at_level: bool = False
 
 
 def _detect_structure_zone(df: pd.DataFrame, price: float, vol_ratio: float) -> str:
@@ -474,6 +476,7 @@ def analyze(symbol: str, name: str = "", with_live: bool = True) -> SignalResult
     live_price = None
     live_rsi = None
     live_vs_vwap = None
+    vwap_day_note = "—"
     live_ok = False
     live_vol_ratio = 1.0
     live_momentum = 0.0
@@ -529,6 +532,7 @@ def analyze(symbol: str, name: str = "", with_live: bool = True) -> SignalResult
             vwap_s = _vwap(intra)
             vwap_last = float(vwap_s.iloc[-1]) if pd.notna(vwap_s.iloc[-1]) else ema20_i
             live_vs_vwap = (live_price - vwap_last) / vwap_last * 100 if vwap_last else 0
+            vwap_day_note = "فوق VWAP اليوم" if live_price >= vwap_last else "تحت VWAP اليوم"
             vol_i = intra["Volume"]
             vol_avg = float(vol_i.rolling(12).mean().iloc[-1] or 1)
             live_vol_ratio = float(vol_i.iloc[-1] / vol_avg) if vol_avg else 1.0
@@ -643,6 +647,21 @@ def analyze(symbol: str, name: str = "", with_live: bool = True) -> SignalResult
     risk_pct = risk / price * 100 if price else 0
     reward_r = (tp2 - price) / risk if risk > 0 else 0
 
+    def _near(level: float | None, pct: float = 1.2) -> bool:
+        if not level:
+            return False
+        return abs(price - level) / price * 100 <= pct
+
+    vol_at_level = bool(
+        vol_ratio >= 1.00
+        and (
+            _near(last_sma20)
+            or _near(swing_low)
+            or _near(swing_high)
+            or _near(recent_low)
+        )
+    )
+
     info = fetch_info(symbol)
     cap = _fmt_cap(info.get("market_cap"))
     last_info = info.get("last")
@@ -709,6 +728,8 @@ def analyze(symbol: str, name: str = "", with_live: bool = True) -> SignalResult
         near_new_high=near_new_high,
         dist_from_high_pct=round(dist_from_high_pct, 2),
         period_high=round(period_high, 2),
+        vwap_day_note=vwap_day_note,
+        vol_at_level=vol_at_level,
     )
 
 
@@ -724,43 +745,32 @@ def format_signal_ar(sig: SignalResult, min_score: int = 84, rank: int | None = 
     if rank is not None:
         head = f"#{rank}  {head}"
 
+    vol_lvl = "نعم" if getattr(sig, "vol_at_level", False) else "لا"
+    vwap_note = getattr(sig, "vwap_day_note", None) or "—"
     lines = [
         head,
         f"{sig.name}",
+        "—————————————",
         f"السعر: {sig.price:.2f} $  ({arrow} {sig.change_pct:+.2f}%)",
         f"شراء: {sig.buy_low:.2f} — {sig.buy_high:.2f}",
         f"وقف: {sig.stop_loss:.2f} ({sig.sl_method})  |  مخاطرة {sig.risk_pct:.2f}%",
         f"أهداف: {sig.tp1:.2f}  |  {sig.tp2:.2f}  |  {sig.tp3:.2f}",
-        f"عائد/مخاطرة ≈ 1:{sig.reward_r:.1f}",
+        "—————————————",
         f"المنطقة: {getattr(sig, 'structure_zone', 'محايدة')} (معلومة فقط)",
     ]
-    if getattr(sig, "near_new_high", False):
-        lines.append(
-            f"قرب قمة تاريخية جديدة: أعلى قمة {getattr(sig, 'period_high', 0):.2f} | المسافة {getattr(sig, 'dist_from_high_pct', 0):.2f}% (حد الإرسال 2%+)"
-        )
     if getattr(sig, "pattern_note", ""):
         pt = getattr(sig, "pattern_target", None)
         if pt:
             lines.append(f"نمط: {sig.pattern_note} | هدف تقديري {pt:.2f}")
         else:
             lines.append(f"نمط: {sig.pattern_note}")
-
-    why = sig.reasons[:3]
-    if why:
-        lines.append("لماذا:")
-        for r in why:
-            lines.append(f"• {r}")
-
-    risks = sig.warnings[:2]
-    if sig.score < min_score or not sig.live_ok:
-        risks.append(f"تحت شرط التنبيه ({min_score}+ وتأكيد لحظي)")
-    if not getattr(sig, "quality_ok", True):
-        risks.append("فشل فلتر جودة الدخول (امتداد/تذبذب/حجم)")
-    if risks:
-        lines.append("مخاطر:")
-        for w in risks:
-            lines.append(f"• {w}")
-
+    if getattr(sig, "near_new_high", False):
+        lines.append(
+            f"قرب قمة تاريخية جديدة: {getattr(sig, 'period_high', 0):.2f} | المسافة {getattr(sig, 'dist_from_high_pct', 0):.2f}%"
+        )
+    lines.append("")
+    lines.append(f"{vwap_note} | الحجم عند المستوى: {vol_lvl}")
+    lines.append("")
     lines.append("تحليل تعليمي — ليست توصية.")
     return "\n".join(lines)
 
@@ -828,6 +838,14 @@ def scan_symbols(
                 continue
             if getattr(sig, "near_new_high", False):
                 continue
+            try:
+                from auto_tune import AUTO
+                if AUTO.require_above_vwap and "تحت" in str(getattr(sig, "vwap_day_note", "") or ""):
+                    continue
+                if AUTO.require_vol_at_level and not getattr(sig, "vol_at_level", False):
+                    continue
+            except Exception:
+                pass
             results.append(sig)
         except Exception:
             continue

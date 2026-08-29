@@ -64,6 +64,8 @@ class PerformanceLog:
             "atr_pct": round(float(getattr(sig, "atr_pct", 0) or 0), 2),
             "structure_zone": getattr(sig, "structure_zone", "") or "",
             "quality_ok": bool(getattr(sig, "quality_ok", True)),
+            "vwap_day_note": getattr(sig, "vwap_day_note", "") or "",
+            "vol_at_level": bool(getattr(sig, "vol_at_level", False)),
             "status": "open",
             "exit_price": None,
             "exit_at": None,
@@ -396,6 +398,11 @@ class PerformanceLog:
                 reasons.append("قرب توزيع")
             if regime in {"weak", "bear"}:
                 reasons.append("سوق ضعيف")
+            note = str(r.get("vwap_day_note") or "")
+            if "تحت" in note:
+                reasons.append("تحت VWAP اليوم")
+            if r.get("vol_at_level") is False and "vwap_day_note" in r:
+                reasons.append("بدون حجم عند المستوى")
             if r.get("result") == "stop":
                 reasons.append("ضرب وقف")
             if r.get("result") == "timeout":
@@ -432,6 +439,21 @@ class PerformanceLog:
                 f"  • {_regime_line('قوي/صاعد', {'strong_bull', 'bull'})}",
                 f"  • {_regime_line('محايد', {'neutral'})}",
                 f"  • {_regime_line('ضعيف/هابط', {'weak', 'bear'})}",
+            ]
+            def _flag_line(title: str, pred) -> str:
+                subset = [r for r in closed if pred(r)]
+                if not subset:
+                    return f"{title}: لا بيانات"
+                w = [r for r in subset if (r.get("pnl_pct") or 0) > 0]
+                return f"{title}: {len(w)}/{len(subset)} نجاح ({len(w)/len(subset)*100:.0f}%)"
+
+            lines += [
+                "",
+                "حسب VWAP والحجم (معلومة للتعلم):",
+                f"  • {_flag_line('فوق VWAP', lambda r: 'فوق' in str(r.get('vwap_day_note') or ''))}",
+                f"  • {_flag_line('تحت VWAP', lambda r: 'تحت' in str(r.get('vwap_day_note') or ''))}",
+                f"  • {_flag_line('حجم عند المستوى', lambda r: bool(r.get('vol_at_level')))}",
+                f"  • {_flag_line('بدون حجم مستوى', lambda r: r.get('vol_at_level') is False)}",
             ]
             if fail_counts:
                 lines.append("")

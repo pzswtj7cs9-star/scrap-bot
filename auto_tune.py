@@ -24,6 +24,8 @@ class AutoTune:
         self.path = Path(path)
         self.min_score_boost = 0  # 0..4 تضاف فوق الحد الأساسي 84
         self.vol_gate = 1.00
+        self.require_above_vwap = False
+        self.require_vol_at_level = False
         self.last_note = "بانتظار 20 صفقة مغلقة للتعديل التلقائي"
         self._load()
 
@@ -34,6 +36,8 @@ class AutoTune:
             data = json.loads(self.path.read_text(encoding="utf-8"))
             self.min_score_boost = int(data.get("min_score_boost", 0))
             self.vol_gate = float(data.get("vol_gate", 1.00))
+            self.require_above_vwap = bool(data.get("require_above_vwap", False))
+            self.require_vol_at_level = bool(data.get("require_vol_at_level", False))
             self.last_note = str(data.get("last_note") or self.last_note)
         except Exception as exc:
             log.warning("auto_tune load: %s", exc)
@@ -45,6 +49,8 @@ class AutoTune:
                     {
                         "min_score_boost": self.min_score_boost,
                         "vol_gate": round(self.vol_gate, 2),
+                        "require_above_vwap": self.require_above_vwap,
+                        "require_vol_at_level": self.require_vol_at_level,
                         "last_note": self.last_note,
                     },
                     ensure_ascii=False,
@@ -114,6 +120,33 @@ class AutoTune:
             pass
 
         self.vol_gate = max(VOL_MIN, min(VOL_MAX, self.vol_gate))
+
+        above = [r for r in closed if "فوق" in str(r.get("vwap_day_note") or "")]
+        below = [r for r in closed if "تحت" in str(r.get("vwap_day_note") or "")]
+        wr_up, wr_dn = wr(above), wr(below)
+        if wr_up is not None and wr_dn is not None and wr_up - wr_dn >= 0.15:
+            if not self.require_above_vwap:
+                self.require_above_vwap = True
+                changed = True
+                notes.append("تفعيل شرط فوق VWAP لأن الإشارات تحته أضعف")
+        elif wr_dn is not None and wr_dn >= 0.50 and self.require_above_vwap:
+            self.require_above_vwap = False
+            changed = True
+            notes.append("إلغاء شرط VWAP لأن الإشارات تحته ليست ضعيفة")
+
+        at = [r for r in closed if r.get("vol_at_level") is True]
+        no = [r for r in closed if r.get("vol_at_level") is False]
+        wr_at, wr_no = wr(at), wr(no)
+        if wr_at is not None and wr_no is not None and wr_at - wr_no >= 0.15:
+            if not self.require_vol_at_level:
+                self.require_vol_at_level = True
+                changed = True
+                notes.append("تفعيل شرط الحجم عند المستوى لأن بدونه أضعف")
+        elif wr_no is not None and wr_no >= 0.50 and self.require_vol_at_level:
+            self.require_vol_at_level = False
+            changed = True
+            notes.append("إلغاء شرط الحجم عند المستوى لأن النتائج بدونه مقبولة")
+
         self.last_note = " | ".join(notes) if notes else "لا تعديل — النتائج ضمن النطاق"
         self.save()
         return changed
@@ -123,6 +156,8 @@ class AutoTune:
             "🤖 التعديل التلقائي:\n"
             f"• رفع الحد الحالي: +{self.min_score_boost} (حد فعلي من {SCORE_MIN + self.min_score_boost})\n"
             f"• بوابة الحجم: {self.vol_gate:.2f}x\n"
+            f"• شرط فوق VWAP: {'نعم' if self.require_above_vwap else 'لا'}\n"
+            f"• شرط الحجم عند المستوى: {'نعم' if self.require_vol_at_level else 'لا'}\n"
             f"• {self.last_note}"
         )
 
