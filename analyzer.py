@@ -68,6 +68,9 @@ class SignalResult:
     period_high: float = 0.0
     vwap_day_note: str = "—"
     vol_at_level: bool = False
+    dump_from_peak: bool = False
+    dump_note: str = ""
+    dump_unrecovered: bool = False
 
 
 def _detect_structure_zone(df: pd.DataFrame, price: float, vol_ratio: float) -> str:
@@ -374,6 +377,19 @@ def analyze(symbol: str, name: str = "", with_live: bool = True) -> SignalResult
     dist_from_high_pct = ((period_high - price) / period_high * 100) if period_high else 0.0
     near_new_high = dist_from_high_pct < 2.0
     recent_low = float(df["Low"].iloc[-5:].min())
+    # سقوط حاد من قمة قريبة: نمنع شراء السكين أثناء الهبوط
+    dump_from_peak = False
+    dump_note = ""
+    try:
+        win = df["High"].iloc[-15:]
+        local_peak = float(win.max())
+        peak_ago = int(len(win) - 1 - win.values.argmax())
+        drop_peak = ((local_peak - price) / local_peak * 100) if local_peak else 0.0
+        if peak_ago <= 3 and drop_peak >= 3.0 and change_pct <= -2.0:
+            dump_from_peak = True
+            dump_note = f"سقوط من قمة قريبة {local_peak:.2f} ({drop_peak:.1f}% خلال {peak_ago} يوم)"
+    except Exception:
+        pass
 
     score = 0.0
     reasons: list[str] = []
@@ -662,6 +678,23 @@ def analyze(symbol: str, name: str = "", with_live: bool = True) -> SignalResult
         )
     )
 
+    dump_unrecovered = False
+    try:
+        win7 = df["High"].iloc[-7:]
+        peak7 = float(win7.max())
+        ago7 = int(len(win7) - 1 - win7.values.argmax())
+        drop7 = ((peak7 - price) / peak7 * 100) if peak7 else 0.0
+        dumped_week = ago7 <= 7 and drop7 >= 3.0
+        reclaimed = (last_sma20 and price >= last_sma20 * 0.999) or (
+            "فوق" in str(vwap_day_note or "")
+        )
+        if dumped_week and not reclaimed:
+            dump_unrecovered = True
+            if not dump_note:
+                dump_note = f"سقوط من قمة {peak7:.2f} بلا ارتداد فوق VWAP/متوسط 20"
+    except Exception:
+        pass
+
     info = fetch_info(symbol)
     cap = _fmt_cap(info.get("market_cap"))
     last_info = info.get("last")
@@ -730,6 +763,9 @@ def analyze(symbol: str, name: str = "", with_live: bool = True) -> SignalResult
         period_high=round(period_high, 2),
         vwap_day_note=vwap_day_note,
         vol_at_level=vol_at_level,
+        dump_from_peak=dump_from_peak,
+        dump_note=dump_note,
+        dump_unrecovered=dump_unrecovered,
     )
 
 
@@ -768,6 +804,8 @@ def format_signal_ar(sig: SignalResult, min_score: int = 84, rank: int | None = 
         lines.append(
             f"قرب قمة تاريخية جديدة: {getattr(sig, 'period_high', 0):.2f} | المسافة {getattr(sig, 'dist_from_high_pct', 0):.2f}%"
         )
+    if getattr(sig, "dump_from_peak", False) or getattr(sig, "dump_unrecovered", False):
+        lines.append(getattr(sig, "dump_note", "") or "سقوط من قمة بلا ارتداد مؤكد — تجنّب الدخول التلقائي")
     lines.append("")
     lines.append(f"{vwap_note} | الحجم عند المستوى: {vol_lvl}")
     lines.append("")
@@ -837,6 +875,8 @@ def scan_symbols(
             if getattr(sig, "volume_ratio", 0) < vol_gate:
                 continue
             if getattr(sig, "near_new_high", False):
+                continue
+            if getattr(sig, "dump_from_peak", False) or getattr(sig, "dump_unrecovered", False):
                 continue
             try:
                 from auto_tune import AUTO
