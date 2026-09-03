@@ -151,7 +151,14 @@ def fetch_intraday(symbol: str, period: str = "5d", interval: str = "5m") -> pd.
         days = 5
     start = datetime.now(timezone.utc) - timedelta(days=max(days, 3))
 
-    tf_map = {"1m": "1Min", "5m": "5Min", "15m": "15Min", "1h": "1Hour"}
+    tf_map = {
+        "1m": "1Min",
+        "5m": "5Min",
+        "15m": "15Min",
+        "60m": "1Hour",
+        "1h": "1Hour",
+        "1Hour": "1Hour",
+    }
     alpaca_tf = tf_map.get(interval, "5Min")
 
     if alpaca_configured():

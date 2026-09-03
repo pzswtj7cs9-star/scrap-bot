@@ -32,6 +32,13 @@ from telegram.ext import (
 )
 
 from analyzer import analyze, format_signal_ar, rank_all, scan_symbols
+from analyzer_intraday import (
+    INTRADAY_MIN_SCORE,
+    analyze_intraday,
+    format_intraday_ar,
+    scan_intraday,
+    session_window_ok,
+)
 from backtest import run_backtest
 from charting import build_signal_chart
 from cooldown import CooldownBook
@@ -64,6 +71,8 @@ OWNER_CHAT_ID = os.getenv("OWNER_CHAT_ID", "").strip()
 MIN_SCORE = int(os.getenv("MIN_SCORE", "84"))
 DAILY_MAX = int(os.getenv("DAILY_MAX_ALERTS", "5"))
 ALERT_EVERY_MINUTES = int(os.getenv("ALERT_EVERY_MINUTES", "90"))
+INTRADAY_MAX = int(os.getenv("INTRADAY_MAX_ALERTS", "3"))
+INTRADAY_EVERY_MINUTES = int(os.getenv("INTRADAY_EVERY_MINUTES", "40"))
 LIVE_SCAN_SECONDS = int(os.getenv("LIVE_SCAN_SECONDS", "60"))
 EARNINGS_DAYS = int(os.getenv("EARNINGS_DAYS", "2"))
 COOLDOWN_DAYS = int(os.getenv("COOLDOWN_DAYS", "5"))
@@ -71,6 +80,7 @@ DATA_DIR = Path(os.getenv("DATA_DIR", "."))
 SUBS_FILE = DATA_DIR / "subscribers.json"
 STATE_FILE = DATA_DIR / "daily_state.json"
 PERF_FILE = DATA_DIR / "signals_log.json"
+PERF_INTRA_FILE = DATA_DIR / "signals_log_intraday.json"
 COOL_FILE = DATA_DIR / "cooldown.json"
 REPORTS_FILE = DATA_DIR / "reports_state.json"
 WEIGHTS_FILE = DATA_DIR / "weights_state.json"
@@ -83,6 +93,7 @@ AUTO.path = DATA_DIR / "auto_tune.json"
 AUTO._load()
 
 PERF = PerformanceLog(PERF_FILE)
+PERF_INTRA = PerformanceLog(PERF_INTRA_FILE)
 COOL = CooldownBook(COOL_FILE, days=COOLDOWN_DAYS)
 BOT_STARTED = now_ny()
 LAST_SCAN_AT: datetime | None = None
@@ -110,7 +121,15 @@ def save_subs(subs: set[int]) -> None:
 
 
 def _empty_state(day: str) -> dict:
-    return {"date": day, "sent": [], "scores": {}, "last_sent_at": None}
+    return {
+        "date": day,
+        "sent": [],
+        "scores": {},
+        "last_sent_at": None,
+        "sent_intraday": [],
+        "scores_intraday": {},
+        "last_sent_intraday_at": None,
+    }
 
 
 def load_state() -> dict:
@@ -122,6 +141,9 @@ def load_state() -> dict:
                 data.setdefault("sent", [])
                 data.setdefault("scores", {})
                 data.setdefault("last_sent_at", None)
+                data.setdefault("sent_intraday", [])
+                data.setdefault("scores_intraday", {})
+                data.setdefault("last_sent_intraday_at", None)
                 return data
         except Exception:
             pass
@@ -450,7 +472,8 @@ def health_text() -> str:
         f"مصدر البيانات: {'يعمل' if ok else 'تعثر'} — {note}",
         f"آخر مسح: {last_scan}",
         f"آخر تنبيه تلقائي: {state.get('last_sent_at') or '—'}",
-        f"حصة اليوم: {len(state.get('sent', []))}/{DAILY_MAX}",
+        f"حصة السوينغ: {len(state.get('sent', []))}/{DAILY_MAX}",
+        f"حصة اللحظي: {len(state.get('sent_intraday', []))}/{INTRADAY_MAX}",
         f"تهدئة الأسهم: {COOLDOWN_DAYS} أيام تداول",
         f"تنبيهات تلقائية: {'نعم' if regime['allow_auto'] else 'موقوفة (سوق هابط)'}",
     ]
@@ -477,7 +500,18 @@ async def cmd_weekly(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
 async def cmd_perf(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     msg = await update.message.reply_text("جاري تحديث سجل الأداء...")
-    text = await asyncio.to_thread(PERF.stats_text)
+
+    def _both():
+        swing = PERF.stats_text()
+        intra = PERF_INTRA.stats_text()
+        return (
+            "===== سوينغ (يومي) =====\n"
+            + swing
+            + "\n\n===== لحظي (ساعة) =====\n"
+            + intra
+        )
+
+    text = await asyncio.to_thread(_both)
     await msg.edit_text(text)
 
 
@@ -656,6 +690,31 @@ async def cmd_scan(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await run_scan_message(update.message, _watch(context))
 
 
+async def cmd_scan_intra(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    msg = await update.message.reply_text("جاري المسح اللحظي (ساعة + 5د)...")
+    ok, reason = session_window_ok()
+    if not ok:
+        await msg.edit_text(f"خارج نافذة اللحظي الآن.\n{reason}")
+        return
+
+    def _run():
+        return scan_intraday(CORE_WATCHLIST, HALAL_STOCKS, INTRADAY_MIN_SCORE, 5)
+
+    hits = await asyncio.to_thread(_run)
+    if not hits:
+        await msg.edit_text(
+            f"لا مرشحين لحظيين الآن.\n{session_label()}\n"
+            f"حد {INTRADAY_MIN_SCORE} | فوق VWAP | نافذة بعد الافتتاح وقبل الإغلاق"
+        )
+        return
+    parts = [f"⚡ مسح لحظي — {session_label()}", f"السقف اليومي للحظي: {INTRADAY_MAX}"]
+    for i, sig in enumerate(hits, 1):
+        parts.append(format_intraday_ar(sig, INTRADAY_MIN_SCORE))
+        if i == 1:
+            parts[1] = parts[1]  # keep header
+    await msg.edit_text("\n\n".join(parts[:4]))
+
+
 async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     q = update.callback_query
     await q.answer()
@@ -780,6 +839,72 @@ async def live_scan_job(context: ContextTypes.DEFAULT_TYPE) -> None:
             )
 
 
+def minutes_since_last_intraday(state: dict) -> float | None:
+    ts = state.get("last_sent_intraday_at")
+    if not ts:
+        return None
+    try:
+        last = datetime.fromisoformat(ts)
+        if last.tzinfo is None:
+            last = last.replace(tzinfo=now_ny().tzinfo)
+        return (now_ny() - last).total_seconds() / 60.0
+    except Exception:
+        return None
+
+
+async def live_scan_intraday_job(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """مسح لحظي معزول: ساعة + 5د | سقف 3 | خارج أول/آخر الجلسة."""
+    if not SUBSCRIBERS or not is_us_regular_session():
+        return
+    ok, reason = session_window_ok()
+    if not ok:
+        return
+    if _scan_lock.locked():
+        return
+
+    async with _scan_lock:
+        state = load_state()
+        sent_i = list(state.get("sent_intraday") or [])
+        if len(sent_i) >= INTRADAY_MAX:
+            return
+        elapsed = minutes_since_last_intraday(state)
+        if elapsed is not None and elapsed < INTRADAY_EVERY_MINUTES:
+            return
+
+        hits = await asyncio.to_thread(
+            scan_intraday,
+            CORE_WATCHLIST,
+            HALAL_STOCKS,
+            INTRADAY_MIN_SCORE,
+            10,
+        )
+        already = set(sent_i) | set(state.get("sent") or [])
+        fresh = [s for s in hits if s.symbol not in already]
+        if not fresh:
+            return
+
+        sig = fresh[0]
+        state.setdefault("sent_intraday", []).append(sig.symbol)
+        state.setdefault("scores_intraday", {})[sig.symbol] = sig.score
+        state["last_sent_intraday_at"] = now_ny().isoformat()
+        save_state(state)
+        PERF_INTRA.add_signal(sig, source="auto_intraday")
+
+        slot = len(state["sent_intraday"])
+        header = (
+            f"⚡ لحظي — الدفعة {slot}/{INTRADAY_MAX}\n"
+            f"{session_label()}\n"
+            f"اتجاه ساعة + تأكيد 5د | فاصل {INTRADAY_EVERY_MINUTES} د\n"
+            f"يفضّل الخروج قبل الإغلاق — ليست توصية."
+        )
+        body = format_intraday_ar(sig, INTRADAY_MIN_SCORE)
+        for chat_id in list(SUBSCRIBERS):
+            try:
+                await context.bot.send_message(chat_id=chat_id, text=header + "\n\n" + body)
+            except Exception as exc:
+                log.warning("إرسال لحظي %s فشل: %s", chat_id, exc)
+
+
 def build_daily_close_text() -> str:
     PERF.update_open_outcomes()
     state = load_state()
@@ -842,14 +967,24 @@ async def weekly_report_job(context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def perf_update_job(context: ContextTypes.DEFAULT_TYPE) -> None:
-    """متابعة الصفقات المفتوحة: وقف / أهداف + تحديث الأوزان."""
+    """متابعة الصفقات المفتوحة (سوينغ + لحظي): وقف / أهداف."""
     try:
         prefer_intraday = is_us_regular_session()
-        events = await asyncio.to_thread(PERF.update_open_outcomes, prefer_intraday)
+
+        def _all_events():
+            evs = []
+            for log_obj in (PERF, PERF_INTRA):
+                try:
+                    evs.extend(log_obj.update_open_outcomes(prefer_intraday))
+                except Exception as exc:
+                    log.warning("perf update one log: %s", exc)
+            return evs
+
+        events = await asyncio.to_thread(_all_events)
         if not events or not SUBSCRIBERS:
             return
         for ev in events:
-            text = PERF.format_event_ar(ev)
+            text = PerformanceLog.format_event_ar(ev)
             await broadcast(context.bot, text)
             await asyncio.sleep(0.4)
     except Exception as exc:
@@ -866,6 +1001,8 @@ def build_app() -> Application:
     app.add_handler(CommandHandler("list", cmd_list))
     app.add_handler(CommandHandler("analyze", cmd_analyze))
     app.add_handler(CommandHandler("scan", cmd_scan))
+    app.add_handler(CommandHandler("scan_intra", cmd_scan_intra))
+    app.add_handler(CommandHandler("scani", cmd_scan_intra))
     app.add_handler(CommandHandler("watch", cmd_watch))
     app.add_handler(CommandHandler("unwatch", cmd_unwatch))
     app.add_handler(CommandHandler("mywatch", cmd_mywatch))
@@ -885,6 +1022,9 @@ def build_app() -> Application:
 
     if app.job_queue:
         app.job_queue.run_repeating(live_scan_job, interval=LIVE_SCAN_SECONDS, first=25, name="live")
+        app.job_queue.run_repeating(
+            live_scan_intraday_job, interval=max(45, LIVE_SCAN_SECONDS), first=40, name="live-intra"
+        )
         app.job_queue.run_repeating(perf_update_job, interval=180, first=90, name="perf")
         app.job_queue.run_repeating(daily_close_job, interval=300, first=40, name="daily-close")
         app.job_queue.run_repeating(weekly_report_job, interval=300, first=50, name="weekly")

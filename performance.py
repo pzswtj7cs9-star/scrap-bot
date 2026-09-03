@@ -48,6 +48,8 @@ class PerformanceLog:
             "symbol": sig.symbol,
             "name": sig.name,
             "source": source,
+            "mode": getattr(sig, "mode", None)
+            or ("intraday" if "intraday" in str(source) else "swing"),
             "opened_at": _now().isoformat(),
             "entry": round(sig.price, 4),
             "buy_low": round(sig.buy_low, 4),
@@ -230,6 +232,9 @@ class PerformanceLog:
                     "pnl_pct": pnl,
                     "closed": close_trade,
                     "timeframe": tf,
+                    "mode": row.get("mode")
+                    or ("intraday" if "intraday" in str(row.get("source") or "") else "swing"),
+                    "source": row.get("source") or "",
                 }
 
             # الوقف: نطلب تأكيداً أقوى من لمسة وهمية واحدة
@@ -290,28 +295,31 @@ class PerformanceLog:
         price = ev.get("price")
         entry = ev.get("entry")
         pnl = ev.get("pnl_pct") or 0
+        mode = ev.get("mode") or "swing"
+        mode_ar = "لحظي" if mode == "intraday" else "سوينغ/يومي"
         if kind == "stop":
-            title = f"🛑 ضرب الوقف — {sym}"
+            title = f"🛑 ضرب الوقف — {sym} | {mode_ar}"
             body = f"تم لمس وقف الخسارة عند {price:.2f} $"
         elif kind == "tp1":
-            title = f"🎯 الهدف 1 — {sym}"
+            title = f"🎯 الهدف 1 — {sym} | {mode_ar}"
             body = f"وصل الهدف الأول عند {price:.2f} $"
         elif kind == "tp2":
-            title = f"🎯 الهدف 2 — {sym}"
+            title = f"🎯 الهدف 2 — {sym} | {mode_ar}"
             body = f"وصل الهدف الثاني عند {price:.2f} $"
         elif kind == "tp3":
-            title = f"🏁 الهدف 3 (إغلاق) — {sym}"
+            title = f"🏁 الهدف 3 (إغلاق) — {sym} | {mode_ar}"
             body = f"وصل الهدف الثالث عند {price:.2f} $"
         elif kind == "timeout":
-            title = f"⏰ انتهاء مدة الصفقة — {sym}"
-            body = f"أُغلقت بعد 15 يوماً عند {price:.2f} $"
+            title = f"⏰ انتهاء مدة الصفقة — {sym} | {mode_ar}"
+            body = f"أُغلقت بعد المهلة عند {price:.2f} $"
         else:
-            title = f"📋 تحديث — {sym}"
+            title = f"📋 تحديث — {sym} | {mode_ar}"
             body = f"نتيجة: {kind}"
         lines = [
             title,
             name,
             body,
+            f"النوع: {mode_ar}",
             f"الدخول: {entry:.2f} $ | النتيجة: {pnl:+.2f}%",
         ]
         if not ev.get("closed") and kind in {"tp1", "tp2"}:
