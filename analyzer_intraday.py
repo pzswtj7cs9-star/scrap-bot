@@ -47,6 +47,8 @@ class IntradaySignal:
     reasons: list[str]
     warnings: list[str]
     mode: str = "intraday"
+    entry_type: str = "دخول مبكر"
+    entry_emoji: str = "🟢"
     structure_zone: str = "محايدة"
     quality_ok: bool = True
     live_ok: bool = True
@@ -177,6 +179,36 @@ def analyze_intraday(symbol: str, name: str = "") -> Optional[IntradaySignal]:
     drop = (session_high - price) / session_high * 100 if session_high else 0
     dump = drop >= 2.5 and change_pct <= -1.2
 
+    # —— تصنيف نوع الدخول اللحظي ——
+    h_win = h1.tail(20)
+    level_high = float(h_win["High"].iloc[:-1].max()) if len(h_win) > 3 else session_high
+    was_below = float(h_win["Close"].iloc[-3]) < level_high * 0.998 if len(h_win) >= 3 else False
+    breakout_now = price >= level_high * 1.001 and was_below
+    prior_break = (
+        float(h_win["High"].iloc[-8:-2].max()) >= level_high * 0.999 if len(h_win) >= 8 else False
+    )
+    near_level = abs(price - level_high) / max(price, 1e-9) * 100 <= 0.7
+    e20_tmp = float(_ema(h1["Close"], 20).iloc[-1])
+    ext_tmp = (price - e20_tmp) / e20_tmp * 100 if e20_tmp else 0.0
+    failed = (
+        float(today_5["High"].max()) >= level_high * 1.001
+        and price < level_high * 0.997
+        and not above_vwap
+    ) or (dump and not above_vwap)
+    retest = prior_break and near_level and price >= level_high * 0.997 and above_vwap and not failed
+    early = above_vwap and above_open and not breakout_now and ext_tmp <= 2.2 and not failed
+
+    if failed:
+        entry_type, entry_emoji = "اختراق فاشل", "🔴"
+    elif retest:
+        entry_type, entry_emoji = "إعادة اختبار", "🟡"
+    elif breakout_now and vol_session_ratio >= 1.0:
+        entry_type, entry_emoji = "اختراق مؤكد", "🟢"
+    elif early or (above_vwap and trend_up and ext_tmp <= 2.5):
+        entry_type, entry_emoji = "دخول مبكر", "🟢"
+    else:
+        entry_type, entry_emoji = "دخول مبكر", "🟢"
+
     reasons = []
     warnings = []
     score = 50.0
@@ -230,6 +262,21 @@ def analyze_intraday(symbol: str, name: str = "") -> Optional[IntradaySignal]:
         warnings.append("سقوط من قمة الجلسة")
         score -= 20
 
+    if entry_type == "اختراق فاشل":
+        warnings.append("اختراق فاشل — لا إرسال تلقائي")
+        score -= 25
+    elif entry_type == "اختراق مؤكد":
+        score += 8
+        reasons.append("اختراق مؤكد لمستوى الساعة")
+        factors.append("breakout")
+    elif entry_type == "إعادة اختبار":
+        score += 5
+        reasons.append("إعادة اختبار مستوى بعد اختراق")
+        factors.append("retest")
+    elif entry_type == "دخول مبكر":
+        reasons.append("دخول مبكر فوق VWAP")
+        factors.append("early")
+
     # امتداد عن ema20 الساعة
     ext = (price - e20) / e20 * 100 if e20 else 0
     if ext > 4.0:
@@ -243,18 +290,28 @@ def analyze_intraday(symbol: str, name: str = "") -> Optional[IntradaySignal]:
         score -= 5
 
     score_i = int(max(0, min(100, round(score))))
-    quality_ok = (not dump) and ext <= 4.5 and atr_pct <= 6.5 and vol_session_ratio >= 0.85
+    quality_ok = (
+        (not dump)
+        and (not failed)
+        and entry_type != "اختراق فاشل"
+        and ext <= 4.5
+        and atr_pct <= 6.5
+        and vol_session_ratio >= 0.85
+    )
 
-    # وقف وأهداف على مقياس الساعة
-    recent_low = float(today_5["Low"].tail(8).min())
-    stop = min(price - 1.2 * atr, recent_low * 0.998)
+    # وقف أوسع شوي (1.5 ATR) + أهداف أقرب لنفس اليوم
+    recent_low = float(today_5["Low"].tail(12).min())
+    stop = min(price - 1.5 * atr, recent_low * 0.997)
     risk = price - stop
-    if risk <= 0 or risk / price > 0.08:
-        stop = price * 0.97
+    if risk <= 0 or risk / price < 0.012:
+        stop = price * (1 - 0.012)
         risk = price - stop
-    tp1 = price + risk * 1.4
-    tp2 = price + risk * 2.2
-    tp3 = price + risk * 3.2
+    if risk / price > 0.07:
+        stop = price * 0.93
+        risk = price - stop
+    tp1 = price + risk * 1.2
+    tp2 = price + risk * 1.8
+    tp3 = price + risk * 2.6
     risk_pct = risk / price * 100
     reward_r = (tp2 - price) / risk if risk else 0
 
@@ -289,6 +346,8 @@ def analyze_intraday(symbol: str, name: str = "") -> Optional[IntradaySignal]:
         sma20=round(e20, 4),
         atr_pct=round(atr_pct, 2),
         ext_sma20=round(ext, 2),
+        entry_type=entry_type,
+        entry_emoji=entry_emoji,
     )
 
 
@@ -296,6 +355,7 @@ def format_intraday_ar(sig: IntradaySignal, min_score: int = INTRADAY_MIN_SCORE)
     arrow = "▲" if sig.change_pct >= 0 else "▼"
     lines = [
         f"⚡ لحظي | {sig.symbol} | {sig.score}/100 | {sig.grade} | ساعة+5د",
+        f"{sig.entry_emoji} نوع الدخول: {sig.entry_type}",
         f"{sig.name}",
         "—————————————",
         f"السعر: {sig.price:.2f} $  ({arrow} {sig.change_pct:+.2f}%)",
@@ -346,6 +406,9 @@ def scan_intraday(
             if sig.score < min_score:
                 continue
             if not sig.live_ok or not sig.quality_ok:
+                continue
+            # لا إرسال لاختراق فاشل
+            if getattr(sig, "entry_type", "") == "اختراق فاشل":
                 continue
             # شرط أقوى: فوق VWAP (مطلوب للإرسال)
             if "تحت" in sig.vwap_day_note:

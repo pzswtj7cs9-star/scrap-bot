@@ -781,7 +781,7 @@ def format_signal_ar(sig: SignalResult, min_score: int = 84, rank: int | None = 
     if sig.live_ok:
         conf.append("5د")
     live = "+".join(conf) if conf else "يومي"
-    head = f"{sig.symbol} | {sig.score}/100 | {sig.grade} | {live}"
+    head = f"📅 سوينغ/يومي | {sig.symbol} | {sig.score}/100 | {sig.grade} | {live}"
     if rank is not None:
         head = f"#{rank}  {head}"
 

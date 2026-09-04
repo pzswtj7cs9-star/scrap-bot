@@ -50,6 +50,7 @@ class PerformanceLog:
             "source": source,
             "mode": getattr(sig, "mode", None)
             or ("intraday" if "intraday" in str(source) else "swing"),
+            "entry_type": getattr(sig, "entry_type", "") or "",
             "opened_at": _now().isoformat(),
             "entry": round(sig.price, 4),
             "buy_low": round(sig.buy_low, 4),
@@ -464,6 +465,19 @@ class PerformanceLog:
                 f"  • {_flag_line('حجم عند المستوى', lambda r: bool(r.get('vol_at_level')))}",
                 f"  • {_flag_line('بدون حجم مستوى', lambda r: r.get('vol_at_level') is False)}",
             ]
+            entry_types = sorted(
+                {
+                    str(r.get("entry_type") or "").strip()
+                    for r in closed
+                    if str(r.get("entry_type") or "").strip()
+                }
+            )
+            if entry_types:
+                lines += ["", "حسب نوع الدخول:"]
+                for et in entry_types:
+                    lines.append(
+                        f"  • {_flag_line(et, lambda r, t=et: str(r.get('entry_type') or '') == t)}"
+                    )
             if fail_counts:
                 lines.append("")
                 lines.append("أكثر أسباب الخسارة المتكررة:")
@@ -480,8 +494,10 @@ class PerformanceLog:
             for r in closed[-5:][::-1]:
                 rr = _r_of(r)
                 rtxt = f"{rr:+.1f}R" if rr is not None else "—"
+                et = r.get("entry_type") or ""
+                et_bit = f" | {et}" if et else ""
                 lines.append(
-                    f"  {r.get('symbol')} | {r.get('score')} | {r.get('result') or '?'} | {rtxt}"
+                    f"  {r.get('symbol')} | {r.get('score')} | {r.get('result') or '?'} | {rtxt}{et_bit}"
                 )
         if open_n:
             lines.append("")

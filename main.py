@@ -161,6 +161,7 @@ def save_state(state: dict) -> None:
 
 SUBSCRIBERS = load_subs()
 _scan_lock = asyncio.Lock()
+_intra_scan_lock = asyncio.Lock()
 
 
 def load_reports() -> dict:
@@ -814,10 +815,10 @@ async def live_scan_job(context: ContextTypes.DEFAULT_TYPE) -> None:
 
         slot = len(state["sent"])
         header = (
-            f"🔔 سهم واحد — الدفعة {slot}/{DAILY_MAX}\n"
+            f"🔔 سوينغ/يومي — الدفعة {slot}/{DAILY_MAX}\n"
             f"{session_label()}\n"
             f"{regime_label()}\n"
-            f"التالي بعد {ALERT_EVERY_MINUTES} دقيقة إن وُجد تأكيد جديد."
+            f"النوع: سوينغ (إطار يومي) | التالي بعد {ALERT_EVERY_MINUTES} د"
         )
         body = format_signal_ar(sig, effective_min, rank=slot)
         for chat_id in list(SUBSCRIBERS):
@@ -859,10 +860,10 @@ async def live_scan_intraday_job(context: ContextTypes.DEFAULT_TYPE) -> None:
     ok, reason = session_window_ok()
     if not ok:
         return
-    if _scan_lock.locked():
+    if _intra_scan_lock.locked():
         return
 
-    async with _scan_lock:
+    async with _intra_scan_lock:
         state = load_state()
         sent_i = list(state.get("sent_intraday") or [])
         if len(sent_i) >= INTRADAY_MAX:
@@ -878,11 +879,19 @@ async def live_scan_intraday_job(context: ContextTypes.DEFAULT_TYPE) -> None:
             INTRADAY_MIN_SCORE,
             10,
         )
-        already = set(sent_i) | set(state.get("sent") or [])
-        fresh = [s for s in hits if s.symbol not in already]
+        # يستبعد فقط ما أُرسل لحظياً اليوم (لا يمنع بسبب السوينغ)
+        already = set(sent_i)
+        fresh = [
+            s
+            for s in hits
+            if s.symbol not in already and getattr(s, "entry_type", "") != "اختراق فاشل"
+        ]
         if not fresh:
             return
 
+        # تفضيل: اختراق مؤكد ثم إعادة اختبار ثم دخول مبكر
+        rank = {"اختراق مؤكد": 0, "إعادة اختبار": 1, "دخول مبكر": 2}
+        fresh.sort(key=lambda s: (rank.get(getattr(s, "entry_type", ""), 9), -s.score))
         sig = fresh[0]
         state.setdefault("sent_intraday", []).append(sig.symbol)
         state.setdefault("scores_intraday", {})[sig.symbol] = sig.score
@@ -894,8 +903,9 @@ async def live_scan_intraday_job(context: ContextTypes.DEFAULT_TYPE) -> None:
         header = (
             f"⚡ لحظي — الدفعة {slot}/{INTRADAY_MAX}\n"
             f"{session_label()}\n"
-            f"اتجاه ساعة + تأكيد 5د | فاصل {INTRADAY_EVERY_MINUTES} د\n"
-            f"يفضّل الخروج قبل الإغلاق — ليست توصية."
+            f"النوع: لحظي (ساعة + 5د)\n"
+            f"{getattr(sig, 'entry_emoji', '🟢')} {getattr(sig, 'entry_type', 'دخول')}\n"
+            f"فاصل {INTRADAY_EVERY_MINUTES} د | يفضّل الخروج قبل الإغلاق"
         )
         body = format_intraday_ar(sig, INTRADAY_MIN_SCORE)
         for chat_id in list(SUBSCRIBERS):
