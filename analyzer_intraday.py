@@ -309,9 +309,33 @@ def analyze_intraday(symbol: str, name: str = "") -> Optional[IntradaySignal]:
     if risk / price > 0.07:
         stop = price * 0.93
         risk = price - stop
+    # أهداف R أساسية ثم قصّها عند أقرب مقاومة جلسة إن كانت أقرب
     tp1 = price + risk * 1.2
     tp2 = price + risk * 1.8
     tp3 = price + risk * 2.6
+    try:
+        # مقاومة مرشحة: قمة الجلسة، قمة آخر 6 ساعات إن كانت فوق السعر
+        cands = []
+        if session_high > price * 1.002:
+            cands.append(session_high)
+        h_highs = h1["High"].tail(8)
+        for hv in h_highs:
+            hv = float(hv)
+            if hv > price * 1.002:
+                cands.append(hv)
+        if cands:
+            resist = min(cands)
+            # هدف 1 عند المقاومة − هامش بسيط إن كانت أقرب من tp1
+            resist_tp = resist * 0.998
+            if price < resist_tp < tp1:
+                tp1 = resist_tp
+            # هدف 2 لا يتجاوز امتداد منطقي فوق المقاومة بعد الكسر
+            if tp2 < resist * 1.004:
+                tp2 = max(tp2, min(resist * 1.008, price + risk * 1.8))
+            if not (tp1 < tp2 < tp3):
+                tp1, tp2, tp3 = price + risk * 1.2, price + risk * 1.8, price + risk * 2.6
+    except Exception:
+        pass
     risk_pct = risk / price * 100
     reward_r = (tp2 - price) / risk if risk else 0
 
