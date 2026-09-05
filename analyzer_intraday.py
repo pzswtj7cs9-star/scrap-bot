@@ -13,6 +13,7 @@ from dataclasses import dataclass
 from datetime import datetime, time, timezone, timedelta
 from pathlib import Path
 from typing import Optional
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import json
 import os
 import urllib.parse
@@ -32,6 +33,16 @@ INTRADAY_LEARNING_FILE = Path("intraday_learning.jsonl")
 LEARNING_MIN_SAMPLES = 20
 LEARNING_LOOKBACK = 60
 LEARNING_MAX_ADJUSTMENT = 4.0
+ADAPTIVE_POLICY_FILE = Path("intraday_adaptive_policy.json")
+ADAPTIVE_MIN_SAMPLES = 30
+ADAPTIVE_CONFIRM_SAMPLES = 40
+ADAPTIVE_MAX_CHANGE = 0.15
+ADAPTIVE_BEST_FILE = Path("intraday_adaptive_best.json")
+ADAPTIVE_SHADOW_FILE = Path("intraday_shadow_results.jsonl")
+LEARNING_ALERT_FILE = Path("intraday_learning_alert.json")
+ADAPTIVE_MIN_EDGE = 0.04
+ADAPTIVE_MIN_COVERAGE = 0.45
+ADAPTIVE_ROLLBACK_DROP = 0.06
 
 # أخبار: اختياري عبر FINNHUB_API_KEY. إذا لم يوجد المفتاح لا يمنع التحليل.
 FINNHUB_API_KEY = os.getenv("FINNHUB_API_KEY", "").strip()
@@ -94,6 +105,12 @@ class IntradaySignal:
     breakout_quality: float = 0.0
     market_state: str = "السوق غير مؤكد"
     chop: bool = False
+    market_regime: str = "neutral"
+    interaction_keys: list | None = None
+    spread_pct: float = 0.0
+    expected_slippage_pct: float = 0.0
+    dollar_volume_3m: float = 0.0
+    liquidity_ok: bool = True
 
 
 def _read_learning_records() -> list[dict]:
@@ -128,6 +145,410 @@ def _completed_learning(records: list[dict] | None = None) -> list[dict]:
         and r.get("status") in {"tp1", "stop", "timeout"}
     ]
     return completed[-LEARNING_LOOKBACK:]
+
+
+
+def _default_adaptive_policy() -> dict:
+    return {
+        "version": 1,
+        "generation": 0,
+        "samples_at_update": 0,
+        "approved": False,
+        "weights": {
+            "h1_trend": 1.0, "m15": 1.0, "m5": 1.0, "vwap": 1.0,
+            "vol_session": 1.0, "market": 1.0, "breakout": 1.0,
+            "breakout_candle": 1.0, "retest": 1.0, "early": 1.0,
+            "news_momentum": 1.0,
+        },
+        "entry_limits": {"دخول مبكر": 94, "إعادة اختبار": 95, "اختراق مؤكد": 100},
+        "min_volume_ratio": 0.85,
+        "min_news_volume_ratio": 1.50,
+        "min_news_change_pct": 4.0,
+        "min_tp1_r": 1.00,
+        "history": [],
+    }
+
+
+def _load_adaptive_policy() -> dict:
+    default = _default_adaptive_policy()
+    try:
+        if not ADAPTIVE_POLICY_FILE.exists():
+            return default
+        data = json.loads(ADAPTIVE_POLICY_FILE.read_text(encoding="utf-8"))
+        if not isinstance(data, dict):
+            return default
+        for k, v in default.items():
+            data.setdefault(k, v)
+        return data
+    except Exception:
+        return default
+
+
+def _save_adaptive_policy(policy: dict) -> None:
+    ADAPTIVE_POLICY_FILE.parent.mkdir(parents=True, exist_ok=True)
+    tmp = ADAPTIVE_POLICY_FILE.with_suffix(".tmp")
+    tmp.write_text(json.dumps(policy, ensure_ascii=False, indent=2), encoding="utf-8")
+    tmp.replace(ADAPTIVE_POLICY_FILE)
+
+
+def _adaptive_score_adjustment(factors: list[str]) -> float:
+    try:
+        p = _load_adaptive_policy()
+        vals = [float(p.get("weights", {}).get(f, 1.0)) for f in factors if f in p.get("weights", {})]
+        if not vals:
+            return 0.0
+        return max(-4.0, min(4.0, (sum(vals) / len(vals) - 1.0) * 8.0))
+    except Exception:
+        return 0.0
+
+
+def _rate(rows: list[dict]) -> float:
+    if not rows:
+        return 0.0
+    return sum(r.get("status") == "tp1" for r in rows) / len(rows)
+
+
+def _build_candidate_policy(completed: list[dict], current: dict) -> dict | None:
+    if len(completed) < ADAPTIVE_MIN_SAMPLES:
+        return None
+    recent = completed[-ADAPTIVE_CONFIRM_SAMPLES:]
+    baseline = _rate(recent)
+    candidate = json.loads(json.dumps(current))
+
+    for factor in candidate["weights"]:
+        subset = [r for r in recent if factor in (r.get("factors") or [])]
+        if len(subset) < 6:
+            continue
+        r = _rate(subset)
+        w = float(candidate["weights"].get(factor, 1.0))
+        if r >= baseline + 0.10:
+            candidate["weights"][factor] = min(1.0 + ADAPTIVE_MAX_CHANGE, w + 0.05)
+        elif r <= baseline - 0.10:
+            candidate["weights"][factor] = max(1.0 - ADAPTIVE_MAX_CHANGE, w - 0.05)
+
+    for et in ("دخول مبكر", "إعادة اختبار", "اختراق مؤكد"):
+        subset = [r for r in recent if r.get("entry_type") == et]
+        if len(subset) < 6:
+            continue
+        r = _rate(subset)
+        lim = int(candidate["entry_limits"].get(et, 94))
+        if r <= baseline - 0.12:
+            candidate["entry_limits"][et] = max(88, lim - 1)
+        elif r >= baseline + 0.12:
+            candidate["entry_limits"][et] = min(100, lim + 1)
+
+    low = [r for r in recent if float(r.get("volume_ratio", 9) or 9) < 1.2]
+    if len(low) >= 8 and _rate(low) <= baseline - 0.10:
+        candidate["min_volume_ratio"] = min(1.20, round(float(candidate.get("min_volume_ratio", .85)) + .05, 2))
+
+    candidate["generation"] = int(current.get("generation", 0)) + 1
+    candidate["samples_at_update"] = len(completed)
+    return candidate
+
+
+def _validate_candidate(candidate: dict, completed: list[dict]) -> tuple[bool, float, float, float]:
+    recent = completed[-ADAPTIVE_CONFIRM_SAMPLES:]
+    actual_rate = _rate(recent)
+    selected = []
+    for r in recent:
+        factors = r.get("factors") or []
+        pseudo_score = 50.0 + sum(2.0 * float(candidate.get("weights", {}).get(f, 1.0)) for f in factors)
+        limit = float(candidate.get("entry_limits", {}).get(r.get("entry_type"), 94))
+        if float(r.get("volume_ratio", 1.0) or 1.0) < float(candidate.get("min_volume_ratio", .85)):
+            continue
+        if r.get("news_state") == "negative":
+            continue
+        if pseudo_score >= min(82.0, limit):
+            selected.append(r)
+    if not selected:
+        return False, actual_rate, 0.0, 0.0
+    candidate_rate = _rate(selected)
+    coverage = len(selected) / len(recent)
+    approved = candidate_rate >= actual_rate + 0.04 and coverage >= 0.45
+    return approved, actual_rate, candidate_rate, coverage
+
+
+
+def _classify_regime(
+    trend_up: bool,
+    m15_state: str,
+    chop: bool,
+    market_ok: bool,
+    atr_pct: float,
+    news_state: str,
+) -> str:
+    if news_state == "positive_strong":
+        return "news_momentum"
+    if chop:
+        return "chop"
+    if not market_ok:
+        return "market_weak"
+    if trend_up and m15_state == "داعم" and atr_pct <= 4.5:
+        return "trend_clean"
+    if trend_up and m15_state != "معاكس":
+        return "trend_mixed"
+    if atr_pct > 6.0:
+        return "high_volatility"
+    return "neutral"
+
+
+def _interaction_keys(
+    entry_type: str,
+    market_regime: str,
+    m15_state: str,
+    volume_ratio: float,
+    breakout_quality: float,
+) -> list[str]:
+    keys = [f"type:{entry_type}", f"regime:{market_regime}", f"m15:{m15_state}"]
+    if volume_ratio >= 1.5:
+        keys.append("volume:strong")
+    elif volume_ratio < 1.0:
+        keys.append("volume:weak")
+    if breakout_quality >= 70:
+        keys.append("breakout:strong")
+    elif 0 < breakout_quality < 55:
+        keys.append("breakout:weak")
+    if entry_type in {"اختراق مؤكد", "إعادة اختبار"} and volume_ratio >= 1.5:
+        keys.append("combo:breakout+volume")
+    if m15_state == "داعم" and volume_ratio >= 1.2 and market_regime == "trend_clean":
+        keys.append("combo:m15+volume+trend")
+    if market_regime == "chop" and volume_ratio < 1.2:
+        keys.append("combo:chop+weak_volume")
+    return keys
+
+
+def _recent_learning_rows() -> list[dict]:
+    return [
+        r for r in _read_learning_records()
+        if r.get("record_type") == "outcome"
+        and r.get("status") in {"tp1", "stop", "timeout"}
+    ]
+
+
+def _interaction_rate(rows: list[dict], key: str) -> tuple[float, int]:
+    subset = [r for r in rows if key in (r.get("interactions") or [])]
+    return _rate(subset), len(subset)
+
+
+def _shadow_score_row(row: dict, policy: dict) -> bool:
+    """قرار افتراضي محافظ للنظام الجديد، دون تغيير النتيجة التاريخية."""
+    factors = row.get("factors") or []
+    interactions = row.get("interactions") or []
+    score = 50.0
+    for f in factors:
+        score += 2.0 * float(policy.get("weights", {}).get(f, 1.0))
+    for k in interactions:
+        score += 1.5 * float(policy.get("interaction_weights", {}).get(k, 1.0))
+    et = row.get("entry_type")
+    limit = float(policy.get("entry_limits", {}).get(et, 94))
+    vol = float(row.get("volume_ratio", 1.0) or 1.0)
+    if vol < float(policy.get("min_volume_ratio", .85)):
+        return False
+    if row.get("news_state") == "negative":
+        return False
+    return score >= min(82.0, limit)
+
+
+def _rollback_if_needed() -> dict:
+    """إذا هبطت نتائج الجيل الحالي بقوة، يرجع تلقائيًا لأفضل جيل محفوظ."""
+    p = _load_adaptive_policy()
+    hist = p.get("history", [])
+    if not hist:
+        return {"status": "no_history"}
+    current_rate = float(p.get("validation_new_rate", 0) or 0)
+    best_path = ADAPTIVE_BEST_FILE
+    if not best_path.exists():
+        return {"status": "no_best"}
+    try:
+        best = json.loads(best_path.read_text(encoding="utf-8"))
+        best_rate = float(best.get("validated_rate", 0) or 0)
+        if best_rate > 0 and current_rate < best_rate - ADAPTIVE_ROLLBACK_DROP:
+            _save_adaptive_policy(best["policy"])
+            return {
+                "status": "rollback",
+                "from_generation": p.get("generation"),
+                "to_generation": best["policy"].get("generation", 0),
+            }
+    except Exception:
+        pass
+    return {"status": "keep"}
+
+
+def adaptive_retrain_if_ready() -> dict:
+    """يشغّل دورة التعلم الذاتي ويصدر نتيجة قابلة للإرسال إلى Telegram."""
+    completed = _recent_learning_rows()
+    policy = _load_adaptive_policy()
+
+    if len(completed) < ADAPTIVE_MIN_SAMPLES:
+        return {"status": "waiting", "samples": len(completed)}
+
+    last_update = int(policy.get("samples_at_update", 0))
+    if len(completed) <= last_update:
+        return {"status": "unchanged", "samples": len(completed)}
+
+    recent = completed[-ADAPTIVE_CONFIRM_SAMPLES:]
+    # اختبار خارج العينة: نتعلم من الجزء الأقدم ونختبر المرشح على أحدث جزء لم يره أثناء التدريب.
+    split = max(20, int(len(recent) * 0.70))
+    train = recent[:split]
+    test = recent[split:]
+    if len(train) < 20 or len(test) < 10:
+        return {"status": "waiting_oos", "samples": len(completed)}
+    baseline_rate = _rate(train)
+    candidate = json.loads(json.dumps(policy))
+    candidate.setdefault("interaction_weights", {})
+
+    # العوامل
+    for factor in candidate.get("weights", {}):
+        subset = [r for r in train if factor in (r.get("factors") or [])]
+        if len(subset) < 6:
+            continue
+        rate = _rate(subset)
+        w = float(candidate["weights"].get(factor, 1.0))
+        if rate >= baseline_rate + 0.10:
+            candidate["weights"][factor] = min(1.0 + ADAPTIVE_MAX_CHANGE, w + 0.05)
+        elif rate <= baseline_rate - 0.10:
+            candidate["weights"][factor] = max(1.0 - ADAPTIVE_MAX_CHANGE, w - 0.05)
+
+    # التركيبات
+    keys = sorted({k for r in train for k in (r.get("interactions") or [])})
+    for key in keys:
+        rate, n = _interaction_rate(train, key)
+        if n < 6:
+            continue
+        w = float(candidate["interaction_weights"].get(key, 1.0))
+        if rate >= baseline_rate + 0.12:
+            candidate["interaction_weights"][key] = min(1.0 + ADAPTIVE_MAX_CHANGE, w + 0.05)
+        elif rate <= baseline_rate - 0.12:
+            candidate["interaction_weights"][key] = max(1.0 - ADAPTIVE_MAX_CHANGE, w - 0.05)
+
+    # نوع الدخول
+    for et in ("دخول مبكر", "إعادة اختبار", "اختراق مؤكد"):
+        subset = [r for r in train if r.get("entry_type") == et]
+        if len(subset) < 6:
+            continue
+        rate = _rate(subset)
+        lim = int(candidate["entry_limits"].get(et, 94))
+        if rate <= baseline_rate - 0.12:
+            candidate["entry_limits"][et] = max(88, lim - 1)
+        elif rate >= baseline_rate + 0.12:
+            candidate["entry_limits"][et] = min(100, lim + 1)
+
+    # نظام السوق والحجم
+    for regime in ("chop", "trend_clean", "trend_mixed", "market_weak", "news_momentum"):
+        subset = [r for r in train if r.get("market_regime") == regime]
+        if len(subset) >= 6 and regime in {"chop", "market_weak"}:
+            if _rate(subset) <= baseline_rate - 0.10:
+                candidate["min_volume_ratio"] = min(
+                    1.20, round(float(candidate.get("min_volume_ratio", .85)) + .05, 2)
+                )
+
+    low = [r for r in train if float(r.get("volume_ratio", 9) or 9) < 1.2]
+    if len(low) >= 8 and _rate(low) <= baseline_rate - 0.10:
+        candidate["min_volume_ratio"] = min(
+            1.20, round(float(candidate.get("min_volume_ratio", .85)) + .05, 2)
+        )
+
+    candidate["generation"] = int(policy.get("generation", 0)) + 1
+    candidate["samples_at_update"] = len(completed)
+
+    current_selected = [r for r in test if _shadow_score_row(r, policy)]
+    candidate_selected = [r for r in test if _shadow_score_row(r, candidate)]
+    current_rate = _rate(current_selected)
+    candidate_rate = _rate(candidate_selected)
+    coverage = len(candidate_selected) / max(len(test), 1)
+
+    approved = (
+        candidate_rate >= current_rate + ADAPTIVE_MIN_EDGE
+        and coverage >= ADAPTIVE_MIN_COVERAGE
+        and len(candidate_selected) >= 10
+    )
+
+    result = {
+        "generation": candidate["generation"],
+        "samples": len(completed),
+        "baseline_rate": round(baseline_rate, 4),
+        "current_shadow_rate": round(current_rate, 4),
+        "candidate_shadow_rate": round(candidate_rate, 4),
+        "coverage": round(coverage, 4),
+        "oos_samples": len(test),
+        "train_samples": len(train),
+        "approved": bool(approved),
+        "at": datetime.now(timezone.utc).isoformat(),
+    }
+
+    # سجل Shadow دائم
+    try:
+        with ADAPTIVE_SHADOW_FILE.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(result, ensure_ascii=False) + "\n")
+    except Exception:
+        pass
+
+    if approved:
+        candidate["approved"] = True
+        candidate["validation_new_rate"] = candidate_rate
+        candidate["validation_old_rate"] = current_rate
+        candidate["history"] = (policy.get("history", []) + [result])[-20:]
+        _save_adaptive_policy(candidate)
+
+        try:
+            best = json.loads(ADAPTIVE_BEST_FILE.read_text(encoding="utf-8")) if ADAPTIVE_BEST_FILE.exists() else {}
+            best_rate = float(best.get("validated_rate", 0) or 0)
+            if candidate_rate > best_rate:
+                ADAPTIVE_BEST_FILE.write_text(
+                    json.dumps({
+                        "validated_rate": candidate_rate,
+                        "generation": candidate["generation"],
+                        "policy": candidate,
+                        "at": datetime.now(timezone.utc).isoformat(),
+                    }, ensure_ascii=False, indent=2),
+                    encoding="utf-8",
+                )
+        except Exception:
+            pass
+
+        result["status"] = "approved"
+        result["message"] = (
+            f"🧠 تحديث التعلم الذاتي\n"
+            f"تم تحليل {len(completed)} صفقة\n"
+            f"الحالي: {current_rate*100:.1f}%\n"
+            f"الجديد المتوقع: {candidate_rate*100:.1f}%\n"
+            f"التغطية: {coverage*100:.1f}%\n"
+            f"✅ تم اعتماد الجيل رقم {candidate['generation']}"
+        )
+    else:
+        policy["samples_at_update"] = len(completed)
+        policy["history"] = (policy.get("history", []) + [result])[-20:]
+        _save_adaptive_policy(policy)
+
+        result["status"] = "rejected"
+        result["message"] = (
+            f"🧠 مراجعة التعلم الذاتي\n"
+            f"تم تحليل {len(completed)} صفقة\n"
+            f"الحالي: {current_rate*100:.1f}% | الجديد: {candidate_rate*100:.1f}%\n"
+            f"❌ لم يتم اعتماد التعديل — السياسة الحالية بقيت كما هي"
+        )
+
+    # Rollback فعلي: لا يتم إلا إذا كان لدينا أفضل جيل وتراجع الأداء بقوة.
+    rollback = _rollback_if_needed()
+    result["rollback"] = rollback.get("status")
+    if rollback.get("status") == "rollback":
+        result["status"] = "rollback"
+        result["message"] = (
+            f"🔄 Rollback للتعلم الذاتي\n"
+            f"الجيل {rollback.get('from_generation')} تراجع، فعاد البوت إلى "
+            f"أفضل جيل محفوظ: {rollback.get('to_generation')}\n"
+            f"🛡️ تم الإبقاء على أفضل سياسة"
+        )
+
+    try:
+        LEARNING_ALERT_FILE.write_text(
+            json.dumps(result, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+    except Exception:
+        pass
+
+    return result
 
 
 def _learning_adjustment(factors: list[str], entry_type: str) -> float:
@@ -188,6 +609,8 @@ def register_intraday_signal(sig: IntradaySignal) -> str:
             "breakout_quality": sig.breakout_quality,
             "market_state": sig.market_state,
             "chop": sig.chop,
+            "adaptive_generation": int(_load_adaptive_policy().get("generation", 0)),
+            "interactions": list(getattr(sig, "interaction_keys", []) or []),
             "status": "pending",
         }
     )
@@ -256,6 +679,8 @@ def record_intraday_outcome(
             "breakout_quality": target.get("breakout_quality", 0),
             "market_state": target.get("market_state", "السوق غير مؤكد"),
             "chop": target.get("chop", False),
+            "market_regime": target.get("market_regime", "neutral"),
+            "interactions": target.get("interactions", []) or [],
             "status": status,
             "exit_price": exit_price,
             "note": note,
@@ -522,19 +947,79 @@ def _find_prior_resistance(
     return min(candidates, key=lambda x: x[0])
 
 
+_QUOTE_CACHE: dict[str, tuple[datetime, dict]] = {}
+QUOTE_CACHE_SECONDS = 30
+MAX_SPREAD_PCT = 0.80
+HARD_MAX_SPREAD_PCT = 1.20
+MIN_DOLLAR_VOLUME_3M = 10_000_000.0
+
+def _quote_liquidity(symbol: str, price: float) -> dict:
+    """يفحص Bid/Ask من Alpaca أولاً، ثم Yahoo كاحتياط؛ لا نخترع quote مفقود."""
+    now = datetime.now(timezone.utc)
+    cached = _QUOTE_CACHE.get(symbol)
+    if cached and (now - cached[0]).total_seconds() < QUOTE_CACHE_SECONDS:
+        return cached[1]
+    result = {"ok": True, "spread_pct": 0.0, "slippage_pct": 0.0, "dollar_volume": 0.0, "quote_source": "none"}
+    try:
+        from market_data import fetch_latest_quote
+        q = fetch_latest_quote(symbol)
+        bid, ask = float(q.get("bid") or 0), float(q.get("ask") or 0)
+        px = float(price or 0)
+        if bid > 0 and ask > bid and px > 0:
+            spread = (ask - bid) / px * 100
+            result["spread_pct"] = spread
+            result["slippage_pct"] = spread / 2.0
+            result["ok"] = spread <= HARD_MAX_SPREAD_PCT
+            result["quote_source"] = "alpaca-" + str(q.get("feed") or "unknown")
+            # quote ناجح؛ نأخذ حجم التداول من متوسط Yahoo لاحقًا فقط كمعلومة سيولة.
+    except Exception:
+        pass
+    try:
+        url = "https://query1.finance.yahoo.com/v7/finance/quote?symbols=" + urllib.parse.quote(symbol)
+        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+        with urllib.request.urlopen(req, timeout=2.5) as r:
+            data = json.loads(r.read().decode("utf-8", errors="replace"))
+        q = ((data.get("quoteResponse") or {}).get("result") or [None])[0]
+        if not q:
+            return result
+        bid = float(q.get("bid") or 0)
+        ask = float(q.get("ask") or 0)
+        px = float(q.get("regularMarketPrice") or price or 0)
+        avg_vol = float(q.get("averageDailyVolume3Month") or 0)
+        if result.get("quote_source") == "none" and bid > 0 and ask > bid and px > 0:
+            spread = (ask - bid) / px * 100
+            result["spread_pct"] = spread
+            result["slippage_pct"] = spread / 2.0
+            result["ok"] = spread <= HARD_MAX_SPREAD_PCT
+            result["quote_source"] = "yahoo"
+        result["dollar_volume"] = avg_vol * px
+        if result["dollar_volume"] and result["dollar_volume"] < MIN_DOLLAR_VOLUME_3M:
+            result["ok"] = False
+    except Exception:
+        pass
+    _QUOTE_CACHE[symbol] = (now, result)
+    return result
+
+
 def analyze_intraday(symbol: str, name: str = "") -> Optional[IntradaySignal]:
     from market_data import fetch_intraday
 
     h1 = fetch_intraday(symbol, interval="60m", period="10d")
-    if h1 is None or len(h1) < 40:
+    from market_data import intraday_data_fresh
+    ok_h1, _ = intraday_data_fresh(h1, "60m", 90)
+    if h1 is None or len(h1) < 40 or not ok_h1:
         return None
 
     m5 = fetch_intraday(symbol, interval="5m", period="5d")
-    if m5 is None or len(m5) < 30:
+    ok_m5, _ = intraday_data_fresh(m5, "5m", 12)
+    if m5 is None or len(m5) < 30 or not ok_m5:
         return None
 
     try:
         m15 = fetch_intraday(symbol, interval="15m", period="10d")
+        ok_m15, _ = intraday_data_fresh(m15, "15m", 25)
+        if not ok_m15:
+            m15 = None
     except Exception:
         m15 = None
 
@@ -751,14 +1236,22 @@ def analyze_intraday(symbol: str, name: str = "") -> Optional[IntradaySignal]:
 
     atr = float(_atr(h1, 14).iloc[-1] or price * 0.01)
     atr_pct = atr / price * 100
+    market_regime = _classify_regime(
+        trend_up, m15_state, chop, market_ok, atr_pct, news_state
+    )
+    interaction_keys = _interaction_keys(
+        entry_type, market_regime, m15_state, vol_session_ratio, 0.0
+    )
     if atr_pct > 6.0:
         warnings.append("تذبذب عالي")
         score -= 5
 
     learning_adj = _learning_adjustment(factors, entry_type)
-    if learning_adj:
-        score += learning_adj
-        reasons.append(f"تعلم سابق {learning_adj:+.1f}")
+    adaptive_adj = _adaptive_score_adjustment(factors)
+    total_learning_adj = learning_adj + adaptive_adj
+    if total_learning_adj:
+        score += total_learning_adj
+        reasons.append(f"تعلم ذاتي {total_learning_adj:+.1f}")
 
     strong_alignment = (
         trend_up
@@ -770,12 +1263,14 @@ def analyze_intraday(symbol: str, name: str = "") -> Optional[IntradaySignal]:
         and ext <= 4.0
     )
 
+    policy = _load_adaptive_policy()
+    limits = policy.get("entry_limits", {})
     if entry_type == "دخول مبكر":
-        score = min(score, 94.0)
+        score = min(score, float(limits.get("دخول مبكر", 94)))
     elif entry_type == "إعادة اختبار":
-        score = min(score, 97.0 if strong_alignment else 95.0)
+        score = min(score, float(limits.get("إعادة اختبار", 97.0 if strong_alignment else 95.0)))
     elif entry_type == "اختراق مؤكد":
-        score = min(score, 100.0)
+        score = min(score, float(limits.get("اختراق مؤكد", 100.0)))
     else:
         score = min(score, 80.0)
 
@@ -792,8 +1287,8 @@ def analyze_intraday(symbol: str, name: str = "") -> Optional[IntradaySignal]:
         news_momentum_ok = False
     if news_state == "positive_strong":
         news_momentum_ok = (
-            change_pct >= NEWS_MOMENTUM_MIN_CHANGE
-            and vol_session_ratio >= NEWS_MOMENTUM_MIN_VOLUME
+            change_pct >= float(policy.get("min_news_change_pct", NEWS_MOMENTUM_MIN_CHANGE))
+            and vol_session_ratio >= float(policy.get("min_news_volume_ratio", NEWS_MOMENTUM_MIN_VOLUME))
             and above_vwap
             and breakout_ok
             and breakout_quality >= 60
@@ -807,7 +1302,7 @@ def analyze_intraday(symbol: str, name: str = "") -> Optional[IntradaySignal]:
         and entry_type != "اختراق فاشل"
         and ext <= 4.5
         and atr_pct <= 6.5
-        and vol_session_ratio >= 0.85
+        and vol_session_ratio >= float(policy.get("min_volume_ratio", 0.85))
         and not chop
         and news_momentum_ok
         and not (m15_state == "معاكس" and score_i < 92)
@@ -844,13 +1339,21 @@ def analyze_intraday(symbol: str, name: str = "") -> Optional[IntradaySignal]:
     if tp1_distance_pct < 0.8:
         quality_ok = False
         warnings.append("TP1 قريب جدًا من الدخول")
-    if reward_r < 1.0:
+    if reward_r < float(policy.get("min_tp1_r", 1.0)):
         quality_ok = False
         warnings.append("العائد إلى TP1 ضعيف")
     if news_state == "positive_strong" and news_momentum_ok:
         reasons.append("NEWS MOMENTUM مؤكد")
     buy_low = max(stop * 1.01, min(price * 0.995, e5))
     buy_high = price * 1.004
+
+    # فحص Spread/السيولة يُجرى في scan_intraday للمرشحين فقط، حتى لا يبطئ تحليل كل الأسهم.
+    liquidity = {"ok": True, "spread_pct": 0.0, "slippage_pct": 0.0, "dollar_volume": 0.0}
+    liquidity_ok = True
+
+    interaction_keys = _interaction_keys(
+        entry_type, market_regime, m15_state, vol_session_ratio, breakout_quality
+    )
 
     if resistance_source != "هدف مخاطر احتياطي":
         reasons.append(f"TP1 مقاومة: {tp1:.2f}")
@@ -888,7 +1391,7 @@ def analyze_intraday(symbol: str, name: str = "") -> Optional[IntradaySignal]:
         entry_type=entry_type,
         entry_emoji=entry_emoji,
         m15_state=m15_state,
-        learning_adjustment=round(learning_adj, 2),
+        learning_adjustment=round(total_learning_adj, 2),
         resistance_tp1=round(tp1, 4),
         news_state=news_state,
         news_title=news_title,
@@ -896,6 +1399,12 @@ def analyze_intraday(symbol: str, name: str = "") -> Optional[IntradaySignal]:
         breakout_quality=round(breakout_quality, 1),
         market_state=market_state,
         chop=chop,
+        market_regime=market_regime,
+        interaction_keys=interaction_keys,
+        spread_pct=round(float(liquidity.get("spread_pct", 0) or 0), 3),
+        expected_slippage_pct=round(float(liquidity.get("slippage_pct", 0) or 0), 3),
+        dollar_volume_3m=round(float(liquidity.get("dollar_volume", 0) or 0), 0),
+        liquidity_ok=liquidity_ok,
     )
 
 
@@ -916,6 +1425,7 @@ def format_intraday_ar(sig: IntradaySignal, min_score: int = INTRADAY_MIN_SCORE)
         f"{sig.vwap_day_note} | افتتاح: {'فوق' if sig.above_open else 'تحت'} | حجم: {sig.volume_ratio:.2f}x",
         f"15د: {sig.m15_state} | السوق: {sig.market_state} | تعلم: {sig.learning_adjustment:+.1f}",
         f"الأخبار: {sig.news_state} | جودة الاختراق: {sig.breakout_quality:.0f}/100",
+        f"Spread: {sig.spread_pct:.2f}% | انزلاق متوقع: {sig.expected_slippage_pct:.2f}% | السيولة: {'مناسبة' if sig.liquidity_ok else 'غير مناسبة'}",
     ]
     if sig.reasons:
         lines.append("لماذا: " + " | ".join(sig.reasons[:3]))
@@ -925,6 +1435,19 @@ def format_intraday_ar(sig: IntradaySignal, min_score: int = INTRADAY_MIN_SCORE)
         lines.append(f"تحت شرط الإرسال اللحظي ({min_score}+ / تأكيد / جودة)")
     lines.append("تحليل لحظي تعليمي — ليست توصية. يفضّل الخروج قبل الإغلاق.")
     return "\n".join(lines)
+
+
+
+def get_learning_alert() -> dict | None:
+    """يقرأ آخر تحديث تعلم ليتم إرساله من main.py إلى Telegram."""
+    try:
+        if not LEARNING_ALERT_FILE.exists():
+            return None
+        data = json.loads(LEARNING_ALERT_FILE.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) and data.get("message") else None
+    except Exception:
+        return None
+
 
 
 def scan_intraday(
@@ -939,6 +1462,7 @@ def scan_intraday(
         return []
     scan_intraday.last_window = "ok"
 
+    # السوق العام مرة واحدة قبل مسح الأسهم.
     try:
         spy = analyze_intraday("SPY", "SPY")
         if spy and spy.score < 55 and not spy.above_open:
@@ -948,14 +1472,21 @@ def scan_intraday(
         pass
 
     results: list[IntradaySignal] = []
-    for sym in symbols:
+    workers = min(8, max(2, len(symbols)))
+    def _one(sym: str):
         try:
-            sig = analyze_intraday(sym, names.get(sym, sym))
+            return analyze_intraday(sym, names.get(sym, sym))
+        except Exception:
+            return None
+
+    # التنفيذ المتوازي يقلل زمن فحص القائمة الموسعة بدل تحليل الأسهم واحدًا واحدًا.
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        futures = [pool.submit(_one, sym) for sym in symbols]
+        for fut in as_completed(futures):
+            sig = fut.result()
             if not sig:
                 continue
-            if sig.score < min_score:
-                continue
-            if not sig.live_ok or not sig.quality_ok:
+            if sig.score < min_score or not sig.live_ok or not sig.quality_ok:
                 continue
             if getattr(sig, "entry_type", "") == "اختراق فاشل":
                 continue
@@ -966,13 +1497,19 @@ def scan_intraday(
             if sig.news_state == "negative":
                 continue
             if sig.news_state == "positive_strong":
-                if sig.entry_type not in {"اختراق مؤكد", "إعادة اختبار"}:
+                if sig.entry_type not in {"اختراق مؤكد", "إعادة اختبار"} or sig.breakout_quality < 60:
                     continue
-                if sig.breakout_quality < 60:
-                    continue
+            # Quote/Spread فقط بعد اجتياز التحليل الفني، لتوسيع القائمة دون زيادة كبيرة في الزمن.
+            liq = _quote_liquidity(sig.symbol, sig.price)
+            sig.spread_pct = round(float(liq.get("spread_pct", 0) or 0), 3)
+            sig.expected_slippage_pct = round(float(liq.get("slippage_pct", 0) or 0), 3)
+            sig.dollar_volume_3m = round(float(liq.get("dollar_volume", 0) or 0), 0)
+            sig.liquidity_ok = bool(liq.get("ok", True))
+            if sig.spread_pct > MAX_SPREAD_PCT:
+                sig.warnings.append(f"Spread مرتفع {sig.spread_pct:.2f}%")
+            if not sig.liquidity_ok:
+                continue
             results.append(sig)
-        except Exception:
-            continue
 
     rank = {"اختراق مؤكد": 0, "إعادة اختبار": 1, "دخول مبكر": 2}
     results.sort(key=lambda x: (rank.get(x.entry_type, 9), -x.score, -x.reward_r))

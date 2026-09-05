@@ -16,6 +16,10 @@ log = logging.getLogger("halal-bot.data")
 APCA_KEY = os.getenv("APCA_API_KEY_ID", "").strip()
 APCA_SECRET = os.getenv("APCA_API_SECRET_KEY", "").strip()
 DATA_URL = os.getenv("APCA_DATA_URL", "https://data.alpaca.markets").rstrip("/")
+# auto = جرّب SIP ثم IEX تلقائيًا. إذا لم يكن SIP متاحًا يعود إلى IEX المجاني.
+APCA_FEED = os.getenv("APCA_FEED", "auto").strip().lower()
+SIP_RETRY_COOLDOWN_MIN = 15
+_SIP_DISABLED_UNTIL: datetime | None = None
 
 _LAST_SOURCE = "none"
 _LAST_ERROR = ""
@@ -76,27 +80,14 @@ def _bars_to_df(bars: list) -> pd.DataFrame:
     return df
 
 
-def fetch_alpaca_bars(
-    symbol: str,
-    timeframe: str,
-    start: datetime,
-    end: Optional[datetime] = None,
-    limit: int = 10000,
-) -> pd.DataFrame:
-    if not alpaca_configured():
-        raise RuntimeError("Alpaca keys missing")
-    end = end or datetime.now(timezone.utc)
-    if start.tzinfo is None:
-        start = start.replace(tzinfo=timezone.utc)
-    if end.tzinfo is None:
-        end = end.replace(tzinfo=timezone.utc)
+def _alpaca_request_bars(symbol: str, timeframe: str, start: datetime, end: datetime, limit: int, feed: str) -> pd.DataFrame:
     params = {
         "timeframe": timeframe,
         "start": start.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
         "end": end.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
         "limit": min(limit, 10000),
         "adjustment": "split",
-        "feed": "iex",
+        "feed": feed,
     }
     url = f"{DATA_URL}/v2/stocks/{symbol.upper()}/bars"
     r = requests.get(url, headers=_alpaca_headers(), params=params, timeout=20)
@@ -114,6 +105,92 @@ def fetch_alpaca_bars(
         bars.extend(data.get("bars") or [])
         next_token = data.get("next_page_token")
     return _bars_to_df(bars)
+
+
+def fetch_alpaca_bars(
+    symbol: str,
+    timeframe: str,
+    start: datetime,
+    end: Optional[datetime] = None,
+    limit: int = 10000,
+) -> pd.DataFrame:
+    global _SIP_DISABLED_UNTIL
+    if not alpaca_configured():
+        raise RuntimeError("Alpaca keys missing")
+    end = end or datetime.now(timezone.utc)
+    if start.tzinfo is None:
+        start = start.replace(tzinfo=timezone.utc)
+    if end.tzinfo is None:
+        end = end.replace(tzinfo=timezone.utc)
+
+    requested = APCA_FEED if APCA_FEED in {"iex", "sip", "delayed_sip"} else "auto"
+    feeds = [requested] if requested != "auto" else []
+    if requested == "auto":
+        now = datetime.now(timezone.utc)
+        if _SIP_DISABLED_UNTIL is None or now >= _SIP_DISABLED_UNTIL:
+            feeds.append("sip")
+        feeds.append("iex")
+
+    last_exc = None
+    for feed in feeds:
+        try:
+            df = _alpaca_request_bars(symbol, timeframe, start, end, limit, feed)
+            if feed == "sip":
+                _SIP_DISABLED_UNTIL = None
+            _set_status(f"alpaca-{feed}")
+            return df
+        except Exception as exc:
+            last_exc = exc
+            # إذا لم تكن صلاحية SIP موجودة، لا نكرر الطلب في كل سهم/كل دقيقة.
+            if feed == "sip" and APCA_FEED == "auto":
+                _SIP_DISABLED_UNTIL = datetime.now(timezone.utc) + timedelta(minutes=SIP_RETRY_COOLDOWN_MIN)
+                log.info("Alpaca SIP غير متاح حاليًا؛ الرجوع إلى IEX: %s", exc)
+                continue
+            if feed != feeds[-1]:
+                continue
+            raise
+    raise last_exc or RuntimeError("Alpaca data unavailable")
+
+
+def data_age_minutes(df: pd.DataFrame, now: Optional[datetime] = None) -> float:
+    """عمر آخر شمعة بالدقائق، بناءً على timestamp الفعلي للفهرس."""
+    if df is None or df.empty or not isinstance(df.index, pd.DatetimeIndex):
+        return float("inf")
+    ts = pd.Timestamp(df.index[-1])
+    if ts.tzinfo is None:
+        ts = ts.tz_localize("America/New_York")
+    now_ts = pd.Timestamp(now or datetime.now(timezone.utc))
+    if now_ts.tzinfo is None:
+        now_ts = now_ts.tz_localize("UTC")
+    now_ts = now_ts.tz_convert(ts.tz)
+    return max(0.0, (now_ts - ts).total_seconds() / 60.0)
+
+
+def intraday_data_fresh(df: pd.DataFrame, interval: str, max_age_minutes: Optional[float] = None) -> tuple[bool, float]:
+    defaults = {"1m": 4.0, "5m": 12.0, "15m": 25.0, "60m": 90.0, "1h": 90.0}
+    age = data_age_minutes(df)
+    limit = float(max_age_minutes if max_age_minutes is not None else defaults.get(interval, 12.0))
+    return age <= limit, age
+
+
+def fetch_latest_quote(symbol: str, feed: Optional[str] = None) -> dict:
+    """أفضل Bid/Ask من Alpaca عند توفره، بدون اختراع قيم عند غياب الاقتباس."""
+    if not alpaca_configured():
+        return {}
+    use_feed = feed or ("sip" if APCA_FEED == "sip" else "iex")
+    url = f"{DATA_URL}/v2/stocks/{symbol.upper()}/quotes/latest"
+    params = {"feed": use_feed}
+    r = requests.get(url, headers=_alpaca_headers(), params=params, timeout=5)
+    if r.status_code >= 400:
+        raise RuntimeError(f"Alpaca quote {r.status_code}: {r.text[:160]}")
+    data = r.json() or {}
+    q = data.get("quote") or {}
+    return {
+        "bid": float(q.get("bp") or 0),
+        "ask": float(q.get("ap") or 0),
+        "timestamp": q.get("t"),
+        "feed": use_feed,
+    }
 
 
 def fetch_history(symbol: str, period: str = "1y") -> pd.DataFrame:

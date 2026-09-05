@@ -38,6 +38,7 @@ from analyzer_intraday import (
     format_intraday_ar,
     scan_intraday,
     session_window_ok,
+    get_learning_alert,
 )
 from backtest import run_backtest
 from charting import build_signal_chart
@@ -72,7 +73,7 @@ MIN_SCORE = int(os.getenv("MIN_SCORE", "84"))
 DAILY_MAX = int(os.getenv("DAILY_MAX_ALERTS", "5"))
 ALERT_EVERY_MINUTES = int(os.getenv("ALERT_EVERY_MINUTES", "90"))
 INTRADAY_MAX = int(os.getenv("INTRADAY_MAX_ALERTS", "3"))
-INTRADAY_EVERY_MINUTES = int(os.getenv("INTRADAY_EVERY_MINUTES", "40"))
+INTRADAY_EVERY_MINUTES = int(os.getenv("INTRADAY_EVERY_MINUTES", "120"))
 LIVE_SCAN_SECONDS = int(os.getenv("LIVE_SCAN_SECONDS", "60"))
 EARNINGS_DAYS = int(os.getenv("EARNINGS_DAYS", "2"))
 COOLDOWN_DAYS = int(os.getenv("COOLDOWN_DAYS", "5"))
@@ -83,6 +84,7 @@ PERF_FILE = DATA_DIR / "signals_log.json"
 PERF_INTRA_FILE = DATA_DIR / "signals_log_intraday.json"
 COOL_FILE = DATA_DIR / "cooldown.json"
 REPORTS_FILE = DATA_DIR / "reports_state.json"
+LEARNING_ALERT_SENT_FILE = DATA_DIR / "learning_alert_sent.json"
 WEIGHTS_FILE = DATA_DIR / "weights_state.json"
 CHART_DIR = DATA_DIR / "charts"
 
@@ -129,6 +131,8 @@ def _empty_state(day: str) -> dict:
         "sent_intraday": [],
         "scores_intraday": {},
         "last_sent_intraday_at": None,
+        "intraday_alert_meta": {},
+        "intraday_watch": {},
     }
 
 
@@ -144,6 +148,8 @@ def load_state() -> dict:
                 data.setdefault("sent_intraday", [])
                 data.setdefault("scores_intraday", {})
                 data.setdefault("last_sent_intraday_at", None)
+                data.setdefault("intraday_alert_meta", {})
+                data.setdefault("intraday_watch", {})
                 return data
         except Exception:
             pass
@@ -854,7 +860,7 @@ def minutes_since_last_intraday(state: dict) -> float | None:
 
 
 async def live_scan_intraday_job(context: ContextTypes.DEFAULT_TYPE) -> None:
-    """مسح لحظي معزول: ساعة + 5د | سقف 3 | خارج أول/آخر الجلسة."""
+    """مسح لحظي: Watch → Confirm → Alert | ساعة + 15د + 5د | سقف 3."""
     if not SUBSCRIBERS or not is_us_regular_session():
         return
     ok, reason = session_window_ok()
@@ -876,25 +882,69 @@ async def live_scan_intraday_job(context: ContextTypes.DEFAULT_TYPE) -> None:
             scan_intraday,
             CORE_WATCHLIST,
             HALAL_STOCKS,
-            INTRADAY_MIN_SCORE,
+            max(76, INTRADAY_MIN_SCORE - 6),
             10,
         )
-        # يستبعد فقط ما أُرسل لحظياً اليوم (لا يمنع بسبب السوينغ)
+        # Watch → Confirm → Alert: أول مسح يسلّح المرشح، والمسح التالي يؤكده.
+        meta = state.get("intraday_alert_meta") or {}
+        def _duplicate_ok(sig):
+            old = meta.get(sig.symbol)
+            if not old:
+                return True
+            try:
+                old_score = float(old.get("score", 0) or 0)
+                old_price = float(old.get("price", 0) or 0)
+                old_type = str(old.get("entry_type", ""))
+                new_price = float(sig.price)
+                price_move = abs(new_price - old_price) / max(old_price, 1e-9) * 100
+                type_changed = str(getattr(sig, "entry_type", "")) != old_type
+                score_improved = float(sig.score) >= old_score + 5
+                return type_changed and score_improved or price_move >= 1.5 and score_improved
+            except Exception:
+                return False
         already = set(sent_i)
         fresh = [
-            s
-            for s in hits
-            if s.symbol not in already and getattr(s, "entry_type", "") != "اختراق فاشل"
+            s for s in hits
+            if getattr(s, "entry_type", "") != "اختراق فاشل"
+            and (s.symbol not in already or _duplicate_ok(s))
         ]
         if not fresh:
             return
 
-        # تفضيل: اختراق مؤكد ثم إعادة اختبار ثم دخول مبكر
         rank = {"اختراق مؤكد": 0, "إعادة اختبار": 1, "دخول مبكر": 2}
-        fresh.sort(key=lambda s: (rank.get(getattr(s, "entry_type", ""), 9), -s.score))
-        sig = fresh[0]
+        fresh.sort(key=lambda s: (rank.get(getattr(s, "entry_type", ""), 9), -s.score, -s.reward_r))
+        candidate = fresh[0]
+        watch = state.get("intraday_watch") or {}
+        now_iso = now_ny().isoformat()
+        confirmed = False
+        if watch.get("symbol") == candidate.symbol:
+            try:
+                age = (now_ny() - datetime.fromisoformat(watch.get("at"))).total_seconds() / 60.0
+            except Exception:
+                age = 999
+            confirmed = age <= max(20, INTRADAY_EVERY_MINUTES * 2) and candidate.score >= INTRADAY_MIN_SCORE
+
+        if not confirmed:
+            state["intraday_watch"] = {
+                "symbol": candidate.symbol,
+                "score": candidate.score,
+                "price": candidate.price,
+                "entry_type": candidate.entry_type,
+                "at": now_iso,
+            }
+            save_state(state)
+            return
+
+        sig = candidate
+        state.pop("intraday_watch", None)
         state.setdefault("sent_intraday", []).append(sig.symbol)
         state.setdefault("scores_intraday", {})[sig.symbol] = sig.score
+        state.setdefault("intraday_alert_meta", {})[sig.symbol] = {
+            "score": sig.score,
+            "price": sig.price,
+            "entry_type": getattr(sig, "entry_type", ""),
+            "at": now_ny().isoformat(),
+        }
         state["last_sent_intraday_at"] = now_ny().isoformat()
         save_state(state)
         PERF_INTRA.add_signal(sig, source="auto_intraday")
@@ -903,7 +953,7 @@ async def live_scan_intraday_job(context: ContextTypes.DEFAULT_TYPE) -> None:
         header = (
             f"⚡ لحظي — الدفعة {slot}/{INTRADAY_MAX}\n"
             f"{session_label()}\n"
-            f"النوع: لحظي (ساعة + 5د)\n"
+            f"النوع: لحظي (ساعة + 15د + 5د) — Watch→Confirm\n"
             f"{getattr(sig, 'entry_emoji', '🟢')} {getattr(sig, 'entry_type', 'دخول')}\n"
             f"فاصل {INTRADAY_EVERY_MINUTES} د | يفضّل الخروج قبل الإغلاق"
         )
@@ -977,7 +1027,7 @@ async def weekly_report_job(context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def perf_update_job(context: ContextTypes.DEFAULT_TYPE) -> None:
-    """متابعة الصفقات المفتوحة (سوينغ + لحظي): وقف / أهداف."""
+    """متابعة الصفقات المفتوحة + إرسال تحديثات التعلم الذاتي مرة واحدة."""
     try:
         prefer_intraday = is_us_regular_session()
 
@@ -991,8 +1041,33 @@ async def perf_update_job(context: ContextTypes.DEFAULT_TYPE) -> None:
             return evs
 
         events = await asyncio.to_thread(_all_events)
+
+        # التعلم الذاتي يعمل بعد تسجيل نتائج الصفقات داخل PerformanceLog.
+        # نقرأ آخر نتيجة ونرسلها مرة واحدة فقط.
+        if SUBSCRIBERS:
+            try:
+                alert = get_learning_alert()
+                sent_key = None
+                if LEARNING_ALERT_SENT_FILE.exists():
+                    try:
+                        sent_key = json.loads(
+                            LEARNING_ALERT_SENT_FILE.read_text(encoding="utf-8")
+                        ).get("at")
+                    except Exception:
+                        sent_key = None
+
+                if alert and alert.get("message") and alert.get("at") != sent_key:
+                    await broadcast(context.bot, alert["message"])
+                    LEARNING_ALERT_SENT_FILE.write_text(
+                        json.dumps({"at": alert.get("at")}, ensure_ascii=False),
+                        encoding="utf-8",
+                    )
+            except Exception as exc:
+                log.warning("learning alert: %s", exc)
+
         if not events or not SUBSCRIBERS:
             return
+
         for ev in events:
             text = PerformanceLog.format_event_ar(ev)
             await broadcast(context.bot, text)

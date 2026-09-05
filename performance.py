@@ -63,6 +63,9 @@ class PerformanceLog:
             "factors": factors,
             "regime": getattr(sig, "regime", "") or "",
             "volume_ratio": round(float(getattr(sig, "volume_ratio", 0) or 0), 3),
+            "spread_pct": round(float(getattr(sig, "spread_pct", 0) or 0), 3),
+            "expected_slippage_pct": round(float(getattr(sig, "expected_slippage_pct", 0) or 0), 3),
+            "dollar_volume_3m": round(float(getattr(sig, "dollar_volume_3m", 0) or 0), 0),
             "ext_sma20": round(float(getattr(sig, "ext_sma20", 0) or 0), 2),
             "atr_pct": round(float(getattr(sig, "atr_pct", 0) or 0), 2),
             "structure_zone": getattr(sig, "structure_zone", "") or "",
@@ -76,6 +79,10 @@ class PerformanceLog:
             "result": None,
             "pnl_pct": None,
             "notes": "",
+            "mfe_pct": 0.0,
+            "mae_pct": 0.0,
+            "time_to_result_min": None,
+            "quote_source": getattr(sig, "quote_source", "") or "",
         }
         # التعلم اللحظي مستقل عن السوينغ: نحفظ لقطة الإشارة عند تسجيلها.
         if row["mode"] == "intraday":
@@ -219,8 +226,17 @@ class PerformanceLog:
             except Exception:
                 return []
 
+            # جودة التنفيذ/الحركة بعد التنبيه: MFE وMAE ووقت الوصول للنتيجة.
+            row["mfe_pct"] = round(max(float(row.get("mfe_pct") or 0), (max_high - entry) / entry * 100), 2)
+            row["mae_pct"] = round(min(float(row.get("mae_pct") or 0), (min_low - entry) / entry * 100), 2)
+
             def _evt(kind: str, price: float, close_trade: bool) -> dict[str, Any]:
                 pnl = round((price - entry) / entry * 100, 2)
+                try:
+                    opened_at = datetime.fromisoformat(row["opened_at"])
+                    row["time_to_result_min"] = round((_now() - opened_at).total_seconds() / 60.0, 1)
+                except Exception:
+                    pass
                 row_mode = row.get("mode") or ("intraday" if "intraday" in str(row.get("source") or "") else "swing")
                 if close_trade:
                     row["status"] = "closed"
@@ -249,6 +265,12 @@ class PerformanceLog:
                                 exit_price=price,
                                 note="تعلم لحظي: إغلاق كامل عند TP1" if kind == "tp1" else "",
                             )
+                            try:
+                                from analyzer_intraday import adaptive_retrain_if_ready
+                                retrain_result = adaptive_retrain_if_ready()
+                                log.info("التعلم الذاتي: %s", retrain_result.get("message", ""))
+                            except Exception as exc:
+                                log.warning("تعذر تحديث التعلم الذاتي للحظي %s: %s", symbol, exc)
                         except Exception as exc:
                             log.warning("تعذر حفظ نتيجة تعلم اللحظي %s: %s", symbol, exc)
 
@@ -264,6 +286,9 @@ class PerformanceLog:
                     "mode": row.get("mode")
                     or ("intraday" if "intraday" in str(row.get("source") or "") else "swing"),
                     "source": row.get("source") or "",
+                    "mfe_pct": row.get("mfe_pct", 0.0),
+                    "mae_pct": row.get("mae_pct", 0.0),
+                    "time_to_result_min": row.get("time_to_result_min"),
                 }
 
             # الوقف: نطلب تأكيداً أقوى من لمسة وهمية واحدة
