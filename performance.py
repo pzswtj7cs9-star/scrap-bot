@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, time
 from pathlib import Path
 from typing import Any, Optional
 from zoneinfo import ZoneInfo
@@ -77,6 +77,15 @@ class PerformanceLog:
             "pnl_pct": None,
             "notes": "",
         }
+        # التعلم اللحظي مستقل عن السوينغ: نحفظ لقطة الإشارة عند تسجيلها.
+        if row["mode"] == "intraday":
+            try:
+                from analyzer_intraday import register_intraday_signal
+                row["learning_id"] = register_intraday_signal(sig)
+            except Exception as exc:
+                log.warning("تعذر تسجيل تعلم اللحظي %s: %s", sig.symbol, exc)
+                row["learning_id"] = row["id"]
+
         rows.append(row)
         self._save(rows)
         return row
@@ -136,9 +145,10 @@ class PerformanceLog:
                 pass
         return events
 
-    def _fetch_bars(self, symbol: str, opened: datetime, prefer_intraday: bool):
+    def _fetch_bars(self, symbol: str, opened: datetime, prefer_intraday: bool, mode: str = ""):
         age_hours = (_now() - opened).total_seconds() / 3600
-        if prefer_intraday and age_hours <= 72:
+        use_5m = (mode == "intraday" and age_hours <= 72) or (prefer_intraday and age_hours <= 72)
+        if use_5m:
             try:
                 from market_data import fetch_intraday
 
@@ -165,7 +175,8 @@ class PerformanceLog:
             opened = datetime.fromisoformat(row["opened_at"])
             if opened.tzinfo is None:
                 opened = opened.replace(tzinfo=NY)
-            df, tf = self._fetch_bars(symbol, opened, prefer_intraday)
+            row_mode = row.get("mode") or ("intraday" if "intraday" in str(row.get("source") or "") else "swing")
+            df, tf = self._fetch_bars(symbol, opened, prefer_intraday, mode=row_mode)
             if df is None or df.empty:
                 return []
 
@@ -210,6 +221,7 @@ class PerformanceLog:
 
             def _evt(kind: str, price: float, close_trade: bool) -> dict[str, Any]:
                 pnl = round((price - entry) / entry * 100, 2)
+                row_mode = row.get("mode") or ("intraday" if "intraday" in str(row.get("source") or "") else "swing")
                 if close_trade:
                     row["status"] = "closed"
                     row["result"] = kind
@@ -224,6 +236,22 @@ class PerformanceLog:
                             WEIGHTS.record_outcome(factors, won=won)
                         except Exception:
                             pass
+
+                    # التعلم الجديد للحظي فقط.
+                    # TP1 = نجاح لأن الاستراتيجية تغلق كامل المركز عند TP1.
+                    if row_mode == "intraday" and kind in {"tp1", "stop", "timeout"}:
+                        try:
+                            from analyzer_intraday import record_intraday_outcome
+                            record_intraday_outcome(
+                                row.get("learning_id"),
+                                symbol,
+                                kind,
+                                exit_price=price,
+                                note="تعلم لحظي: إغلاق كامل عند TP1" if kind == "tp1" else "",
+                            )
+                        except Exception as exc:
+                            log.warning("تعذر حفظ نتيجة تعلم اللحظي %s: %s", symbol, exc)
+
                 return {
                     "symbol": symbol,
                     "name": row.get("name") or symbol,
@@ -263,17 +291,30 @@ class PerformanceLog:
                 events.append(_evt("stop", stop_px, True))
                 return events
 
-            # أهداف تدريجية: ينبّه عند كل هدف، ويغلق عند الثالث
+            # اللحظي: خروج كامل عند TP1، لأنه الهدف الذي يعتمد عليه المستخدم للتقييم.
             if max_high >= tp1 and not row.get("hit_tp1"):
                 row["hit_tp1"] = True
+                if row_mode == "intraday":
+                    events.append(_evt("tp1", tp1, True))
+                    return events
                 events.append(_evt("tp1", tp1, False))
-            if max_high >= tp2 and not row.get("hit_tp2"):
-                row["hit_tp2"] = True
-                events.append(_evt("tp2", tp2, False))
-            if max_high >= tp3 and not row.get("hit_tp3"):
-                row["hit_tp3"] = True
-                events.append(_evt("tp3", tp3, True))
-                return events
+
+            # السوينغ يبقى كما هو: متابعة TP2 ثم TP3.
+            if row_mode != "intraday":
+                if max_high >= tp2 and not row.get("hit_tp2"):
+                    row["hit_tp2"] = True
+                    events.append(_evt("tp2", tp2, False))
+                if max_high >= tp3 and not row.get("hit_tp3"):
+                    row["hit_tp3"] = True
+                    events.append(_evt("tp3", tp3, True))
+                    return events
+
+            # اللحظي ينتهي بنهاية يوم التداول إذا لم يصل TP1 أو الوقف.
+            if row_mode == "intraday":
+                now = _now()
+                if now.date() > opened.date() or now.time() >= time(16, 0):
+                    events.append(_evt("timeout", last_close, True))
+                    return events
 
             age_days = (_now() - opened).days
             if age_days >= 15 and row.get("status") == "open":
