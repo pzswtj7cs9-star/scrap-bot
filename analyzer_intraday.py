@@ -40,6 +40,15 @@ ADAPTIVE_MAX_CHANGE = 0.15
 ADAPTIVE_BEST_FILE = Path("intraday_adaptive_best.json")
 ADAPTIVE_SHADOW_FILE = Path("intraday_shadow_results.jsonl")
 LEARNING_ALERT_FILE = Path("intraday_learning_alert.json")
+
+# Canonical list: the adaptive learner must track every real entry strategy.
+ENTRY_TYPES = (
+    "اختراق مؤكد", "إعادة اختبار", "دخول مبكر", "ارتداد VWAP", "ارتداد EMA20",
+    "سحب سيولة", "اختراق نطاق الافتتاح", "استمرار الزخم", "ضغط ثم انفجار",
+    "علم صاعد", "استعادة مستوى", "دخول بعد Opening Drive", "استعادة قمة اليوم",
+    "استعادة بعد فشل ORB", "استمرار ABC", "سحب سيولة مع Displacement",
+)
+PREFILTER_MAX_CANDIDATES = 50
 ADAPTIVE_MIN_EDGE = 0.04
 ADAPTIVE_MIN_COVERAGE = 0.45
 ADAPTIVE_ROLLBACK_DROP = 0.06
@@ -162,6 +171,7 @@ def _default_adaptive_policy() -> dict:
             "news_momentum": 1.0,
         },
         "entry_limits": {"دخول مبكر": 94, "إعادة اختبار": 95, "ارتداد VWAP": 96, "ارتداد EMA20": 96, "سحب سيولة": 97, "ضغط ثم انفجار": 98, "استمرار الزخم": 97, "اختراق نطاق الافتتاح": 99, "اختراق مؤكد": 100, "علم صاعد": 98, "استعادة مستوى": 98, "دخول بعد Opening Drive": 98, "استعادة قمة اليوم": 98, "استعادة بعد فشل ORB": 99, "استمرار ABC": 98, "سحب سيولة مع Displacement": 99},
+        "strategy_stats": {et: {"samples": 0, "wins": 0, "win_rate": 0.0} for et in ENTRY_TYPES},
         "min_volume_ratio": 0.85,
         "min_news_volume_ratio": 1.50,
         "min_news_change_pct": 4.0,
@@ -180,6 +190,15 @@ def _load_adaptive_policy() -> dict:
             return default
         for k, v in default.items():
             data.setdefault(k, v)
+        data.setdefault("weights", {})
+        for k, v in default["weights"].items():
+            data["weights"].setdefault(k, v)
+        data.setdefault("entry_limits", {})
+        for k, v in default["entry_limits"].items():
+            data["entry_limits"].setdefault(k, v)
+        data.setdefault("strategy_stats", {})
+        for et, stat in default["strategy_stats"].items():
+            data["strategy_stats"].setdefault(et, dict(stat))
         return data
     except Exception:
         return default
@@ -209,6 +228,20 @@ def _rate(rows: list[dict]) -> float:
     return sum(r.get("status") == "tp1" for r in rows) / len(rows)
 
 
+def _strategy_stats(rows: list[dict]) -> dict:
+    """إحصاءات منفصلة لكل واحدة من استراتيجيات الدخول الـ16."""
+    stats = {}
+    for et in ENTRY_TYPES:
+        subset = [r for r in rows if str(r.get("entry_type") or "") == et]
+        wins = sum(1 for r in subset if r.get("status") == "tp1")
+        stats[et] = {
+            "samples": len(subset),
+            "wins": wins,
+            "win_rate": round(wins / len(subset), 4) if subset else 0.0,
+        }
+    return stats
+
+
 def _build_candidate_policy(completed: list[dict], current: dict) -> dict | None:
     if len(completed) < ADAPTIVE_MIN_SAMPLES:
         return None
@@ -227,7 +260,7 @@ def _build_candidate_policy(completed: list[dict], current: dict) -> dict | None
         elif r <= baseline - 0.10:
             candidate["weights"][factor] = max(1.0 - ADAPTIVE_MAX_CHANGE, w - 0.05)
 
-    for et in ("دخول مبكر", "إعادة اختبار", "ارتداد VWAP", "ارتداد EMA20", "سحب سيولة", "سحب سيولة مع Displacement", "ضغط ثم انفجار", "استمرار الزخم", "اختراق نطاق الافتتاح", "اختراق مؤكد", "علم صاعد", "استعادة مستوى", "دخول بعد Opening Drive", "استعادة قمة اليوم", "استعادة بعد فشل ORB", "استمرار ABC"):
+    for et in ENTRY_TYPES:
         subset = [r for r in recent if r.get("entry_type") == et]
         if len(subset) < 6:
             continue
@@ -309,7 +342,7 @@ def _interaction_keys(
         keys.append("breakout:strong")
     elif 0 < breakout_quality < 55:
         keys.append("breakout:weak")
-    if entry_type in {"اختراق مؤكد", "إعادة اختبار", "اختراق نطاق الافتتاح", "سحب سيولة", "ضغط ثم انفجار", "استمرار الزخم", "علم صاعد", "استعادة مستوى", "دخول بعد Opening Drive", "استعادة قمة اليوم", "استعادة بعد فشل ORB", "استمرار ABC", "سحب سيولة مع Displacement"} and volume_ratio >= 1.5:
+    if entry_type in ENTRY_TYPES and volume_ratio >= 1.5:
         keys.append("combo:breakout+volume")
     if m15_state == "داعم" and volume_ratio >= 1.2 and market_regime == "trend_clean":
         keys.append("combo:m15+volume+trend")
@@ -397,6 +430,8 @@ def adaptive_retrain_if_ready() -> dict:
     baseline_rate = _rate(train)
     candidate = json.loads(json.dumps(policy))
     candidate.setdefault("interaction_weights", {})
+    # Always refresh per-strategy statistics so all 16 setups are observable.
+    candidate["strategy_stats"] = _strategy_stats(completed)
 
     # العوامل
     for factor in candidate.get("weights", {}):
@@ -990,16 +1025,25 @@ def _quote_liquidity(symbol: str, price: float) -> dict:
     return result
 
 
-def analyze_intraday(symbol: str, name: str = "", market_context: tuple[bool, str] | None = None) -> Optional[IntradaySignal]:
+def analyze_intraday(
+    symbol: str,
+    name: str = "",
+    market_context: tuple[bool, str] | None = None,
+    preloaded: tuple[pd.DataFrame, pd.DataFrame] | None = None,
+) -> Optional[IntradaySignal]:
     from market_data import fetch_intraday
-
-    h1 = fetch_intraday(symbol, interval="60m", period="10d")
     from market_data import intraday_data_fresh
+
+    if preloaded is not None:
+        h1, m5 = preloaded
+    else:
+        h1 = fetch_intraday(symbol, interval="60m", period="10d")
+        m5 = fetch_intraday(symbol, interval="5m", period="5d")
+
     ok_h1, _ = intraday_data_fresh(h1, "60m", 90)
     if h1 is None or len(h1) < 40 or not ok_h1:
         return None
 
-    m5 = fetch_intraday(symbol, interval="5m", period="5d")
     ok_m5, _ = intraday_data_fresh(m5, "5m", 12)
     if m5 is None or len(m5) < 30 or not ok_m5:
         return None
@@ -1428,9 +1472,12 @@ def analyze_intraday(symbol: str, name: str = "", market_context: tuple[bool, st
 
     breakout_ok, breakout_quality = _breakout_quality(today_5, level_high, price)
     orb_breakout_ok, orb_quality = _breakout_quality(today_5, orb_high, price) if orb_high > 0 else (False, 0.0)
-    if failed:
-        entry_type, entry_emoji = "اختراق فاشل", "🔴"
-    elif retest:
+    # Failed breakout is a rejection/filter condition, not an entry strategy.
+    # If there is no separate recovery setup below, the candidate is discarded.
+    if failed and not (retest or liquidity_displacement or liquidity_sweep or orb_failed_reclaim or abc_continuation or opening_drive_pullback or hod_reclaim or vwap_bounce or ema_pullback or orb_breakout or breakout_now or compression_expansion or momentum_continuation or bull_flag or resistance_reclaim):
+        return None
+
+    if retest:
         entry_type, entry_emoji = "إعادة اختبار", "🟡"
     elif orb_breakout and orb_breakout_ok:
         breakout_quality = max(breakout_quality, orb_quality)
@@ -1569,10 +1616,7 @@ def analyze_intraday(symbol: str, name: str = "", market_context: tuple[bool, st
         warnings.append("سقوط من قمة الجلسة")
         score -= 20
 
-    if entry_type == "اختراق فاشل":
-        warnings.append("اختراق فاشل — لا إرسال")
-        score -= 25
-    elif entry_type == "اختراق مؤكد":
+    if entry_type == "اختراق مؤكد":
         score += 8
         reasons.append("اختراق مؤكد")
         factors.append("breakout")
@@ -1749,7 +1793,6 @@ def analyze_intraday(symbol: str, name: str = "", market_context: tuple[bool, st
     quality_ok = (
         (not dump)
         and (not failed)
-        and entry_type != "اختراق فاشل"
         and ext <= 4.5
         and atr_pct <= 6.5
         and vol_session_ratio >= float(policy.get("min_volume_ratio", 0.85))
@@ -1947,6 +1990,66 @@ def get_learning_alert() -> dict | None:
 
 
 
+def _prefilter_intraday(symbol: str) -> tuple[float, pd.DataFrame, pd.DataFrame] | None:
+    """Stage 1: cheap H1+5m filter. Returns reusable bars for Stage 2."""
+    try:
+        from market_data import fetch_intraday, intraday_data_fresh
+        h1 = fetch_intraday(symbol, interval="60m", period="10d")
+        m5 = fetch_intraday(symbol, interval="5m", period="5d")
+        ok_h1, _ = intraday_data_fresh(h1, "60m", 90)
+        ok_m5, _ = intraday_data_fresh(m5, "5m", 12)
+        if h1 is None or m5 is None or len(h1) < 40 or len(m5) < 30 or not ok_h1 or not ok_m5:
+            return None
+
+        last_day = m5.index[-1].date()
+        today = m5[m5.index.date == last_day]
+        if len(today) < 6:
+            return None
+        price = float(today["Close"].iloc[-1])
+        if price <= 0 or price > float(MAX_AUTO_PRICE):
+            return None
+
+        hc = h1["Close"]
+        e20 = float(_ema(hc, 20).iloc[-1])
+        e50 = float(_ema(hc, 50).iloc[-1])
+        h_rsi = float(_rsi(hc, 14).iloc[-1])
+        trend = price > e20 > e50 * 0.998 and h_rsi >= 45
+
+        vwap_s = _vwap(today)
+        vwap = float(vwap_s.iloc[-1]) if pd.notna(vwap_s.iloc[-1]) else price
+        vwap_dist = (price - vwap) / max(vwap, 1e-9) * 100
+        above_vwap = price >= vwap * 0.996
+        above_open = price >= float(today["Open"].iloc[0]) * 0.997
+        last_green = float(today["Close"].iloc[-1]) >= float(today["Open"].iloc[-1])
+        c5 = today["Close"]
+        mom = (price - float(c5.iloc[-6])) / max(float(c5.iloc[-6]), 1e-9) * 100
+        r5 = float(_rsi(c5, 14).iloc[-1])
+
+        hist = m5[m5.index.date < last_day].tail(120)
+        avg_today = float(today["Volume"].mean())
+        avg_hist = float(hist["Volume"].mean()) if not hist.empty else float(m5["Volume"].tail(60).mean() or 1)
+        vol_ratio = avg_today / avg_hist if avg_hist else 1.0
+
+        # Score is only a routing score; Stage 2 makes the actual trade decision.
+        route_score = 0.0
+        route_score += 3.0 if trend else 0.0
+        route_score += 2.0 if above_vwap else 0.0
+        route_score += 1.5 if above_open else 0.0
+        route_score += min(2.0, max(0.0, mom))
+        route_score += min(2.0, max(0.0, vol_ratio - 0.75) * 2.0)
+        route_score -= max(0.0, vwap_dist - 3.0) * 0.5
+        route_score -= 1.0 if r5 >= 82 else 0.0
+
+        # Keep reasonably strong/near-VWAP names, then Stage 2 decides.
+        if not trend and not above_vwap and mom <= 0:
+            return None
+        if vol_ratio < 0.65:
+            return None
+        return route_score, h1, m5
+    except Exception:
+        return None
+
+
 def scan_intraday(
     symbols: list[str],
     names: dict,
@@ -1959,7 +2062,6 @@ def scan_intraday(
         return []
     scan_intraday.last_window = "ok"
 
-    # السوق العام مرة واحدة لكل دورة فقط، ثم نمرره لكل الأسهم لتقليل طلبات API.
     try:
         market_context = _market_alignment(fetch_intraday)
         if not market_context[0] and "ضعيفان" in market_context[1]:
@@ -1968,24 +2070,46 @@ def scan_intraday(
     except Exception:
         market_context = (True, "السوق غير مؤكد")
 
-    results: list[IntradaySignal] = []
     workers = min(8, max(2, len(symbols)))
-    def _one(sym: str):
+    stage1: list[tuple[float, str, pd.DataFrame, pd.DataFrame]] = []
+
+    # Stage 1 — H1 + 5m only for the full universe.
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        futures = {pool.submit(_prefilter_intraday, sym): sym for sym in symbols}
+        for fut in as_completed(futures):
+            sym = futures[fut]
+            try:
+                item = fut.result()
+            except Exception:
+                item = None
+            if item:
+                route_score, h1, m5 = item
+                stage1.append((route_score, sym, h1, m5))
+
+    stage1.sort(key=lambda x: x[0], reverse=True)
+    finalists = stage1[:max(PREFILTER_MAX_CANDIDATES, limit * 5)]
+
+    # Stage 2 — only finalists receive 15m + full setup/confluence/news analysis.
+    results: list[IntradaySignal] = []
+    def _one_stage2(item):
+        _, sym, h1, m5 = item
         try:
-            return analyze_intraday(sym, names.get(sym, sym), market_context=market_context)
+            return analyze_intraday(
+                sym,
+                names.get(sym, sym),
+                market_context=market_context,
+                preloaded=(h1, m5),
+            )
         except Exception:
             return None
 
-    # التنفيذ المتوازي يقلل زمن فحص القائمة الموسعة بدل تحليل الأسهم واحدًا واحدًا.
     with ThreadPoolExecutor(max_workers=workers) as pool:
-        futures = [pool.submit(_one, sym) for sym in symbols]
+        futures = [pool.submit(_one_stage2, item) for item in finalists]
         for fut in as_completed(futures):
             sig = fut.result()
             if not sig:
                 continue
             if sig.score < min_score or not sig.live_ok or not sig.quality_ok:
-                continue
-            if getattr(sig, "entry_type", "") == "اختراق فاشل":
                 continue
             if "تحت" in sig.vwap_day_note:
                 continue
@@ -1993,7 +2117,6 @@ def scan_intraday(
                 continue
             if sig.news_state == "negative":
                 continue
-            # Quote/Spread فقط بعد اجتياز التحليل الفني، لتوسيع القائمة دون زيادة كبيرة في الزمن.
             liq = _quote_liquidity(sig.symbol, sig.price)
             sig.spread_pct = round(float(liq.get("spread_pct", 0) or 0), 3)
             sig.expected_slippage_pct = round(float(liq.get("slippage_pct", 0) or 0), 3)
@@ -2007,7 +2130,7 @@ def scan_intraday(
                 continue
             results.append(sig)
 
-    rank = {"اختراق مؤكد": 0, "سحب سيولة مع Displacement": 1, "استعادة بعد فشل ORB": 2, "استمرار ABC": 3, "اختراق نطاق الافتتاح": 4, "علم صاعد": 5, "استعادة مستوى": 6, "دخول بعد Opening Drive": 7, "استعادة قمة اليوم": 8, "إعادة اختبار": 9, "سحب سيولة": 10, "ضغط ثم انفجار": 11, "استمرار الزخم": 12, "ارتداد VWAP": 13, "ارتداد EMA20": 14, "دخول مبكر": 15}
+    rank = {et: i for i, et in enumerate(ENTRY_TYPES)}
     results.sort(key=lambda x: (
         -(float(x.score) + 1.5 * min(float(getattr(x, "reward_r", 0) or 0), 3.0)
           + 2.0 * ("multi_level_confluence" in (getattr(x, "factor_keys", []) or []))

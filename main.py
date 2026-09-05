@@ -905,13 +905,11 @@ async def live_scan_intraday_job(context: ContextTypes.DEFAULT_TYPE) -> None:
         already = set(sent_i)
         fresh = [
             s for s in hits
-            if getattr(s, "entry_type", "") != "اختراق فاشل"
-            and (s.symbol not in already or _duplicate_ok(s))
+            if (s.symbol not in already or _duplicate_ok(s))
         ]
         if not fresh:
             return
 
-        rank = {"اختراق مؤكد": 0, "سحب سيولة مع Displacement": 1, "استعادة بعد فشل ORB": 2, "استمرار ABC": 3, "اختراق نطاق الافتتاح": 4, "علم صاعد": 5, "استعادة مستوى": 6, "دخول بعد Opening Drive": 7, "استعادة قمة اليوم": 8, "إعادة اختبار": 9, "سحب سيولة": 10, "ضغط ثم انفجار": 11, "استمرار الزخم": 12, "ارتداد VWAP": 13, "ارتداد EMA20": 14, "دخول مبكر": 15}
         fresh.sort(key=lambda s: (
             -(float(s.score) + 1.5 * min(float(getattr(s, "reward_r", 0) or 0), 3.0)
               + 2.0 * ("multi_level_confluence" in (getattr(s, "factor_keys", []) or []))
