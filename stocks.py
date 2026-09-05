@@ -1,79 +1,21 @@
-"""
-قائمة أسهم أمريكية شائعة التصنيف كحلال وفق معايير AAOIFI.
-المسح التلقائي: 35 سهماً مختارة لتكون عادة تحت 200$ + فلتر سعر وقت المسح.
+"""قائمة موسعة من 200 سهم أمريكي مرشح للمسح اللحظي.
 
-تنبيه:
-- التصنيف الشرعي يتغير فصلياً. راجع Zoya / Musaffa قبل الشراء.
-- الأسعار تتحرك؛ أي سهم يتجاوز MAX_AUTO_PRICE يُستبعد من التنبيه التلقائي.
+- الحد السعري الصارم وقت المسح: <= $200.
+- الاختيار يركز على السيولة والحجم وجودة الشركة وتنوع القطاعات.
+- التصنيف الشرعي ليس ثابتاً؛ يجب إعادة فحص AAOIFI/مزود الفحص قبل الشراء.
 """
 
 MAX_AUTO_PRICE = 200.0
 
-HALAL_STOCKS = {
-    "INTC": "Intel",
-    "ON": "ON Semiconductor",
-    "SWKS": "Skyworks",
-    "MCHP": "Microchip",
-    "QCOM": "Qualcomm",
-    "MRVL": "Marvell",
-    "QRVO": "Qorvo",
-    "SMTC": "Semtech",
-    "CRUS": "Cirrus Logic",
-    "STM": "STMicroelectronics",
-    "AMKR": "Amkor",
-    "UMC": "United Microelectronics",
-    "ASX": "ASE Technology",
-    "GLW": "Corning",
-    "CSCO": "Cisco",
-    "HPQ": "HP",
-    "FTNT": "Fortinet",
-    "PYPL": "PayPal",
-    "PEP": "PepsiCo",
-    "ORCL": "AbbVie",
-    "ABT": "Abbott",
-    "CRWD": "Amgen",
-    "MDT": "Medtronic",
-    "GILD": "Gilead",
-    "BMY": "Bristol-Myers",
-    "PFE": "Pfizer",
-    "FAST": "Fastenal",
-    "PAYX": "Paychex",
-    "MRK": "Ross Stores",
-    "NKE": "Nike",
-    "SBUX": "Starbucks",
-    "TGT": "Target",
-    "DIOD": "Diodes",
-    "KLIC": "Kulicke & Soffa",
-    "PG": "Silicon Motion",
-    "NVDA": "NVIDIA",
-    "AAPL": "Apple",
-    "MSFT": "Microsoft",
-    "GOOGL": "Alphabet",
-    "AMD": "AMD",
-    "AMZN": "Amazon",
-    "META": "Meta Platforms",
-    "TSLA": "Tesla",
-    "MU": "Micron",
-    "TSM": "TSMC",
-    "AMAT": "Applied Materials",
-    "ADBE": "Adobe",
-    "CRM": "Salesforce",
-    "LLY": "Eli Lilly",
-}
+CORE_WATCHLIST = ['MU', 'MRVL', 'QCOM', 'QRVO', 'SWKS', 'MCHP', 'ON', 'INTC', 'SMTC', 'CRUS', 'AMKR', 'UMC', 'ASX', 'GLW', 'CSCO', 'HPQ', 'FTNT', 'WDC', 'GFS', 'STM', 'TER', 'DIOD', 'KLIC', 'LSCC', 'ALGM', 'ACLS', 'FORM', 'AMBA', 'COHR', 'ONTO', 'RMBS', 'CRDO', 'PANW', 'DDOG', 'ESTC', 'NET', 'ZS', 'OKTA', 'DOCU', 'TWLO', 'RDDT', 'GDDY', 'WIX', 'PATH', 'PLTR', 'HIMS', 'CPNG', 'SE', 'FROG', 'CFLT', 'GTLB', 'PEP', 'NKE', 'SBUX', 'TGT', 'FAST', 'PG', 'ROST', 'TJX', 'DECK', 'BIRK', 'CROX', 'ELF', 'GIS', 'KHC', 'KDP', 'HSY', 'CLX', 'KMB', 'SJM', 'MNST', 'CELH', 'YUM', 'CMG', 'DPZ', 'CHWY', 'ETSY', 'ABT', 'MDT', 'GILD', 'BMY', 'PFE', 'MRK', 'TMDX', 'SYK', 'BSX', 'EW', 'GMED', 'INSP', 'PODD', 'HOLX', 'ZBH', 'ALGN', 'ILMN', 'DXCM', 'RMD', 'BIIB', 'MRNA', 'BNTX', 'EXAS', 'NTRA', 'SRPT', 'IONS', 'ACAD', 'XRAY', 'HSIC', 'NVST', 'XOM', 'COP', 'OXY', 'EOG', 'DVN', 'FANG', 'HAL', 'SLB', 'BKR', 'MPC', 'PSX', 'VLO', 'APA', 'CTRA', 'OVV', 'EQT', 'AR', 'CHRD', 'MTDR', 'RRC', 'CNX', 'KMI', 'WMB', 'OKE', 'CSX', 'FDX', 'UPS', 'ODFL', 'JBHT', 'CHRW', 'EXPD', 'XPO', 'CNI', 'PHM', 'DHI', 'LEN', 'TOL', 'PCAR', 'CARR', 'OTIS', 'AOS', 'SWK', 'CTAS', 'Q', 'USLM', 'XYL', 'IESC', 'TXT', 'AER', 'BLDR', 'JELD', 'TREX', 'MAS', 'DD', 'LYB', 'CF', 'MOS', 'FMC', 'NTR', 'NUE', 'STLD', 'CMC', 'FCX', 'SCCO', 'AA', 'AEM', 'GOLD', 'NEM', 'WPM', 'MP', 'ADP', 'PAYX', 'CPRT', 'MANH', 'EPAM', 'GLOB', 'CNXC', 'EXLS', 'GLBE', 'SEZL', 'INSM', 'AGYS', 'LFUS', 'BCPC', 'HNGE', 'SN', 'DAL', 'UAL', 'CPA', 'RKLB', 'CIEN', 'UBER', 'PINS']
 
-CORE_WATCHLIST = [
-    "INTC", "ON", "SWKS", "MCHP", "QCOM", "MRVL",
-    "QRVO", "SMTC", "CRUS", "STM", "AMKR", "UMC",
-    "ASX", "GLW", "CSCO", "HPQ", "FTNT", "PYPL",
-    "PEP", "ORCL", "ABT", "CRWD", "MDT", "GILD",
-    "BMY", "PFE", "FAST", "PAYX", "MRK", "NKE",
-    "SBUX", "TGT", "DIOD", "KLIC", "PG",
-]
+_NAMES = {'MU': 'Micron Technology', 'MRVL': 'Marvell Technology', 'QCOM': 'Qualcomm', 'QRVO': 'Qorvo', 'SWKS': 'Skyworks Solutions', 'MCHP': 'Microchip Technology', 'ON': 'ON Semiconductor', 'INTC': 'Intel', 'SMTC': 'Semtech', 'CRUS': 'Cirrus Logic', 'AMKR': 'Amkor Technology', 'UMC': 'United Microelectronics', 'ASX': 'ASE Technology', 'GLW': 'Corning', 'CSCO': 'Cisco', 'HPQ': 'HP', 'FTNT': 'Fortinet', 'WDC': 'Western Digital', 'GFS': 'GlobalFoundries', 'STM': 'STMicroelectronics', 'TER': 'Teradyne', 'DIOD': 'Diodes', 'KLIC': 'Kulicke & Soffa', 'LSCC': 'Lattice Semiconductor', 'ALGM': 'Allegro MicroSystems', 'ACLS': 'Axcelis Technologies', 'FORM': 'FormFactor', 'AMBA': 'Ambarella', 'COHR': 'Coherent', 'ONTO': 'Onto Innovation', 'RMBS': 'Rambus', 'CRDO': 'Credo Technology', 'PANW': 'Palo Alto Networks', 'DDOG': 'Datadog', 'ESTC': 'Elastic', 'NET': 'Cloudflare', 'ZS': 'Zscaler', 'OKTA': 'Okta', 'DOCU': 'DocuSign', 'TWLO': 'Twilio', 'RDDT': 'Reddit', 'GDDY': 'GoDaddy', 'WIX': 'Wix.com', 'PATH': 'UiPath', 'PLTR': 'Palantir', 'HIMS': 'Hims & Hers Health', 'CPNG': 'Coupang', 'SE': 'Sea Limited', 'FROG': 'JFrog', 'CFLT': 'Confluent', 'GTLB': 'GitLab', 'PEP': 'PepsiCo', 'NKE': 'Nike', 'SBUX': 'Starbucks', 'TGT': 'Target', 'FAST': 'Fastenal', 'PG': 'Procter & Gamble', 'ROST': 'Ross Stores', 'TJX': 'TJX Companies', 'DECK': 'Deckers Outdoor', 'BIRK': 'Birkenstock', 'CROX': 'Crocs', 'ELF': 'e.l.f. Beauty', 'GIS': 'General Mills', 'KHC': 'Kraft Heinz', 'KDP': 'Keurig Dr Pepper', 'HSY': 'Hershey', 'CLX': 'Clorox', 'KMB': 'Kimberly-Clark', 'SJM': 'J.M. Smucker', 'MNST': 'Monster Beverage', 'CELH': 'Celsius Holdings', 'YUM': 'Yum! Brands', 'CMG': 'Chipotle', 'DPZ': "Domino's Pizza", 'CHWY': 'Chewy', 'ETSY': 'Etsy', 'ABT': 'Abbott Laboratories', 'MDT': 'Medtronic', 'GILD': 'Gilead Sciences', 'BMY': 'Bristol Myers Squibb', 'PFE': 'Pfizer', 'MRK': 'Merck', 'TMDX': 'TransMedics', 'SYK': 'Stryker', 'BSX': 'Boston Scientific', 'EW': 'Edwards Lifesciences', 'GMED': 'Globus Medical', 'INSP': 'Inspire Medical Systems', 'PODD': 'Insulet', 'HOLX': 'Hologic', 'ZBH': 'Zimmer Biomet', 'ALGN': 'Align Technology', 'ILMN': 'Illumina', 'DXCM': 'DexCom', 'RMD': 'ResMed', 'BIIB': 'Biogen', 'MRNA': 'Moderna', 'BNTX': 'BioNTech', 'EXAS': 'Exact Sciences', 'NTRA': 'Natera', 'SRPT': 'Sarepta Therapeutics', 'IONS': 'Ionis Pharmaceuticals', 'ACAD': 'Acadia Pharmaceuticals', 'XRAY': 'Dentsply Sirona', 'HSIC': 'Henry Schein', 'NVST': 'Envista', 'XOM': 'Exxon Mobil', 'COP': 'ConocoPhillips', 'OXY': 'Occidental Petroleum', 'EOG': 'EOG Resources', 'DVN': 'Devon Energy', 'FANG': 'Diamondback Energy', 'HAL': 'Halliburton', 'SLB': 'SLB', 'BKR': 'Baker Hughes', 'MPC': 'Marathon Petroleum', 'PSX': 'Phillips 66', 'VLO': 'Valero Energy', 'APA': 'APA Corporation', 'CTRA': 'Coterra Energy', 'OVV': 'Ovintiv', 'EQT': 'EQT', 'AR': 'Antero Resources', 'CHRD': 'Chord Energy', 'MTDR': 'Matador Resources', 'RRC': 'Range Resources', 'CNX': 'CNX Resources', 'KMI': 'Kinder Morgan', 'WMB': 'Williams Companies', 'OKE': 'ONEOK', 'CSX': 'CSX', 'FDX': 'FedEx', 'UPS': 'UPS', 'ODFL': 'Old Dominion Freight Line', 'JBHT': 'J.B. Hunt', 'CHRW': 'C.H. Robinson', 'EXPD': 'Expeditors', 'XPO': 'XPO', 'CNI': 'Canadian National Railway', 'PHM': 'PulteGroup', 'DHI': 'D.R. Horton', 'LEN': 'Lennar', 'TOL': 'Toll Brothers', 'PCAR': 'PACCAR', 'CARR': 'Carrier Global', 'OTIS': 'Otis Worldwide', 'AOS': 'A. O. Smith', 'SWK': 'Stanley Black & Decker', 'CTAS': 'Cintas', 'Q': 'Q', 'USLM': 'United States Lime & Minerals', 'XYL': 'Xylem', 'IESC': 'IES Holdings', 'TXT': 'Textron', 'AER': 'AerCap', 'BLDR': 'Builders FirstSource', 'JELD': 'JELD-WEN', 'TREX': 'Trex', 'MAS': 'Masco', 'DD': 'DuPont', 'LYB': 'LyondellBasell', 'CF': 'CF Industries', 'MOS': 'Mosaic', 'FMC': 'FMC', 'NTR': 'Nutrien', 'NUE': 'Nucor', 'STLD': 'Steel Dynamics', 'CMC': 'Commercial Metals', 'FCX': 'Freeport-McMoRan', 'SCCO': 'Southern Copper', 'AA': 'Alcoa', 'AEM': 'Agnico Eagle Mines', 'GOLD': 'Barrick Mining', 'NEM': 'Newmont', 'WPM': 'Wheaton Precious Metals', 'MP': 'MP Materials', 'ADP': 'Automatic Data Processing', 'PAYX': 'Paychex', 'CPRT': 'Copart', 'MANH': 'Manhattan Associates', 'EPAM': 'EPAM Systems', 'GLOB': 'Globant', 'CNXC': 'Concentrix', 'EXLS': 'ExlService', 'GLBE': 'Global-e Online', 'SEZL': 'Sezzle', 'INSM': 'Insmed', 'AGYS': 'Agilysys', 'LFUS': 'Littelfuse', 'BCPC': 'Balchem', 'HNGE': 'Hinge Health', 'SN': 'SharkNinja', 'DAL': 'Delta Air Lines', 'UAL': 'United Airlines', 'CPA': 'Copa Holdings', 'RKLB': 'Rocket Lab', 'CIEN': 'Ciena', 'UBER': 'Uber', 'PINS': 'Pinterest'}
 
+# الاسم القديم مستخدم في بقية المشروع، لذلك نبقيه بنفس الواجهة.
+HALAL_STOCKS = {s: _NAMES.get(s, s) for s in CORE_WATCHLIST}
 
 def is_known_halal(symbol: str) -> bool:
     return symbol.upper() in HALAL_STOCKS
-
 
 def display_name(symbol: str) -> str:
     return HALAL_STOCKS.get(symbol.upper(), symbol.upper())

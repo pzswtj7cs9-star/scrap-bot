@@ -911,8 +911,16 @@ async def live_scan_intraday_job(context: ContextTypes.DEFAULT_TYPE) -> None:
         if not fresh:
             return
 
-        rank = {"اختراق مؤكد": 0, "إعادة اختبار": 1, "دخول مبكر": 2}
-        fresh.sort(key=lambda s: (rank.get(getattr(s, "entry_type", ""), 9), -s.score, -s.reward_r))
+        rank = {"اختراق مؤكد": 0, "سحب سيولة مع Displacement": 1, "استعادة بعد فشل ORB": 2, "استمرار ABC": 3, "اختراق نطاق الافتتاح": 4, "علم صاعد": 5, "استعادة مستوى": 6, "دخول بعد Opening Drive": 7, "استعادة قمة اليوم": 8, "إعادة اختبار": 9, "سحب سيولة": 10, "ضغط ثم انفجار": 11, "استمرار الزخم": 12, "ارتداد VWAP": 13, "ارتداد EMA20": 14, "دخول مبكر": 15}
+        fresh.sort(key=lambda s: (
+            -(float(s.score) + 1.5 * min(float(getattr(s, "reward_r", 0) or 0), 3.0)
+              + 2.0 * ("multi_level_confluence" in (getattr(s, "factor_keys", []) or []))
+              + 1.5 * ("vwap_h1_confluence" in (getattr(s, "factor_keys", []) or []))
+              - 1.5 * float(getattr(s, "spread_pct", 0) or 0)
+              - 1.0 * float(getattr(s, "expected_slippage_pct", 0) or 0)
+              - 0.8 * max(float(getattr(s, "ext_sma20", 0) or 0) - 2.0, 0.0)),
+            rank.get(getattr(s, "entry_type", ""), 99), -float(s.score), -float(getattr(s, "reward_r", 0) or 0)
+        ))
         candidate = fresh[0]
         watch = state.get("intraday_watch") or {}
         now_iso = now_ny().isoformat()
@@ -922,7 +930,7 @@ async def live_scan_intraday_job(context: ContextTypes.DEFAULT_TYPE) -> None:
                 age = (now_ny() - datetime.fromisoformat(watch.get("at"))).total_seconds() / 60.0
             except Exception:
                 age = 999
-            type_rank = {"اختراق مؤكد": 0, "إعادة اختبار": 1, "دخول مبكر": 2}
+            type_rank = {"اختراق مؤكد": 0, "سحب سيولة مع Displacement": 1, "استعادة بعد فشل ORB": 2, "استمرار ABC": 3, "اختراق نطاق الافتتاح": 4, "علم صاعد": 5, "استعادة مستوى": 6, "دخول بعد Opening Drive": 7, "استعادة قمة اليوم": 8, "إعادة اختبار": 9, "سحب سيولة": 10, "ضغط ثم انفجار": 11, "استمرار الزخم": 12, "ارتداد VWAP": 13, "ارتداد EMA20": 14, "دخول مبكر": 15}
             old_type = str(watch.get("entry_type") or "دخول مبكر")
             new_type = str(getattr(candidate, "entry_type", "دخول مبكر"))
             type_same_or_stronger = type_rank.get(new_type, 9) <= type_rank.get(old_type, 9)

@@ -157,14 +157,15 @@ def _default_adaptive_policy() -> dict:
         "weights": {
             "h1_trend": 1.0, "m15": 1.0, "m5": 1.0, "vwap": 1.0,
             "vol_session": 1.0, "market": 1.0, "breakout": 1.0,
-            "breakout_candle": 1.0, "retest": 1.0, "early": 1.0,
+            "breakout_candle": 1.0, "retest": 1.0, "vwap_bounce": 1.0,
+            "ema_pullback": 1.0, "liquidity_sweep": 1.0, "liquidity_displacement": 1.0, "orb": 1.0, "momentum_continuation": 1.0, "compression_expansion": 1.0, "bull_flag": 1.0, "resistance_reclaim": 1.0, "opening_drive_pullback": 1.0, "hod_reclaim": 1.0, "orb_failed_reclaim": 1.0, "abc_continuation": 1.0, "vwap_h1_confluence": 1.0, "multi_level_confluence": 1.0, "early": 1.0,
             "news_momentum": 1.0,
         },
-        "entry_limits": {"دخول مبكر": 94, "إعادة اختبار": 95, "اختراق مؤكد": 100},
+        "entry_limits": {"دخول مبكر": 94, "إعادة اختبار": 95, "ارتداد VWAP": 96, "ارتداد EMA20": 96, "سحب سيولة": 97, "ضغط ثم انفجار": 98, "استمرار الزخم": 97, "اختراق نطاق الافتتاح": 99, "اختراق مؤكد": 100, "علم صاعد": 98, "استعادة مستوى": 98, "دخول بعد Opening Drive": 98, "استعادة قمة اليوم": 98, "استعادة بعد فشل ORB": 99, "استمرار ABC": 98, "سحب سيولة مع Displacement": 99},
         "min_volume_ratio": 0.85,
         "min_news_volume_ratio": 1.50,
         "min_news_change_pct": 4.0,
-        "min_tp1_r": 1.00,
+        "min_tp1_r": 1.20,
         "history": [],
     }
 
@@ -226,7 +227,7 @@ def _build_candidate_policy(completed: list[dict], current: dict) -> dict | None
         elif r <= baseline - 0.10:
             candidate["weights"][factor] = max(1.0 - ADAPTIVE_MAX_CHANGE, w - 0.05)
 
-    for et in ("دخول مبكر", "إعادة اختبار", "اختراق مؤكد"):
+    for et in ("دخول مبكر", "إعادة اختبار", "ارتداد VWAP", "ارتداد EMA20", "سحب سيولة", "سحب سيولة مع Displacement", "ضغط ثم انفجار", "استمرار الزخم", "اختراق نطاق الافتتاح", "اختراق مؤكد", "علم صاعد", "استعادة مستوى", "دخول بعد Opening Drive", "استعادة قمة اليوم", "استعادة بعد فشل ORB", "استمرار ABC"):
         subset = [r for r in recent if r.get("entry_type") == et]
         if len(subset) < 6:
             continue
@@ -308,7 +309,7 @@ def _interaction_keys(
         keys.append("breakout:strong")
     elif 0 < breakout_quality < 55:
         keys.append("breakout:weak")
-    if entry_type in {"اختراق مؤكد", "إعادة اختبار"} and volume_ratio >= 1.5:
+    if entry_type in {"اختراق مؤكد", "إعادة اختبار", "اختراق نطاق الافتتاح", "سحب سيولة", "ضغط ثم انفجار", "استمرار الزخم", "علم صاعد", "استعادة مستوى", "دخول بعد Opening Drive", "استعادة قمة اليوم", "استعادة بعد فشل ORB", "استمرار ABC", "سحب سيولة مع Displacement"} and volume_ratio >= 1.5:
         keys.append("combo:breakout+volume")
     if m15_state == "داعم" and volume_ratio >= 1.2 and market_regime == "trend_clean":
         keys.append("combo:m15+volume+trend")
@@ -422,7 +423,7 @@ def adaptive_retrain_if_ready() -> dict:
             candidate["interaction_weights"][key] = max(1.0 - ADAPTIVE_MAX_CHANGE, w - 0.05)
 
     # نوع الدخول
-    for et in ("دخول مبكر", "إعادة اختبار", "اختراق مؤكد"):
+    for et in ("دخول مبكر", "إعادة اختبار", "ارتداد VWAP", "ارتداد EMA20", "سحب سيولة", "سحب سيولة مع Displacement", "ضغط ثم انفجار", "استمرار الزخم", "اختراق نطاق الافتتاح", "اختراق مؤكد", "علم صاعد", "استعادة مستوى", "دخول بعد Opening Drive", "استعادة قمة اليوم", "استعادة بعد فشل ORB", "استمرار ABC"):
         subset = [r for r in train if r.get("entry_type") == et]
         if len(subset) < 6:
             continue
@@ -1084,15 +1085,382 @@ def analyze_intraday(symbol: str, name: str = "", market_context: tuple[bool, st
         and not above_vwap
     ) or (dump and not above_vwap)
     retest = prior_break and near_level and price >= level_high * 0.997 and above_vwap and not failed
+
+    # 1) VWAP Bounce/Reclaim: رجوع منظم إلى VWAP ثم استعادة المستوى.
+    recent4 = today_5.tail(4)
+    vwap_touch = False
+    try:
+        vwap_touch = bool((recent4["Low"].astype(float) <= vwap_last * 1.006).any())
+    except Exception:
+        vwap_touch = False
+    vwap_bounce = (
+        above_vwap and vwap_touch and not failed
+        and last_green and (mom > 0.05)
+        and vol_session_ratio >= 1.0
+        and trend_up and m15_state != "معاكس"
+    )
+
+    # 2) EMA20 Pullback: ترند صاعد + تصحيح صحي إلى EMA20 + استعادة.
+    ema_touch = False
+    try:
+        ema_touch = bool((recent4["Low"].astype(float) <= e5 * 1.006).any())
+    except Exception:
+        ema_touch = False
+    ema_pullback = (
+        trend_up and ema_touch and price >= e5 * 1.001
+        and last_green and mom > 0.05
+        and vol_session_ratio >= 1.0
+        and m15_state != "معاكس" and not failed
+    )
+
+    # 3) Liquidity Sweep + Reclaim: كسر قاع قريب ثم استعادة المستوى بسرعة.
+    support_level = 0.0
+    liquidity_sweep = False
+    try:
+        support_window = today_5["Low"].astype(float).iloc[-12:-2]
+        if len(support_window) >= 5:
+            support_level = float(support_window.min())
+            recent3 = today_5.tail(3)
+            swept = (recent3["Low"].astype(float) < support_level * 0.998).any()
+            reclaimed = price >= support_level * 1.002
+            liquidity_sweep = bool(
+                swept and reclaimed and last_green and mom > 0.05
+                and vol_session_ratio >= 1.0 and m15_state != "معاكس"
+                and not failed and above_vwap
+            )
+    except Exception:
+        liquidity_sweep = False
+
+    # 4) Liquidity Sweep + Displacement: سحب سيولة يتبعه اندفاع سعري واضح.
+    liquidity_displacement = False
+    try:
+        if len(today_5) >= 8 and support_level > 0:
+            cur = today_5.iloc[-1]
+            prev3 = today_5.iloc[-4:-1]
+            cur_o, cur_c = float(cur["Open"]), float(cur["Close"])
+            cur_h, cur_l = float(cur["High"]), float(cur["Low"])
+            cur_range = max(cur_h - cur_l, price * 0.0001)
+            cur_body = abs(cur_c - cur_o)
+            close_pos = (cur_c - cur_l) / cur_range
+            prior_ranges = (prev3["High"].astype(float) - prev3["Low"].astype(float)).clip(lower=0)
+            med_range = float(prior_ranges.median()) if len(prior_ranges) else 0.0
+            swept = bool((today_5["Low"].astype(float).iloc[-5:-1] < support_level * 0.998).any())
+            reclaimed = price >= support_level * 1.002
+            displacement = bool(
+                cur_c > cur_o and cur_body / cur_range >= 0.55 and close_pos >= 0.75
+                and (med_range <= 0 or cur_range >= med_range * 1.35)
+                and vol_session_ratio >= 1.25
+            )
+            liquidity_displacement = bool(
+                swept and reclaimed and displacement and trend_up and above_vwap and above_open
+                and m15_state != "معاكس" and market_ok and not failed
+                and mom > 0.08 and ext_tmp <= 3.5
+            )
+    except Exception:
+        liquidity_displacement = False
+
+    # 5) Opening Range Breakout (ORB): اختراق أعلى أول 15 دقيقة مع متابعة.
+    orb_high = 0.0
+    orb_breakout = False
+    try:
+        if len(today_5) >= 6:
+            orb = today_5.iloc[:3]
+            orb_high = float(orb["High"].max())
+            prior_orb = float(today_5["Close"].iloc[-2]) < orb_high * 1.001
+            orb_breakout = bool(
+                price >= orb_high * 1.001 and prior_orb and last_green
+                and vol_session_ratio >= 1.0 and above_vwap
+                and m15_state != "معاكس" and not failed
+            )
+    except Exception:
+        orb_breakout = False
+
+    # 5) Momentum Continuation: استمرار دفعة صاعدة بدون مطاردة اختراق ضعيف.
+    momentum_continuation = False
+    try:
+        tail5 = today_5.tail(4)
+        closes = tail5["Close"].astype(float)
+        opens = tail5["Open"].astype(float)
+        highs = tail5["High"].astype(float)
+        lows = tail5["Low"].astype(float)
+        if len(tail5) >= 4:
+            rising = bool(closes.iloc[-1] > closes.iloc[-2] > closes.iloc[-3])
+            green_now = bool(closes.iloc[-1] >= opens.iloc[-1])
+            body_now = abs(closes.iloc[-1] - opens.iloc[-1])
+            range_now = max(highs.iloc[-1] - lows.iloc[-1], price * 0.0001)
+            close_pos = (closes.iloc[-1] - lows.iloc[-1]) / range_now
+            prior_move = (closes.iloc[-2] - closes.iloc[-4]) / max(closes.iloc[-4], 1e-9) * 100
+            momentum_continuation = bool(
+                trend_up and above_vwap and above_open and not failed and not breakout_now
+                and m15_state != "معاكس" and market_ok
+                and rising and green_now and prior_move >= 0.35
+                and mom > 0.08 and vol_session_ratio >= 1.05
+                and body_now / range_now >= 0.45 and close_pos >= 0.65
+                and ext_tmp <= 3.5
+            )
+    except Exception:
+        momentum_continuation = False
+
+    # 6) Compression → Expansion: ضغط سعري ثم توسع مدعوم بالحجم.
+    compression_expansion = False
+    try:
+        if len(today_5) >= 10:
+            prev = today_5.iloc[-9:-1]
+            cur = today_5.iloc[-1]
+            prev_ranges = (prev["High"].astype(float) - prev["Low"].astype(float)).clip(lower=0)
+            cur_range = max(float(cur["High"]) - float(cur["Low"]), price * 0.0001)
+            med_range = float(prev_ranges.median()) if len(prev_ranges) else 0.0
+            comp_range = float(prev["High"].max() - prev["Low"].min())
+            comp_width_pct = comp_range / max(price, 1e-9) * 100
+            cur_body = abs(float(cur["Close"]) - float(cur["Open"]))
+            cur_pos = (float(cur["Close"]) - float(cur["Low"])) / cur_range
+            expansion = cur_range >= max(med_range * 1.35, price * 0.003)
+            compression = comp_width_pct <= 2.2 and med_range > 0
+            compression_expansion = bool(
+                compression and expansion and float(cur["Close"]) > float(cur["Open"])
+                and cur_pos >= 0.70 and vol_session_ratio >= 1.20
+                and above_vwap and above_open and trend_up
+                and m15_state != "معاكس" and market_ok and not failed
+                and cur_body / cur_range >= 0.45 and ext_tmp <= 4.0
+            )
+    except Exception:
+        compression_expansion = False
+
+    # مستويات اليوم السابق/الافتتاح كعامل جودة، وليس كإشارة دخول مستقلة.
+    prev_day_high = 0.0
+    prev_day_low = 0.0
+    prev_close_level = 0.0
+    try:
+        if len(h1) >= 30:
+            prior = h1.iloc[:-20]
+            if len(prior) >= 5:
+                prev_day_high = float(prior["High"].max())
+                prev_day_low = float(prior["Low"].min())
+                prev_close_level = float(prior["Close"].iloc[-1])
+    except Exception:
+        pass
+
+    key_level_near = any(
+        lvl > 0 and abs(price - lvl) / max(price, 1e-9) * 100 <= 0.45
+        for lvl in (prev_day_high, prev_day_low, prev_close_level, orb_high, level_high)
+    )
+
+
+
+    # 5) Bull Flag: tight bullish consolidation after an impulsive move,
+    # then a clean continuation trigger. Distinct from compression-expansion:
+    # the prior leg must already be clearly bullish and the pullback must stay controlled.
+    bull_flag = False
+    try:
+        if len(today_5) >= 12:
+            impulse = today_5.iloc[-12:-6]
+            flag = today_5.iloc[-6:-1]
+            impulse_open = float(impulse["Open"].iloc[0])
+            impulse_high = float(impulse["High"].max())
+            impulse_gain = (impulse_high - impulse_open) / max(impulse_open, 1e-9) * 100
+            flag_high = float(flag["High"].max())
+            flag_low = float(flag["Low"].min())
+            flag_range = (flag_high - flag_low) / max(flag_high, 1e-9) * 100
+            breakout_flag = price >= flag_high * 1.001
+            bull_flag = bool(
+                impulse_gain >= 1.0
+                and flag_range <= 2.0
+                and breakout_flag
+                and trend_up and above_vwap and above_open
+                and m15_state != "معاكس" and market_ok and not failed
+                and last_green and mom > 0.05
+                and vol_session_ratio >= 1.05
+                and ext_tmp <= 3.5
+                and not orb_breakout
+            )
+    except Exception:
+        bull_flag = False
+
+    # 6) Resistance Reclaim: a previously established resistance is lost,
+    # then reclaimed with confirmation. This is different from HOD reclaim:
+    # the level can be an intraday structural resistance, not necessarily today's high.
+    resistance_reclaim = False
+    reclaim_level = 0.0
+    try:
+        if len(today_5) >= 10:
+            prior = today_5.iloc[-10:-2]
+            reclaim_level = float(prior["High"].quantile(0.80))
+            prev_close = float(today_5["Close"].iloc[-2])
+            resistance_was_lost = prev_close < reclaim_level * 0.999
+            reclaimed = price >= reclaim_level * 1.001
+            touches = int((prior["High"] >= reclaim_level * 0.995).sum())
+            resistance_reclaim = bool(
+                touches >= 2
+                and resistance_was_lost and reclaimed
+                and trend_up and above_vwap and above_open
+                and m15_state != "معاكس" and market_ok and not failed
+                and last_green and mom > 0.05
+                and vol_session_ratio >= 1.05
+                and ext_tmp <= 3.5
+            )
+    except Exception:
+        resistance_reclaim = False
+
+    # 7) Opening Drive → Pullback:
+    # لا يدخل على أول اختراق (حتى لا يتداخل مع ORB/اختراق مؤكد).
+    # نبحث عن دفعة قوية مبكرة، ثم تراجع منظم، ثم استعادة منطقة الدفعة.
+    opening_drive_pullback = False
+    drive_level = 0.0
+    try:
+        if len(today_5) >= 8:
+            first6 = today_5.iloc[:6]  # أول 30 دقيقة على شموع 5د
+            later = today_5.iloc[6:]
+            drive_open = float(first6["Open"].iloc[0])
+            drive_high = float(first6["High"].max())
+            drive_return = (drive_high - drive_open) / max(drive_open, 1e-9) * 100
+            drive_level = drive_high
+            if not later.empty and drive_return >= 1.0:
+                recent = today_5.tail(3)
+                recent_low = float(recent["Low"].min())
+                pullback_from_high = (drive_high - recent_low) / max(drive_high, 1e-9) * 100
+                reclaim_drive = price >= drive_high * 0.999
+                controlled_pullback = 0.25 <= pullback_from_high <= 2.5
+                not_chasing = ext_tmp <= 3.5
+                opening_drive_pullback = bool(
+                    trend_up and above_vwap and above_open
+                    and m15_state != "معاكس" and market_ok and not failed
+                    and drive_return >= 1.0
+                    and controlled_pullback and reclaim_drive
+                    and last_green and mom > 0.05
+                    and vol_session_ratio >= 1.05
+                    and not breakout_now
+                    and not orb_breakout
+                    and not_chasing
+                )
+    except Exception:
+        opening_drive_pullback = False
+
+    # 8) High-of-Day Reclaim:
+    # بعد تسجيل قمة يومية، يحصل تراجع تحت القمة ثم استعادة فعلية لها.
+    # هذا ليس ORB: المستوى هنا هو HOD المتكوّن خلال الجلسة، وليس أول 15 دقيقة.
+    hod_reclaim = False
+    hod_level = 0.0
+    try:
+        if len(today_5) >= 8:
+            prior = today_5.iloc[:-2]
+            hod_level = float(prior["High"].max())
+            if hod_level > 0:
+                pullback_below_hod = float(today_5["Close"].iloc[-2]) < hod_level * 0.999
+                reclaimed_hod = price >= hod_level * 1.001
+                had_hod = float(prior["High"].max()) >= hod_level * 0.999
+                hod_reclaim = bool(
+                    had_hod and pullback_below_hod and reclaimed_hod
+                    and above_vwap and above_open and trend_up
+                    and m15_state != "معاكس" and market_ok and not failed
+                    and last_green and mom > 0.05
+                    and vol_session_ratio >= 1.05
+                    and ext_tmp <= 3.5
+                )
+    except Exception:
+        hod_reclaim = False
+
+    # 9) ORB Failed Breakout -> Reclaim: مخصوص لفشل اختراق نطاق الافتتاح ثم استعادته.
+    # مختلف عن سحب السيولة: المستوى هنا ORB High فقط، مع شرط اختراق سابق ثم فشل ثم reclaim.
+    orb_failed_reclaim = False
+    try:
+        if len(today_5) >= 8 and orb_high > 0:
+            post_orb = today_5.iloc[3:-1]
+            broke = bool((post_orb["High"].astype(float) >= orb_high * 1.002).any())
+            failure = bool((post_orb["Close"].astype(float) <= orb_high * 0.998).any())
+            reclaim = price >= orb_high * 1.001
+            orb_failed_reclaim = bool(
+                broke and failure and reclaim
+                and trend_up and above_vwap and above_open
+                and m15_state != "معاكس" and market_ok and not failed
+                and last_green and mom > 0.05
+                and vol_session_ratio >= 1.05
+                and ext_tmp <= 3.5
+                and not orb_breakout
+            )
+    except Exception:
+        orb_failed_reclaim = False
+
+    # 10) ABC Pullback / 3-Wave Continuation: دفعة A، تصحيح B مضبوط، ثم C.
+    # لا يكفي لمس EMA20؛ يجب أن تكون بنية A/B/C واضحة.
+    abc_continuation = False
+    try:
+        if len(today_5) >= 12:
+            a = today_5.iloc[-12:-8]
+            b = today_5.iloc[-8:-4]
+            c = today_5.iloc[-4:]
+            a_open = float(a["Open"].iloc[0])
+            a_high = float(a["High"].max())
+            a_gain = (a_high - a_open) / max(a_open, 1e-9) * 100
+            b_high = float(b["High"].max())
+            b_low = float(b["Low"].min())
+            b_retrace = (a_high - b_low) / max(a_high - a_open, price * 0.001) * 100
+            c_high = float(c["High"].max())
+            c_last_green = float(c["Close"].iloc[-1]) >= float(c["Open"].iloc[-1])
+            c_break = c_high >= a_high * 0.999
+            abc_continuation = bool(
+                a_gain >= 0.70
+                and 20.0 <= b_retrace <= 65.0
+                and c_break and price >= a_high * 0.999
+                and c_last_green and trend_up and above_vwap and above_open
+                and m15_state != "معاكس" and market_ok and not failed
+                and mom > 0.05 and vol_session_ratio >= 1.05
+                and ext_tmp <= 3.5
+            )
+    except Exception:
+        abc_continuation = False
+
+    # طبقة Confluence: ليست نوع دخول جديداً، بل Bonus عند اجتماع VWAP + H1 + عدة مستويات.
+    confluence_levels = []
+    for lvl, label in ((vwap_last, "VWAP"), (e5, "EMA20"), (orb_high, "ORB"),
+                       (level_high, "H1-Level"), (prev_close_level, "PrevClose")):
+        try:
+            if lvl > 0 and abs(price - float(lvl)) / max(price, 1e-9) * 100 <= 0.60:
+                confluence_levels.append(label)
+        except Exception:
+            pass
+    multi_level_confluence = len(set(confluence_levels)) >= 3
+    vwap_h1_confluence = bool(
+        trend_up and above_vwap and e20 > e50
+        and m15_state == "داعم" and not failed
+    )
+
     early = above_vwap and above_open and not breakout_now and ext_tmp <= 2.2 and not failed
 
     breakout_ok, breakout_quality = _breakout_quality(today_5, level_high, price)
+    orb_breakout_ok, orb_quality = _breakout_quality(today_5, orb_high, price) if orb_high > 0 else (False, 0.0)
     if failed:
         entry_type, entry_emoji = "اختراق فاشل", "🔴"
     elif retest:
         entry_type, entry_emoji = "إعادة اختبار", "🟡"
+    elif orb_breakout and orb_breakout_ok:
+        breakout_quality = max(breakout_quality, orb_quality)
+        entry_type, entry_emoji = "اختراق نطاق الافتتاح", "🟢"
     elif breakout_now and breakout_ok and vol_session_ratio >= 1.0:
         entry_type, entry_emoji = "اختراق مؤكد", "🟢"
+    elif liquidity_displacement:
+        entry_type, entry_emoji = "سحب سيولة مع Displacement", "🟢"
+    elif liquidity_sweep:
+        entry_type, entry_emoji = "سحب سيولة", "🟢"
+    elif compression_expansion:
+        entry_type, entry_emoji = "ضغط ثم انفجار", "🟢"
+    elif momentum_continuation:
+        entry_type, entry_emoji = "استمرار الزخم", "🟢"
+    elif bull_flag:
+        entry_type, entry_emoji = "علم صاعد", "🟢"
+    elif resistance_reclaim:
+        entry_type, entry_emoji = "استعادة مستوى", "🟢"
+    elif orb_failed_reclaim:
+        entry_type, entry_emoji = "استعادة بعد فشل ORB", "🟢"
+    elif abc_continuation:
+        entry_type, entry_emoji = "استمرار ABC", "🟢"
+    elif opening_drive_pullback:
+        entry_type, entry_emoji = "دخول بعد Opening Drive", "🟢"
+    elif hod_reclaim:
+        entry_type, entry_emoji = "استعادة قمة اليوم", "🟢"
+    elif vwap_bounce:
+        entry_type, entry_emoji = "ارتداد VWAP", "🟢"
+    elif ema_pullback:
+        entry_type, entry_emoji = "ارتداد EMA20", "🟢"
     elif early or (above_vwap and trend_up and ext_tmp <= 2.5):
         entry_type, entry_emoji = "دخول مبكر", "🟢"
     else:
@@ -1208,13 +1576,81 @@ def analyze_intraday(symbol: str, name: str = "", market_context: tuple[bool, st
         score += 8
         reasons.append("اختراق مؤكد")
         factors.append("breakout")
+    elif entry_type == "اختراق نطاق الافتتاح":
+        score += 8
+        reasons.append("اختراق نطاق الافتتاح ORB")
+        factors.append("orb")
+        factors.append("breakout")
     elif entry_type == "إعادة اختبار":
         score += 5
         reasons.append("إعادة اختبار مستوى")
         factors.append("retest")
+    elif entry_type == "ارتداد VWAP":
+        score += 6
+        reasons.append("ارتداد واستعادة VWAP")
+        factors.append("vwap_bounce")
+    elif entry_type == "ارتداد EMA20":
+        score += 6
+        reasons.append("تصحيح صحي إلى EMA20")
+        factors.append("ema_pullback")
+    elif entry_type == "سحب سيولة مع Displacement":
+        score += 10
+        reasons.append("سحب سيولة ثم Displacement واستعادة قوية")
+        factors.append("liquidity_sweep")
+        factors.append("liquidity_displacement")
+    elif entry_type == "سحب سيولة":
+        score += 7
+        reasons.append("سحب سيولة ثم استعادة المستوى")
+        factors.append("liquidity_sweep")
+    elif entry_type == "ضغط ثم انفجار":
+        score += 8
+        reasons.append("ضغط سعري ثم توسع بالحجم")
+        factors.append("compression_expansion")
+    elif entry_type == "استمرار الزخم":
+        score += 7
+        reasons.append("استمرار زخم بعد دفعة صاعدة")
+        factors.append("momentum_continuation")
+    elif entry_type == "علم صاعد":
+        score += 9
+        reasons.append("علم صاعد بعد دفعة قوية ثم استمرار")
+        factors.append("bull_flag")
+    elif entry_type == "استعادة مستوى":
+        score += 9
+        reasons.append("استعادة مقاومة بعد كسرها")
+        factors.append("resistance_reclaim")
+    elif entry_type == "استعادة بعد فشل ORB":
+        score += 10
+        reasons.append("فشل اختراق ORB ثم استعادة مؤكدة")
+        factors.append("orb_failed_reclaim")
+        factors.append("orb")
+    elif entry_type == "استمرار ABC":
+        score += 9
+        reasons.append("بنية A/B/C: دفعة ثم تصحيح منظم ثم استمرار")
+        factors.append("abc_continuation")
+    elif entry_type == "دخول بعد Opening Drive":
+        score += 9
+        reasons.append("دفعة افتتاحية قوية ثم تراجع منظم واستعادة")
+        factors.append("opening_drive_pullback")
+    elif entry_type == "استعادة قمة اليوم":
+        score += 9
+        reasons.append("استعادة قمة اليوم بعد تراجع تحتها")
+        factors.append("hod_reclaim")
     else:
         reasons.append("دخول مبكر فوق VWAP")
         factors.append("early")
+
+    if key_level_near and "key_level" not in factors:
+        factors.append("key_level")
+        reasons.append("قرب مستوى سعري مهم")
+
+    if vwap_h1_confluence:
+        score += 3
+        factors.append("vwap_h1_confluence")
+        reasons.append("Confluence: VWAP + اتجاه الساعة + 15د")
+    if multi_level_confluence:
+        score += min(5, 2 + len(set(confluence_levels)))
+        factors.append("multi_level_confluence")
+        reasons.append("تجمع مستويات: " + "/".join(confluence_levels[:4]))
 
     ext = (price - e20) / e20 * 100 if e20 else 0
     if ext > 4.0:
@@ -1257,6 +1693,32 @@ def analyze_intraday(symbol: str, name: str = "", market_context: tuple[bool, st
         score = min(score, float(limits.get("دخول مبكر", 94)))
     elif entry_type == "إعادة اختبار":
         score = min(score, float(limits.get("إعادة اختبار", 97.0 if strong_alignment else 95.0)))
+    elif entry_type == "ارتداد VWAP":
+        score = min(score, float(limits.get("ارتداد VWAP", 96.0)))
+    elif entry_type == "ارتداد EMA20":
+        score = min(score, float(limits.get("ارتداد EMA20", 96.0)))
+    elif entry_type == "سحب سيولة مع Displacement":
+        score = min(score, float(limits.get("سحب سيولة مع Displacement", 99.0)))
+    elif entry_type == "سحب سيولة":
+        score = min(score, float(limits.get("سحب سيولة", 97.0)))
+    elif entry_type == "ضغط ثم انفجار":
+        score = min(score, float(limits.get("ضغط ثم انفجار", 98.0)))
+    elif entry_type == "استمرار الزخم":
+        score = min(score, float(limits.get("استمرار الزخم", 97.0)))
+    elif entry_type == "علم صاعد":
+        score = min(score, float(limits.get("علم صاعد", 98.0)))
+    elif entry_type == "استعادة مستوى":
+        score = min(score, float(limits.get("استعادة مستوى", 98.0)))
+    elif entry_type == "استعادة بعد فشل ORB":
+        score = min(score, float(limits.get("استعادة بعد فشل ORB", 99.0)))
+    elif entry_type == "استمرار ABC":
+        score = min(score, float(limits.get("استمرار ABC", 98.0)))
+    elif entry_type == "دخول بعد Opening Drive":
+        score = min(score, float(limits.get("دخول بعد Opening Drive", 98.0)))
+    elif entry_type == "استعادة قمة اليوم":
+        score = min(score, float(limits.get("استعادة قمة اليوم", 98.0)))
+    elif entry_type == "اختراق نطاق الافتتاح":
+        score = min(score, float(limits.get("اختراق نطاق الافتتاح", 99.0)))
     elif entry_type == "اختراق مؤكد":
         score = min(score, float(limits.get("اختراق مؤكد", 100.0)))
     else:
@@ -1266,7 +1728,7 @@ def analyze_intraday(symbol: str, name: str = "", market_context: tuple[bool, st
     strong_for_grade = (
         score_i >= 95
         and strong_alignment
-        and entry_type in {"اختراق مؤكد", "إعادة اختبار"}
+        and entry_type in {"اختراق مؤكد", "اختراق نطاق الافتتاح", "إعادة اختبار", "ارتداد VWAP", "ارتداد EMA20", "سحب سيولة", "ضغط ثم انفجار", "استمرار الزخم", "علم صاعد", "استعادة مستوى", "دخول بعد Opening Drive", "استعادة قمة اليوم", "استعادة بعد فشل ORB", "استمرار ABC", "سحب سيولة مع Displacement"}
         and m15_state != "معاكس"
     )
 
@@ -1278,8 +1740,8 @@ def analyze_intraday(symbol: str, name: str = "", market_context: tuple[bool, st
             change_pct >= float(policy.get("min_news_change_pct", NEWS_MOMENTUM_MIN_CHANGE))
             and vol_session_ratio >= float(policy.get("min_news_volume_ratio", NEWS_MOMENTUM_MIN_VOLUME))
             and above_vwap
-            and breakout_ok
-            and breakout_quality >= 60
+            and (breakout_ok or entry_type != "دخول مبكر")
+            and (breakout_quality >= 60 or entry_type != "دخول مبكر")
             and m15_state != "معاكس"
             and market_ok
         )
@@ -1298,36 +1760,83 @@ def analyze_intraday(symbol: str, name: str = "", market_context: tuple[bool, st
     )
 
     recent_low = float(today_5["Low"].tail(12).min())
-    stop = min(price - 1.5 * atr, recent_low * 0.997)
+
+    # Structure-aware intraday stop. The stop is placed behind the structure
+    # that actually justifies the entry, then constrained to a practical
+    # intraday risk band of 0.60%–4.50%.
+    stop_candidates = []
+    if entry_type == "ارتداد VWAP":
+        stop_candidates.append(vwap_last * 0.997)
+    elif entry_type == "ارتداد EMA20":
+        stop_candidates.append(e5 * 0.997)
+    elif entry_type in {"سحب سيولة", "سحب سيولة مع Displacement"}:
+        stop_candidates.append(support_level * 0.997 if support_level > 0 else recent_low * 0.997)
+    elif entry_type in {"اختراق مؤكد", "اختراق نطاق الافتتاح"}:
+        level = orb_high if entry_type == "اختراق نطاق الافتتاح" else level_high
+        if level and level > 0:
+            stop_candidates.append(level * 0.997)
+    elif entry_type == "إعادة اختبار":
+        level = level_high
+        if level and level > 0:
+            stop_candidates.append(level * 0.997)
+    elif entry_type == "علم صاعد":
+        stop_candidates.append(float(today_5["Low"].tail(5).min()) * 0.997)
+    elif entry_type == "استعادة مستوى":
+        stop_candidates.append(reclaim_level * 0.997 if reclaim_level > 0 else recent_low * 0.997)
+    elif entry_type == "استعادة بعد فشل ORB":
+        stop_candidates.append(orb_high * 0.997 if orb_high > 0 else recent_low * 0.997)
+    elif entry_type == "استمرار ABC":
+        stop_candidates.append(float(today_5["Low"].tail(4).min()) * 0.997)
+    elif entry_type == "دخول بعد Opening Drive":
+        stop_candidates.append(drive_level * 0.997 if drive_level > 0 else recent_low * 0.997)
+    elif entry_type == "استعادة قمة اليوم":
+        stop_candidates.append(hod_level * 0.997 if hod_level > 0 else recent_low * 0.997)
+    elif entry_type in {"ضغط ثم انفجار", "استمرار الزخم"}:
+        stop_candidates.append(float(today_5["Low"].tail(5).min()) * 0.997)
+
+    # ATR remains the fallback/secondary safety reference.
+    stop_candidates.append(price - 1.5 * atr)
+    stop_candidates.append(recent_low * 0.997)
+
+    # Choose the nearest valid structural stop below price.
+    valid_stops = [x for x in stop_candidates if x > 0 and x < price]
+    stop = max(valid_stops) if valid_stops else price * 0.985
+
     risk = price - stop
-    if risk <= 0 or risk / price < 0.012:
-        stop = price * (1 - 0.012)
-        risk = price - stop
-    if risk / price > 0.07:
-        stop = price * 0.93
-        risk = price - stop
+    min_risk = price * 0.006
+    max_risk = price * 0.045
+    if risk < min_risk:
+        stop = price - min_risk
+        risk = min_risk
+    elif risk > max_risk:
+        # Too-wide structures are rejected rather than hiding the risk.
+        quality_ok = False
+        warnings.append("وقف هيكلي واسع جدًا")
 
     resistance_tp1, resistance_source = _find_prior_resistance(today_5, h1, price)
-    fallback_tp1 = price + risk * 1.2
-    if resistance_tp1 > price and resistance_tp1 >= price * 1.008:
+
+    # TP1 must be at least 1.20R. Prefer real resistance only when it clears
+    # that threshold; otherwise use a risk-multiple fallback.
+    fallback_tp1 = price + risk * 1.20
+    if resistance_tp1 > price and resistance_tp1 >= fallback_tp1:
         tp1 = resistance_tp1
     else:
         tp1 = fallback_tp1
-        resistance_source = "هدف مخاطر احتياطي"
+        resistance_source = "هدف مخاطر 1.20R"
 
-    if tp1 > price * 1.07:
-        tp1 = fallback_tp1
-        resistance_source = "هدف مخاطر احتياطي"
+    if tp1 <= price:
+        quality_ok = False
+        warnings.append("TP1 غير صالح")
 
-    tp2 = max(tp1 + risk * 0.8, price + risk * 1.8)
-    tp3 = max(tp2 + risk * 0.8, price + risk * 2.6)
+    tp2 = price + risk * 2.0
+    tp3 = price + risk * 3.0
     risk_pct = risk / price * 100
     reward_r = (tp1 - price) / risk if risk else 0.0
     tp1_distance_pct = (tp1 - price) / price * 100 if price else 0.0
     if tp1_distance_pct < 0.8:
         quality_ok = False
         warnings.append("TP1 قريب جدًا من الدخول")
-    if reward_r < float(policy.get("min_tp1_r", 1.0)):
+    if reward_r < float(policy.get("min_tp1_r", 1.2)):
         quality_ok = False
         warnings.append("العائد إلى TP1 ضعيف")
     if news_state == "positive_strong" and news_momentum_ok:
@@ -1343,7 +1852,7 @@ def analyze_intraday(symbol: str, name: str = "", market_context: tuple[bool, st
         entry_type, market_regime, m15_state, vol_session_ratio, breakout_quality
     )
 
-    if resistance_source != "هدف مخاطر احتياطي":
+    if resistance_source != "هدف مخاطر 1.20R":
         reasons.append(f"TP1 مقاومة: {tp1:.2f}")
     else:
         warnings.append("لم توجد مقاومة قريبة مناسبة؛ TP1 احتياطي")
@@ -1363,7 +1872,7 @@ def analyze_intraday(symbol: str, name: str = "", market_context: tuple[bool, st
         tp3=round(tp3, 4),
         risk_pct=round(risk_pct, 2),
         reward_r=round(reward_r, 2),
-        sl_method="ATR/قاع جلسة",
+        sl_method="وقف هيكلي حسب نوع الدخول",
         vwap_day_note=vwap_note,
         above_open=above_open,
         vol_session_ok=vol_session_ok,
@@ -1484,9 +1993,6 @@ def scan_intraday(
                 continue
             if sig.news_state == "negative":
                 continue
-            if sig.news_state == "positive_strong":
-                if sig.entry_type not in {"اختراق مؤكد", "إعادة اختبار"} or sig.breakout_quality < 60:
-                    continue
             # Quote/Spread فقط بعد اجتياز التحليل الفني، لتوسيع القائمة دون زيادة كبيرة في الزمن.
             liq = _quote_liquidity(sig.symbol, sig.price)
             sig.spread_pct = round(float(liq.get("spread_pct", 0) or 0), 3)
@@ -1501,8 +2007,16 @@ def scan_intraday(
                 continue
             results.append(sig)
 
-    rank = {"اختراق مؤكد": 0, "إعادة اختبار": 1, "دخول مبكر": 2}
-    results.sort(key=lambda x: (rank.get(x.entry_type, 9), -x.score, -x.reward_r))
+    rank = {"اختراق مؤكد": 0, "سحب سيولة مع Displacement": 1, "استعادة بعد فشل ORB": 2, "استمرار ABC": 3, "اختراق نطاق الافتتاح": 4, "علم صاعد": 5, "استعادة مستوى": 6, "دخول بعد Opening Drive": 7, "استعادة قمة اليوم": 8, "إعادة اختبار": 9, "سحب سيولة": 10, "ضغط ثم انفجار": 11, "استمرار الزخم": 12, "ارتداد VWAP": 13, "ارتداد EMA20": 14, "دخول مبكر": 15}
+    results.sort(key=lambda x: (
+        -(float(x.score) + 1.5 * min(float(getattr(x, "reward_r", 0) or 0), 3.0)
+          + 2.0 * ("multi_level_confluence" in (getattr(x, "factor_keys", []) or []))
+          + 1.5 * ("vwap_h1_confluence" in (getattr(x, "factor_keys", []) or []))
+          - 1.5 * float(getattr(x, "spread_pct", 0) or 0)
+          - 1.0 * float(getattr(x, "expected_slippage_pct", 0) or 0)
+          - 0.8 * max(float(getattr(x, "ext_sma20", 0) or 0) - 2.0, 0.0)),
+        rank.get(x.entry_type, 99), -float(x.score), -float(getattr(x, "reward_r", 0) or 0)
+    ))
     return results[:limit]
 
 
