@@ -954,54 +954,42 @@ HARD_MAX_SPREAD_PCT = 1.20
 MIN_DOLLAR_VOLUME_3M = 10_000_000.0
 
 def _quote_liquidity(symbol: str, price: float) -> dict:
-    """يفحص Bid/Ask من Alpaca أولاً، ثم Yahoo كاحتياط؛ لا نخترع quote مفقود."""
+    """لحظي: Bid/Ask من Alpaca فقط؛ لا نستخدم Yahoo كبديل للتنفيذ اللحظي."""
     now = datetime.now(timezone.utc)
     cached = _QUOTE_CACHE.get(symbol)
     if cached and (now - cached[0]).total_seconds() < QUOTE_CACHE_SECONDS:
         return cached[1]
-    result = {"ok": True, "spread_pct": 0.0, "slippage_pct": 0.0, "dollar_volume": 0.0, "quote_source": "none"}
+    result = {
+        "ok": False,
+        "spread_pct": 0.0,
+        "slippage_pct": 0.0,
+        "dollar_volume": 0.0,
+        "quote_source": "none",
+        "quote_age_min": float("inf"),
+    }
     try:
-        from market_data import fetch_latest_quote
+        from market_data import fetch_latest_quote, data_age_minutes
         q = fetch_latest_quote(symbol)
         bid, ask = float(q.get("bid") or 0), float(q.get("ask") or 0)
         px = float(price or 0)
-        if bid > 0 and ask > bid and px > 0:
+        ts = q.get("timestamp")
+        if ts:
+            qdf = pd.DataFrame({"Close": [px]}, index=[pd.Timestamp(ts)])
+            age = data_age_minutes(qdf)
+            result["quote_age_min"] = age
+        if bid > 0 and ask > bid and px > 0 and result["quote_age_min"] <= 2.0:
             spread = (ask - bid) / px * 100
             result["spread_pct"] = spread
             result["slippage_pct"] = spread / 2.0
             result["ok"] = spread <= HARD_MAX_SPREAD_PCT
             result["quote_source"] = "alpaca-" + str(q.get("feed") or "unknown")
-            # quote ناجح؛ نأخذ حجم التداول من متوسط Yahoo لاحقًا فقط كمعلومة سيولة.
-    except Exception:
-        pass
-    try:
-        url = "https://query1.finance.yahoo.com/v7/finance/quote?symbols=" + urllib.parse.quote(symbol)
-        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-        with urllib.request.urlopen(req, timeout=2.5) as r:
-            data = json.loads(r.read().decode("utf-8", errors="replace"))
-        q = ((data.get("quoteResponse") or {}).get("result") or [None])[0]
-        if not q:
-            return result
-        bid = float(q.get("bid") or 0)
-        ask = float(q.get("ask") or 0)
-        px = float(q.get("regularMarketPrice") or price or 0)
-        avg_vol = float(q.get("averageDailyVolume3Month") or 0)
-        if result.get("quote_source") == "none" and bid > 0 and ask > bid and px > 0:
-            spread = (ask - bid) / px * 100
-            result["spread_pct"] = spread
-            result["slippage_pct"] = spread / 2.0
-            result["ok"] = spread <= HARD_MAX_SPREAD_PCT
-            result["quote_source"] = "yahoo"
-        result["dollar_volume"] = avg_vol * px
-        if result["dollar_volume"] and result["dollar_volume"] < MIN_DOLLAR_VOLUME_3M:
-            result["ok"] = False
     except Exception:
         pass
     _QUOTE_CACHE[symbol] = (now, result)
     return result
 
 
-def analyze_intraday(symbol: str, name: str = "") -> Optional[IntradaySignal]:
+def analyze_intraday(symbol: str, name: str = "", market_context: tuple[bool, str] | None = None) -> Optional[IntradaySignal]:
     from market_data import fetch_intraday
 
     h1 = fetch_intraday(symbol, interval="60m", period="10d")
@@ -1072,7 +1060,7 @@ def analyze_intraday(symbol: str, name: str = "") -> Optional[IntradaySignal]:
 
     m15_state, m15_points = _m15_confirmation(m15, price)
     news_state, news_title, news_source = _classify_news(symbol)
-    market_ok, market_state = _market_alignment(fetch_intraday)
+    market_ok, market_state = market_context if market_context is not None else _market_alignment(fetch_intraday)
     chop = _chop_filter(today_5, price, vwap_last)
 
     session_high = float(today_5["High"].max())
@@ -1462,20 +1450,20 @@ def scan_intraday(
         return []
     scan_intraday.last_window = "ok"
 
-    # السوق العام مرة واحدة قبل مسح الأسهم.
+    # السوق العام مرة واحدة لكل دورة فقط، ثم نمرره لكل الأسهم لتقليل طلبات API.
     try:
-        spy = analyze_intraday("SPY", "SPY")
-        if spy and spy.score < 55 and not spy.above_open:
-            scan_intraday.last_window = "SPY لحظي ضعيف"
+        market_context = _market_alignment(fetch_intraday)
+        if not market_context[0] and "ضعيفان" in market_context[1]:
+            scan_intraday.last_window = "SPY+QQQ لحظيًا ضعيفان"
             min_score = max(min_score, 88)
     except Exception:
-        pass
+        market_context = (True, "السوق غير مؤكد")
 
     results: list[IntradaySignal] = []
     workers = min(8, max(2, len(symbols)))
     def _one(sym: str):
         try:
-            return analyze_intraday(sym, names.get(sym, sym))
+            return analyze_intraday(sym, names.get(sym, sym), market_context=market_context)
         except Exception:
             return None
 
@@ -1508,6 +1496,8 @@ def scan_intraday(
             if sig.spread_pct > MAX_SPREAD_PCT:
                 sig.warnings.append(f"Spread مرتفع {sig.spread_pct:.2f}%")
             if not sig.liquidity_ok:
+                continue
+            if liq.get("quote_source") == "none" or float(liq.get("quote_age_min", 999) or 999) > 2.0:
                 continue
             results.append(sig)
 

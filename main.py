@@ -922,7 +922,26 @@ async def live_scan_intraday_job(context: ContextTypes.DEFAULT_TYPE) -> None:
                 age = (now_ny() - datetime.fromisoformat(watch.get("at"))).total_seconds() / 60.0
             except Exception:
                 age = 999
-            confirmed = age <= max(20, INTRADAY_EVERY_MINUTES * 2) and candidate.score >= INTRADAY_MIN_SCORE
+            type_rank = {"اختراق مؤكد": 0, "إعادة اختبار": 1, "دخول مبكر": 2}
+            old_type = str(watch.get("entry_type") or "دخول مبكر")
+            new_type = str(getattr(candidate, "entry_type", "دخول مبكر"))
+            type_same_or_stronger = type_rank.get(new_type, 9) <= type_rank.get(old_type, 9)
+            old_score = float(watch.get("score") or 0)
+            old_price = float(watch.get("price") or candidate.price)
+            price_move = abs(float(candidate.price) - old_price) / max(old_price, 1e-9) * 100
+            old_bq = float(watch.get("breakout_quality") or 0)
+            bq_ok = float(getattr(candidate, "breakout_quality", 0) or 0) >= max(0.0, old_bq - 5.0)
+            price_zone_ok = price_move <= 2.0
+            confirmation_ok = (
+                candidate.score >= max(INTRADAY_MIN_SCORE, old_score - 2)
+                and getattr(candidate, "live_ok", False)
+                and getattr(candidate, "above_open", False)
+                and "تحت" not in str(getattr(candidate, "vwap_day_note", ""))
+                and type_same_or_stronger
+                and bq_ok
+                and price_zone_ok
+            )
+            confirmed = age <= 20 and confirmation_ok
 
         if not confirmed:
             state["intraday_watch"] = {
@@ -930,6 +949,9 @@ async def live_scan_intraday_job(context: ContextTypes.DEFAULT_TYPE) -> None:
                 "score": candidate.score,
                 "price": candidate.price,
                 "entry_type": candidate.entry_type,
+                "breakout_quality": float(getattr(candidate, "breakout_quality", 0) or 0),
+                "buy_low": float(getattr(candidate, "buy_low", candidate.price)),
+                "buy_high": float(getattr(candidate, "buy_high", candidate.price)),
                 "at": now_iso,
             }
             save_state(state)
