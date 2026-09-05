@@ -20,6 +20,7 @@ DATA_URL = os.getenv("APCA_DATA_URL", "https://data.alpaca.markets").rstrip("/")
 APCA_FEED = os.getenv("APCA_FEED", "auto").strip().lower()
 SIP_RETRY_COOLDOWN_MIN = 15
 _SIP_DISABLED_UNTIL: datetime | None = None
+_LAST_ALPACA_FEED = "iex"
 
 _LAST_SOURCE = "none"
 _LAST_ERROR = ""
@@ -114,7 +115,7 @@ def fetch_alpaca_bars(
     end: Optional[datetime] = None,
     limit: int = 10000,
 ) -> pd.DataFrame:
-    global _SIP_DISABLED_UNTIL
+    global _SIP_DISABLED_UNTIL, _LAST_ALPACA_FEED
     if not alpaca_configured():
         raise RuntimeError("Alpaca keys missing")
     end = end or datetime.now(timezone.utc)
@@ -137,6 +138,10 @@ def fetch_alpaca_bars(
             df = _alpaca_request_bars(symbol, timeframe, start, end, limit, feed)
             if feed == "sip":
                 _SIP_DISABLED_UNTIL = None
+            _LAST_ALPACA_FEED = feed
+            if df is not None:
+                df.attrs["data_source"] = f"alpaca-{feed}"
+                df.attrs["feed"] = feed
             _set_status(f"alpaca-{feed}")
             return df
         except Exception as exc:
@@ -163,7 +168,11 @@ def data_age_minutes(df: pd.DataFrame, now: Optional[datetime] = None) -> float:
     if now_ts.tzinfo is None:
         now_ts = now_ts.tz_localize("UTC")
     now_ts = now_ts.tz_convert(ts.tz)
-    return max(0.0, (now_ts - ts).total_seconds() / 60.0)
+    age = (now_ts - ts).total_seconds() / 60.0
+    # Timestamp مستقبلي بشكل غير منطقي = بيانات غير صالحة.
+    if age < -2.0:
+        return float("inf")
+    return max(0.0, age)
 
 
 def intraday_data_fresh(df: pd.DataFrame, interval: str, max_age_minutes: Optional[float] = None) -> tuple[bool, float]:
@@ -177,7 +186,9 @@ def fetch_latest_quote(symbol: str, feed: Optional[str] = None) -> dict:
     """أفضل Bid/Ask من Alpaca عند توفره، بدون اختراع قيم عند غياب الاقتباس."""
     if not alpaca_configured():
         return {}
-    use_feed = feed or ("sip" if APCA_FEED == "sip" else "iex")
+    # في وضع auto نستخدم نفس الـfeed الذي نجح فعليًا مع آخر طلب شموع.
+    # إذا لم ننجح بعد، البداية الآمنة هي IEX المجاني.
+    use_feed = feed or (APCA_FEED if APCA_FEED in {"iex", "sip", "delayed_sip"} else _LAST_ALPACA_FEED)
     url = f"{DATA_URL}/v2/stocks/{symbol.upper()}/quotes/latest"
     params = {"feed": use_feed}
     r = requests.get(url, headers=_alpaca_headers(), params=params, timeout=5)
@@ -202,7 +213,7 @@ def fetch_history(symbol: str, period: str = "1y") -> pd.DataFrame:
         try:
             df = fetch_alpaca_bars(symbol, "1Day", start)
             if df is not None and len(df) >= 30:
-                _set_status("alpaca")
+                _set_status(df.attrs.get("data_source", "alpaca"))
                 return df
         except Exception as exc:
             log.warning("Alpaca daily %s: %s", symbol, exc)
