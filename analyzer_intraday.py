@@ -2073,6 +2073,8 @@ def scan_intraday(
     workers = min(8, max(2, len(symbols)))
     stage1: list[tuple[float, str, pd.DataFrame, pd.DataFrame]] = []
 
+    log.info("INTRADAY SCAN: %d symbols loaded", len(symbols))
+
     # Stage 1 — H1 + 5m only for the full universe.
     with ThreadPoolExecutor(max_workers=workers) as pool:
         futures = {pool.submit(_prefilter_intraday, sym): sym for sym in symbols}
@@ -2087,7 +2089,12 @@ def scan_intraday(
                 stage1.append((route_score, sym, h1, m5))
 
     stage1.sort(key=lambda x: x[0], reverse=True)
+    log.info(
+        "STAGE 1: %d/%d completed; %d candidates passed prefilter",
+        len(stage1), len(symbols), len(stage1),
+    )
     finalists = stage1[:max(PREFILTER_MAX_CANDIDATES, limit * 5)]
+    log.info("STAGE 2: top %d candidates selected for deep analysis", len(finalists))
 
     # Stage 2 — only finalists receive 15m + full setup/confluence/news analysis.
     results: list[IntradaySignal] = []
@@ -2129,6 +2136,11 @@ def scan_intraday(
             if liq.get("quote_source") == "none" or float(liq.get("quote_age_min", 999) or 999) > 2.0:
                 continue
             results.append(sig)
+
+    log.info(
+        "STAGE 2: %d deep candidates completed; %d qualified signals",
+        len(finalists), len(results),
+    )
 
     rank = {et: i for i, et in enumerate(ENTRY_TYPES)}
     results.sort(key=lambda x: (
