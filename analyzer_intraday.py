@@ -53,6 +53,45 @@ ADAPTIVE_MIN_EDGE = 0.04
 ADAPTIVE_MIN_COVERAGE = 0.45
 ADAPTIVE_ROLLBACK_DROP = 0.06
 
+# Self-adaptive market-regime layer: starts neutral, learns in shadow,
+# and activates automatically only after an out-of-sample improvement.
+REGIME_MIN_SAMPLES = 8
+REGIME_WEIGHT_STEP = 0.03
+REGIME_WEIGHT_MIN = 0.85
+REGIME_WEIGHT_MAX = 1.15
+REGIME_MIN_EDGE = 0.04
+REGIME_MIN_COVERAGE = 0.45
+
+# Adaptive Exit Engine: learns TP/SL behavior from MFE/MAE and time-to-result.
+# It starts shadow-only and can activate automatically after OOS validation.
+EXIT_MIN_SAMPLES = 12
+EXIT_TP_STEP_R = 0.05
+EXIT_SL_STEP = 0.03
+EXIT_TP_MIN_R = 1.20
+EXIT_TP_MAX_R = 1.80
+EXIT_SL_MIN_MULT = 0.90
+EXIT_SL_MAX_MULT = 1.10
+EXIT_MIN_EDGE = 0.04
+EXIT_MIN_COVERAGE = 0.45
+
+# Trade Intelligence / Reason Engine.
+# Shadow-only at first: classifies why a trade worked/failed and learns
+# conditional patterns without changing the core trading rules.
+REASON_MIN_SAMPLES = 12
+REASON_ACTIVE_MIN_SAMPLES = 30
+REASON_EDGE = 0.08
+REASON_WEIGHT_STEP = 0.03
+REASON_WEIGHT_MIN = 0.85
+REASON_WEIGHT_MAX = 1.15
+
+OPPORTUNITY_MIN_SAMPLES = 15
+OPPORTUNITY_ACTIVE_MIN_SAMPLES = 40
+OPPORTUNITY_EDGE = 0.05
+OPPORTUNITY_WEIGHT_STEP = 0.03
+OPPORTUNITY_WEIGHT_MIN = 0.85
+OPPORTUNITY_WEIGHT_MAX = 1.15
+OPPORTUNITY_MIN_COVERAGE = 0.45
+
 # أخبار: اختياري عبر FINNHUB_API_KEY. إذا لم يوجد المفتاح لا يمنع التحليل.
 FINNHUB_API_KEY = os.getenv("FINNHUB_API_KEY", "").strip()
 NEWS_LOOKBACK_HOURS = 6
@@ -176,6 +215,37 @@ def _default_adaptive_policy() -> dict:
         "min_news_volume_ratio": 1.50,
         "min_news_change_pct": 4.0,
         "min_tp1_r": 1.20,
+        "regime_weights": {
+            regime: {et: 1.0 for et in ENTRY_TYPES}
+            for regime in (
+                "chop", "trend_clean", "trend_mixed", "market_weak",
+                "news_momentum", "high_volatility", "neutral"
+            )
+        },
+        "regime_active": False,
+        "regime_activation_generation": None,
+        "exit_policy": {
+            regime: {
+                et: {"tp1_r": 1.20, "sl_mult": 1.00}
+                for et in ENTRY_TYPES
+            }
+            for regime in (
+                "chop", "trend_clean", "trend_mixed", "market_weak",
+                "news_momentum", "high_volatility", "neutral"
+            )
+        },
+        "exit_active": False,
+        "exit_activation_generation": None,
+        "reason_policy": {
+            "weights": {},
+            "active": False,
+            "generation": 0,
+        },
+        "opportunity_policy": {
+            "weights": {},
+            "active": False,
+            "generation": 0,
+        },
         "history": [],
     }
 
@@ -199,6 +269,28 @@ def _load_adaptive_policy() -> dict:
         data.setdefault("strategy_stats", {})
         for et, stat in default["strategy_stats"].items():
             data["strategy_stats"].setdefault(et, dict(stat))
+        data.setdefault("regime_weights", {})
+        for regime, et_map in default["regime_weights"].items():
+            data["regime_weights"].setdefault(regime, {})
+            for et, w in et_map.items():
+                data["regime_weights"][regime].setdefault(et, w)
+        data.setdefault("regime_active", False)
+        data.setdefault("regime_activation_generation", None)
+        data.setdefault("exit_policy", {})
+        for regime, et_map in default["exit_policy"].items():
+            data["exit_policy"].setdefault(regime, {})
+            for et, vals in et_map.items():
+                data["exit_policy"][regime].setdefault(et, dict(vals))
+        data.setdefault("exit_active", False)
+        data.setdefault("exit_activation_generation", None)
+        data.setdefault("reason_policy", {"weights": {}, "active": False, "generation": 0})
+        data["reason_policy"].setdefault("weights", {})
+        data["reason_policy"].setdefault("active", False)
+        data["reason_policy"].setdefault("generation", 0)
+        data.setdefault("opportunity_policy", {"weights": {}, "active": False, "generation": 0})
+        data["opportunity_policy"].setdefault("weights", {})
+        data["opportunity_policy"].setdefault("active", False)
+        data["opportunity_policy"].setdefault("generation", 0)
         return data
     except Exception:
         return default
@@ -211,13 +303,50 @@ def _save_adaptive_policy(policy: dict) -> None:
     tmp.replace(ADAPTIVE_POLICY_FILE)
 
 
-def _adaptive_score_adjustment(factors: list[str]) -> float:
+def _adaptive_score_adjustment(
+    factors: list[str],
+    market_regime: str = "neutral",
+    entry_type: str = "",
+) -> float:
+    """Adaptive adjustment plus self-learned regime/strategy multiplier."""
     try:
         p = _load_adaptive_policy()
-        vals = [float(p.get("weights", {}).get(f, 1.0)) for f in factors if f in p.get("weights", {})]
-        if not vals:
-            return 0.0
-        return max(-4.0, min(4.0, (sum(vals) / len(vals) - 1.0) * 8.0))
+        vals = [
+            float(p.get("weights", {}).get(f, 1.0))
+            for f in factors
+            if f in p.get("weights", {})
+        ]
+        adjustment = (sum(vals) / len(vals) - 1.0) * 8.0 if vals else 0.0
+
+        if p.get("regime_active") and entry_type:
+            rw = (
+                p.get("regime_weights", {})
+                .get(market_regime, {})
+                .get(entry_type, 1.0)
+            )
+            adjustment += (float(rw) - 1.0) * 8.0
+
+        # Reason policy is intentionally conservative and does not invent a
+        # new setup; it only nudges ranking after OOS approval.
+        if p.get("reason_policy", {}).get("active") and entry_type:
+            key = f"{market_regime}|{entry_type}"
+            reason_map = p.get("reason_policy", {}).get("weights", {}).get(key, {})
+            if reason_map:
+                vals = [
+                    float(v) for k, v in reason_map.items()
+                    if k != "samples" and isinstance(v, (int, float))
+                ]
+                if vals:
+                    adjustment += max(-1.0, min(1.0, (sum(vals) / len(vals) - 1.0) * 4.0))
+
+        if p.get("opportunity_policy", {}).get("active") and entry_type:
+            key = f"{market_regime}|{entry_type}"
+            opp_map = p.get("opportunity_policy", {}).get("weights", {}).get(key, {})
+            vals = [float(v) for k, v in opp_map.items() if k != "samples" and isinstance(v, (int, float))]
+            if vals:
+                adjustment += max(-1.25, min(1.25, (sum(vals) / len(vals) - 1.0) * 5.0))
+
+        return max(-5.0, min(5.0, adjustment))
     except Exception:
         return 0.0
 
@@ -380,6 +509,16 @@ def _shadow_score_row(row: dict, policy: dict) -> bool:
         return False
     if row.get("news_state") == "negative":
         return False
+
+    if policy.get("regime_active") and et:
+        regime = str(row.get("market_regime") or "neutral")
+        rw = (
+            policy.get("regime_weights", {})
+            .get(regime, {})
+            .get(et, 1.0)
+        )
+        score += (float(rw) - 1.0) * 8.0
+
     return score >= min(82.0, limit)
 
 
@@ -408,7 +547,324 @@ def _rollback_if_needed() -> dict:
     return {"status": "keep"}
 
 
-def adaptive_retrain_if_ready() -> dict:
+def monthly_self_optimization() -> dict:
+    """
+    Monthly controlled optimization entry point.
+    Reviews the full accumulated learning set once per month and returns a
+    Telegram-friendly summary. It never changes core trading rules.
+    """
+    result = adaptive_retrain_if_ready(force_monthly=True)
+    policy = _load_adaptive_policy()
+
+    if result.get("status") in {"waiting", "waiting_oos", "unchanged"}:
+        return {
+            **result,
+            "generation": int(policy.get("generation", 0)),
+            "regime_active": bool(policy.get("regime_active", False)),
+            "exit_active": bool(policy.get("exit_active", False)),
+            "reason_active": bool(policy.get("reason_policy", {}).get("active", False)),
+            "opportunity_active": bool(policy.get("opportunity_policy", {}).get("active", False)),
+        }
+
+    return {
+        **result,
+        "generation": int(policy.get("generation", 0)),
+        "regime_active": bool(policy.get("regime_active", False)),
+        "exit_active": bool(policy.get("exit_active", False)),
+        "reason_active": bool(policy.get("reason_policy", {}).get("active", False)),
+        "opportunity_active": bool(policy.get("opportunity_policy", {}).get("active", False)),
+    }
+
+
+def _build_regime_candidate(policy: dict, train: list[dict]) -> dict:
+    """Learn strategy performance inside each market regime; shadow-only at first."""
+    candidate = json.loads(json.dumps(policy))
+    candidate.setdefault("regime_weights", {})
+    regimes = (
+        "chop", "trend_clean", "trend_mixed", "market_weak",
+        "news_momentum", "high_volatility", "neutral"
+    )
+
+    for regime in regimes:
+        candidate["regime_weights"].setdefault(regime, {})
+        regime_rows = [
+            r for r in train
+            if str(r.get("market_regime") or "neutral") == regime
+        ]
+        regime_rate = _rate(regime_rows)
+
+        for et in ENTRY_TYPES:
+            subset = [
+                r for r in regime_rows
+                if str(r.get("entry_type") or "") == et
+            ]
+            if len(subset) < REGIME_MIN_SAMPLES:
+                continue
+
+            rate = _rate(subset)
+            w = float(candidate["regime_weights"][regime].get(et, 1.0))
+
+            if rate >= regime_rate + 0.10:
+                w = min(REGIME_WEIGHT_MAX, w + REGIME_WEIGHT_STEP)
+            elif rate <= regime_rate - 0.10:
+                w = max(REGIME_WEIGHT_MIN, w - REGIME_WEIGHT_STEP)
+
+            candidate["regime_weights"][regime][et] = round(w, 4)
+
+    return candidate
+
+
+def _classify_trade_reason(row: dict) -> str:
+    """Explainable primary outcome reason; no effect on live trading."""
+    status = str(row.get("status") or "").lower()
+    mfe = float(row.get("mfe_pct") or 0.0)
+    mae = abs(float(row.get("mae_pct") or 0.0))
+    vr = float(row.get("volume_ratio") or 1.0)
+    regime = str(row.get("market_regime") or "neutral")
+    news = str(row.get("news_state") or "").lower()
+    r = float(row.get("r_multiple") or 0.0)
+
+    if "tp3" in status or "tp2" in status:
+        return "strong_trend_followthrough"
+    if "tp1" in status:
+        if mfe > 2.0 * max(mae, 0.01):
+            return "clean_momentum"
+        return "tp1_reached_then_slowed"
+    if "stop" in status:
+        if mfe >= 0.8 and mae > max(mfe, 0.0) and vr < 1.0:
+            return "weak_volume_stop"
+        if regime == "chop":
+            return "chop_stop"
+        if news == "negative":
+            return "negative_news_stop"
+        if mfe >= 0.5:
+            return "moved_then_reversed"
+        return "immediate_setup_failure"
+    if "timeout" in status:
+        if mfe >= 1.0 and r <= 0.0:
+            return "target_too_far_or_timing"
+        if regime == "chop":
+            return "chop_timeout"
+        return "momentum_faded"
+    return "other"
+
+
+def _build_reason_candidate(policy: dict, train: list[dict]) -> dict:
+    """Learn conditional outcome reasons without altering the core rules."""
+    candidate = json.loads(json.dumps(policy))
+    rp = candidate.setdefault("reason_policy", {"weights": {}, "active": False, "generation": 0})
+    weights = rp.setdefault("weights", {})
+
+    groups = {}
+    for row in train:
+        key = (
+            str(row.get("market_regime") or "neutral"),
+            str(row.get("entry_type") or ""),
+        )
+        groups.setdefault(key, []).append(row)
+
+    for (regime, et), rows in groups.items():
+        if not et or len(rows) < REASON_MIN_SAMPLES:
+            continue
+
+        wins = [r for r in rows if str(r.get("status") or "").lower() in ("tp1", "tp2", "tp3")]
+        losses = [r for r in rows if str(r.get("status") or "").lower() in ("stop", "timeout")]
+        if not wins and not losses:
+            continue
+
+        reason_counts = {}
+        for r in rows:
+            reason = _classify_trade_reason(r)
+            reason_counts[reason] = reason_counts.get(reason, 0) + 1
+
+        key_name = f"{regime}|{et}"
+        weights.setdefault(key_name, {})
+        for reason, count in reason_counts.items():
+            share = count / max(len(rows), 1)
+            old_w = float(weights[key_name].get(reason, 1.0))
+            if reason in ("clean_momentum", "strong_trend_followthrough") and share >= 0.25:
+                old_w = min(REASON_WEIGHT_MAX, old_w + REASON_WEIGHT_STEP)
+            elif reason in ("weak_volume_stop", "chop_stop", "negative_news_stop") and share >= 0.25:
+                old_w = max(REASON_WEIGHT_MIN, old_w - REASON_WEIGHT_STEP)
+            weights[key_name][reason] = round(old_w, 4)
+
+        weights[key_name]["samples"] = len(rows)
+
+    return candidate
+
+
+def _build_exit_candidate(policy: dict, train: list[dict]) -> dict:
+    """
+    Learn TP1 R and structural-stop multiplier by regime + entry type.
+    Uses completed trade path telemetry:
+      MFE = max favorable excursion
+      MAE = max adverse excursion
+      time_to_result_min = time to closure/result
+    This candidate is shadow-only until its OOS gate approves it.
+    """
+    candidate = json.loads(json.dumps(policy))
+    candidate.setdefault("exit_policy", {})
+
+    regimes = (
+        "chop", "trend_clean", "trend_mixed", "market_weak",
+        "news_momentum", "high_volatility", "neutral"
+    )
+
+    for regime in regimes:
+        candidate["exit_policy"].setdefault(regime, {})
+        regime_rows = [
+            r for r in train
+            if str(r.get("market_regime") or "neutral") == regime
+        ]
+
+        for et in ENTRY_TYPES:
+            subset = [
+                r for r in regime_rows
+                if str(r.get("entry_type") or "") == et
+            ]
+            if len(subset) < EXIT_MIN_SAMPLES:
+                continue
+
+            # Convert excursion percentages into R using the original risk.
+            mfe_r = []
+            mae_r = []
+            for r in subset:
+                entry = float(r.get("entry") or 0)
+                stop = float(r.get("stop_loss") or 0)
+                if entry <= 0 or stop <= 0 or stop >= entry:
+                    continue
+                risk_pct = (entry - stop) / entry * 100.0
+                if risk_pct <= 0:
+                    continue
+                mfe_r.append(float(r.get("mfe_pct") or 0.0) / risk_pct)
+                mae_r.append(abs(float(r.get("mae_pct") or 0.0)) / risk_pct)
+
+            if not mfe_r or not mae_r:
+                continue
+
+            current = candidate["exit_policy"][regime].get(
+                et, {"tp1_r": 1.20, "sl_mult": 1.00}
+            )
+            tp1_r = float(current.get("tp1_r", 1.20))
+            sl_mult = float(current.get("sl_mult", 1.00))
+
+            # If the trade frequently reaches materially beyond TP1, allow a
+            # slightly larger target. If it usually stalls before TP1, keep the
+            # minimum 1.20R rather than shrinking below the strategy's core rule.
+            median_mfe = float(np.median(mfe_r))
+            hit_rate = sum(1 for x in mfe_r if x >= tp1_r) / len(mfe_r)
+            if hit_rate >= 0.70 and median_mfe >= tp1_r + 0.20:
+                tp1_r = min(EXIT_TP_MAX_R, tp1_r + EXIT_TP_STEP_R)
+            elif hit_rate < 0.50 and median_mfe < tp1_r:
+                tp1_r = max(EXIT_TP_MIN_R, tp1_r - EXIT_TP_STEP_R)
+
+            # If MAE repeatedly approaches/exceeds the current structural risk
+            # before the trade later succeeds, allow a small widening. If stops
+            # are hit quickly with little favorable excursion, tighten instead.
+            near_stop = sum(1 for x in mae_r if x >= 0.85) / len(mae_r)
+            early_loss = sum(
+                1 for r in subset
+                if r.get("status") == "stop"
+                and float(r.get("mfe_pct") or 0.0) <= 0.30
+            ) / len(subset)
+
+            if near_stop >= 0.60 and hit_rate >= 0.55:
+                sl_mult = min(EXIT_SL_MAX_MULT, sl_mult + EXIT_SL_STEP)
+            elif early_loss >= 0.55:
+                sl_mult = max(EXIT_SL_MIN_MULT, sl_mult - EXIT_SL_STEP)
+
+            candidate["exit_policy"][regime][et] = {
+                "tp1_r": round(tp1_r, 3),
+                "sl_mult": round(sl_mult, 3),
+                "samples": len(subset),
+                "median_mfe_r": round(median_mfe, 3),
+                "near_stop_rate": round(near_stop, 3),
+            }
+
+    return candidate
+
+
+def _apply_adaptive_exit(sig_price: float, structural_stop: float, regime: str,
+                         entry_type: str, policy: dict, atr: float) -> tuple[float, float, float]:
+    """
+    Return (stop, tp1, tp1_r). Adaptive exit is inert until exit_active=True.
+    Stop remains anchored to the structural stop and stays inside the global
+    0.60%–4.50% risk band.
+    """
+    entry = float(sig_price)
+    stop = float(structural_stop)
+    risk = max(entry - stop, entry * 0.006)
+    tp1_r = 1.20
+    sl_mult = 1.00
+
+    if policy.get("exit_active"):
+        vals = (
+            policy.get("exit_policy", {})
+            .get(regime, {})
+            .get(entry_type, {})
+        )
+        tp1_r = float(vals.get("tp1_r", 1.20))
+        sl_mult = float(vals.get("sl_mult", 1.00))
+
+    # Move the structural stop modestly around the original structural point.
+    # Never cross entry and never exceed the global risk ceiling.
+    base_gap = max(entry - stop, entry * 0.006)
+    new_gap = base_gap * sl_mult
+    new_gap = max(entry * 0.006, min(entry * 0.045, new_gap))
+    new_stop = entry - new_gap
+
+    tp1 = entry + new_gap * max(EXIT_TP_MIN_R, min(EXIT_TP_MAX_R, tp1_r))
+    return new_stop, tp1, max(EXIT_TP_MIN_R, min(EXIT_TP_MAX_R, tp1_r))
+
+
+def _opportunity_key(row: dict) -> str:
+    regime = str(row.get("market_regime") or "neutral")
+    et = str(row.get("entry_type") or "")
+    m15 = str(row.get("m15_state") or "محايد")
+    vol = float(row.get("volume_ratio", 1.0) or 1.0)
+    bq = float(row.get("breakout_quality", 0) or 0)
+    vb = "vol_strong" if vol >= 1.5 else ("vol_ok" if vol >= 1.0 else "vol_weak")
+    bb = "breakout_strong" if bq >= 70 else ("breakout_ok" if bq >= 55 else "breakout_weak")
+    return f"{regime}|{et}|m15:{m15}|{vb}|{bb}"
+
+
+def _build_opportunity_candidate(policy: dict, train: list[dict]) -> dict:
+    candidate = json.loads(json.dumps(policy))
+    op = candidate.setdefault("opportunity_policy", {"weights": {}, "active": False, "generation": 0})
+    weights = op.setdefault("weights", {})
+    outcomes = [r for r in train if r.get("record_type") == "outcome" and r.get("status") in {"tp1", "stop", "timeout"}]
+    baseline = _rate(outcomes)
+    groups = {}
+    for r in outcomes:
+        groups.setdefault(_opportunity_key(r), []).append(r)
+    for key, rows in groups.items():
+        if len(rows) < OPPORTUNITY_MIN_SAMPLES:
+            continue
+        rate = _rate(rows)
+        old = float(weights.get(key, 1.0))
+        if rate >= baseline + 0.08:
+            old = min(OPPORTUNITY_WEIGHT_MAX, old + OPPORTUNITY_WEIGHT_STEP)
+        elif rate <= baseline - 0.08:
+            old = max(OPPORTUNITY_WEIGHT_MIN, old - OPPORTUNITY_WEIGHT_STEP)
+        weights[key] = round(old, 4)
+        weights[key + "|samples"] = len(rows)
+    return candidate
+
+
+def _opportunity_shadow_rate(rows: list[dict], policy: dict) -> tuple[float, float, int]:
+    outcomes = [r for r in rows if r.get("record_type") == "outcome" and r.get("status") in {"tp1", "stop", "timeout"}]
+    if not outcomes:
+        return 0.0, 0.0, 0
+    selected = []
+    for r in outcomes:
+        key = _opportunity_key(r)
+        w = float(policy.get("opportunity_policy", {}).get("weights", {}).get(key, 1.0))
+        if w >= 1.0:
+            selected.append(r)
+    return _rate(selected), len(selected) / max(len(outcomes), 1), len(selected)
+
+
+def adaptive_retrain_if_ready(force_monthly: bool = False) -> dict:
     """يشغّل دورة التعلم الذاتي ويصدر نتيجة قابلة للإرسال إلى Telegram."""
     completed = _recent_learning_rows()
     policy = _load_adaptive_policy()
@@ -417,11 +873,13 @@ def adaptive_retrain_if_ready() -> dict:
         return {"status": "waiting", "samples": len(completed)}
 
     last_update = int(policy.get("samples_at_update", 0))
-    if len(completed) <= last_update:
+    if not force_monthly and len(completed) <= last_update:
         return {"status": "unchanged", "samples": len(completed)}
 
-    recent = completed[-ADAPTIVE_CONFIRM_SAMPLES:]
-    # اختبار خارج العينة: نتعلم من الجزء الأقدم ونختبر المرشح على أحدث جزء لم يره أثناء التدريب.
+    # Normal learning stays bounded to the recent confirmation window.
+    # Monthly optimization intentionally reviews the full accumulated dataset.
+    recent = completed if force_monthly else completed[-ADAPTIVE_CONFIRM_SAMPLES:]
+    # اختبار خارج العينة: الجزء الأحدث يبقى خارج التدريب حتى لا نعتمد على نفس البيانات.
     split = max(20, int(len(recent) * 0.70))
     train = recent[:split]
     test = recent[split:]
@@ -432,6 +890,13 @@ def adaptive_retrain_if_ready() -> dict:
     candidate.setdefault("interaction_weights", {})
     # Always refresh per-strategy statistics so all 16 setups are observable.
     candidate["strategy_stats"] = _strategy_stats(completed)
+
+    # Regime layer: learns separately for each market condition, but remains
+    # shadow-only until its OOS gate proves that it improves the current policy.
+    candidate = _build_regime_candidate(candidate, train)
+    candidate = _build_exit_candidate(candidate, train)
+    candidate = _build_reason_candidate(candidate, train)
+    candidate = _build_opportunity_candidate(candidate, train)
 
     # العوامل
     for factor in candidate.get("weights", {}):
@@ -493,6 +958,50 @@ def adaptive_retrain_if_ready() -> dict:
     candidate_rate = _rate(candidate_selected)
     coverage = len(candidate_selected) / max(len(test), 1)
 
+    regime_policy = json.loads(json.dumps(candidate))
+    regime_policy["regime_active"] = True
+    regime_selected = [r for r in test if _shadow_score_row(r, regime_policy)]
+    regime_rate = _rate(regime_selected)
+    regime_coverage = len(regime_selected) / max(len(test), 1)
+    regime_improved = (
+        regime_rate >= current_rate + REGIME_MIN_EDGE
+        and regime_coverage >= REGIME_MIN_COVERAGE
+        and len(regime_selected) >= 10
+    )
+
+    exit_policy = json.loads(json.dumps(candidate))
+    exit_policy["exit_active"] = True
+    exit_selected = [r for r in test if _shadow_score_row(r, exit_policy)]
+    exit_rate = _rate(exit_selected)
+    exit_coverage = len(exit_selected) / max(len(test), 1)
+    exit_improved = (
+        exit_rate >= current_rate + EXIT_MIN_EDGE
+        and exit_coverage >= EXIT_MIN_COVERAGE
+        and len(exit_selected) >= 10
+    )
+
+    # Reason Engine is evaluated separately. It never rewrites core rules;
+    # it only becomes an optional ranking modifier after OOS proof.
+    reason_policy = json.loads(json.dumps(candidate))
+    reason_policy["reason_policy"]["active"] = True
+    reason_selected = [r for r in test if _shadow_score_row(r, reason_policy)]
+    reason_rate = _rate(reason_selected)
+    reason_coverage = len(reason_selected) / max(len(test), 1)
+    reason_improved = (
+        reason_rate >= current_rate + REASON_EDGE
+        and reason_coverage >= REGIME_MIN_COVERAGE
+        and len(reason_selected) >= 10
+    )
+
+    opportunity_policy = json.loads(json.dumps(candidate))
+    opportunity_policy["opportunity_policy"]["active"] = True
+    opportunity_rate, opportunity_coverage, opportunity_n = _opportunity_shadow_rate(test, opportunity_policy)
+    opportunity_improved = (
+        opportunity_rate >= current_rate + OPPORTUNITY_EDGE
+        and opportunity_coverage >= OPPORTUNITY_MIN_COVERAGE
+        and opportunity_n >= 10
+    )
+
     approved = (
         candidate_rate >= current_rate + ADAPTIVE_MIN_EDGE
         and coverage >= ADAPTIVE_MIN_COVERAGE
@@ -506,6 +1015,22 @@ def adaptive_retrain_if_ready() -> dict:
         "current_shadow_rate": round(current_rate, 4),
         "candidate_shadow_rate": round(candidate_rate, 4),
         "coverage": round(coverage, 4),
+        "regime_shadow_rate": round(regime_rate, 4),
+        "regime_coverage": round(regime_coverage, 4),
+        "regime_improved": bool(regime_improved),
+        "regime_active_before": bool(policy.get("regime_active", False)),
+        "exit_shadow_rate": round(exit_rate, 4),
+        "exit_coverage": round(exit_coverage, 4),
+        "exit_improved": bool(exit_improved),
+        "exit_active_before": bool(policy.get("exit_active", False)),
+        "reason_shadow_rate": round(reason_rate, 4),
+        "reason_coverage": round(reason_coverage, 4),
+        "reason_improved": bool(reason_improved),
+        "reason_active_before": bool(policy.get("reason_policy", {}).get("active", False)),
+        "opportunity_shadow_rate": round(opportunity_rate, 4),
+        "opportunity_coverage": round(opportunity_coverage, 4),
+        "opportunity_improved": bool(opportunity_improved),
+        "opportunity_active_before": bool(policy.get("opportunity_policy", {}).get("active", False)),
         "oos_samples": len(test),
         "train_samples": len(train),
         "approved": bool(approved),
@@ -523,6 +1048,32 @@ def adaptive_retrain_if_ready() -> dict:
         candidate["approved"] = True
         candidate["validation_new_rate"] = candidate_rate
         candidate["validation_old_rate"] = current_rate
+
+        # Automatic activation: no manual intervention.
+        candidate["regime_active"] = bool(regime_improved or policy.get("regime_active", False))
+        candidate["regime_activation_generation"] = (
+            candidate["generation"] if regime_improved
+            else policy.get("regime_activation_generation")
+        )
+        candidate["exit_active"] = bool(exit_improved or policy.get("exit_active", False))
+        candidate["exit_activation_generation"] = (
+            candidate["generation"] if exit_improved
+            else policy.get("exit_activation_generation")
+        )
+        candidate["reason_policy"]["active"] = bool(
+            reason_improved or policy.get("reason_policy", {}).get("active", False)
+        )
+        candidate["reason_policy"]["generation"] = (
+            candidate["generation"] if reason_improved
+            else policy.get("reason_policy", {}).get("generation", 0)
+        )
+        candidate["opportunity_policy"]["active"] = bool(
+            opportunity_improved or policy.get("opportunity_policy", {}).get("active", False)
+        )
+        candidate["opportunity_policy"]["generation"] = (
+            candidate["generation"] if opportunity_improved
+            else policy.get("opportunity_policy", {}).get("generation", 0)
+        )
         candidate["history"] = (policy.get("history", []) + [result])[-20:]
         _save_adaptive_policy(candidate)
 
@@ -552,11 +1103,46 @@ def adaptive_retrain_if_ready() -> dict:
             f"✅ تم اعتماد الجيل رقم {candidate['generation']}"
         )
     else:
-        policy["samples_at_update"] = len(completed)
-        policy["history"] = (policy.get("history", []) + [result])[-20:]
-        _save_adaptive_policy(policy)
+        # The regime layer can graduate independently if it passes its own OOS gate.
+        if regime_improved or exit_improved or reason_improved or opportunity_improved:
+            policy["generation"] = int(policy.get("generation", 0)) + 1
+            if regime_improved:
+                policy["regime_weights"] = candidate.get("regime_weights", policy.get("regime_weights", {}))
+                policy["regime_active"] = True
+                policy["regime_activation_generation"] = policy["generation"]
+            if exit_improved:
+                policy["exit_policy"] = candidate.get("exit_policy", policy.get("exit_policy", {}))
+                policy["exit_active"] = True
+                policy["exit_activation_generation"] = policy["generation"]
+            if reason_improved:
+                policy["reason_policy"] = candidate.get(
+                    "reason_policy", policy.get("reason_policy", {})
+                )
+                policy["reason_policy"]["active"] = True
+                policy["reason_policy"]["generation"] = policy["generation"]
+            if opportunity_improved:
+                policy["opportunity_policy"] = candidate.get(
+                    "opportunity_policy", policy.get("opportunity_policy", {})
+                )
+                policy["opportunity_policy"]["active"] = True
+                policy["opportunity_policy"]["generation"] = policy["generation"]
+            policy["samples_at_update"] = len(completed)
+            policy["history"] = (policy.get("history", []) + [result])[-20:]
+            _save_adaptive_policy(policy)
+            result["status"] = "regime_or_exit_approved"
+            result["message"] = (
+                f"🧠 Adaptive Learning\n"
+                f"تم تحليل {len(completed)} صفقة\n"
+                f"Regime: {'مفعل' if regime_improved else 'بدون تغيير'} | "
+                f"Exit: {'مفعل' if exit_improved else 'بدون تغيير'}\n"
+                f"الجيل {policy['generation']}"
+            )
+        else:
+            policy["samples_at_update"] = len(completed)
+            policy["history"] = (policy.get("history", []) + [result])[-20:]
+            _save_adaptive_policy(policy)
 
-        result["status"] = "rejected"
+            result["status"] = "rejected"
         result["message"] = (
             f"🧠 مراجعة التعلم الذاتي\n"
             f"تم تحليل {len(completed)} صفقة\n"
@@ -645,7 +1231,16 @@ def register_intraday_signal(sig: IntradaySignal) -> str:
             "breakout_quality": sig.breakout_quality,
             "market_state": sig.market_state,
             "chop": sig.chop,
+            "market_regime": sig.market_regime,
             "adaptive_generation": int(_load_adaptive_policy().get("generation", 0)),
+            "exit_policy_active": bool(_load_adaptive_policy().get("exit_active", False)),
+            "reason_engine_active": bool(
+                _load_adaptive_policy().get("reason_policy", {}).get("active", False)
+            ),
+            "opportunity_engine_active": bool(
+                _load_adaptive_policy().get("opportunity_policy", {}).get("active", False)
+            ),
+            "outcome_reason": _classify_trade_reason({**sig.__dict__, "status": ""}),
             "interactions": list(getattr(sig, "interaction_keys", []) or []),
             "status": "pending",
         }
@@ -659,6 +1254,9 @@ def record_intraday_outcome(
     status: str,
     exit_price: float | None = None,
     note: str = "",
+    mfe_pct: float | None = None,
+    mae_pct: float | None = None,
+    time_to_result_min: float | None = None,
 ) -> None:
     """يسجل نتيجة الإشارة مرة واحدة. TP1 هو نجاح لأن الخروج الكامل عند TP1."""
     if status not in {"tp1", "stop", "timeout"}:
@@ -717,6 +1315,14 @@ def record_intraday_outcome(
             "chop": target.get("chop", False),
             "market_regime": target.get("market_regime", "neutral"),
             "interactions": target.get("interactions", []) or [],
+            "opportunity_engine_active": bool(target.get("opportunity_engine_active", False)),
+            "mfe_pct": round(float(mfe_pct if mfe_pct is not None else target.get("mfe_pct", 0.0) or 0.0), 4),
+            "mae_pct": round(float(mae_pct if mae_pct is not None else target.get("mae_pct", 0.0) or 0.0), 4),
+            "time_to_result_min": (
+                round(float(time_to_result_min), 1)
+                if time_to_result_min is not None
+                else target.get("time_to_result_min")
+            ),
             "status": status,
             "exit_price": exit_price,
             "note": note,
@@ -1715,7 +2321,7 @@ def analyze_intraday(
         score -= 5
 
     learning_adj = _learning_adjustment(factors, entry_type)
-    adaptive_adj = _adaptive_score_adjustment(factors)
+    adaptive_adj = _adaptive_score_adjustment(factors, market_regime, entry_type)
     total_learning_adj = learning_adj + adaptive_adj
     if total_learning_adj:
         score += total_learning_adj
@@ -1870,6 +2476,25 @@ def analyze_intraday(
     if tp1 <= price:
         quality_ok = False
         warnings.append("TP1 غير صالح")
+
+    # Adaptive Exit Engine is inert until its own OOS validation activates it.
+    policy_now = _load_adaptive_policy()
+    adaptive_stop, adaptive_tp1, adaptive_tp1_r = _apply_adaptive_exit(
+        price, stop, market_regime, entry_type, policy_now, atr
+    )
+    if policy_now.get("exit_active"):
+        stop = adaptive_stop
+        tp1 = adaptive_tp1
+        risk = price - stop
+        risk_pct_check = risk / price * 100 if price else 0.0
+        if 0.60 <= risk_pct_check <= 4.50:
+            warnings.append(f"Adaptive Exit: TP1={adaptive_tp1_r:.2f}R")
+        else:
+            # Safety: revert to the original structural stop if adaptive scaling
+            # somehow leaves the allowed intraday risk band.
+            stop = max(stop_candidates)
+            risk = price - stop
+            tp1 = price + risk * 1.20
 
     tp2 = price + risk * 2.0
     tp3 = price + risk * 3.0
@@ -2144,7 +2769,11 @@ def scan_intraday(
 
     rank = {et: i for i, et in enumerate(ENTRY_TYPES)}
     results.sort(key=lambda x: (
-        -(float(x.score) + 1.5 * min(float(getattr(x, "reward_r", 0) or 0), 3.0)
+        -(float(x.score) + _adaptive_score_adjustment(
+            list(getattr(x, "factor_keys", []) or []),
+            str(getattr(x, "market_regime", "neutral") or "neutral"),
+            str(getattr(x, "entry_type", "") or ""),
+        ) + 1.5 * min(float(getattr(x, "reward_r", 0) or 0), 3.0)
           + 2.0 * ("multi_level_confluence" in (getattr(x, "factor_keys", []) or []))
           + 1.5 * ("vwap_h1_confluence" in (getattr(x, "factor_keys", []) or []))
           - 1.5 * float(getattr(x, "spread_pct", 0) or 0)

@@ -16,7 +16,8 @@ import json
 import logging
 import os
 import threading
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, time as dt_time
+from zoneinfo import ZoneInfo
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 
@@ -38,7 +39,7 @@ from analyzer_intraday import (
     format_intraday_ar,
     scan_intraday,
     session_window_ok,
-    get_learning_alert,
+    monthly_self_optimization,
 )
 from backtest import run_backtest
 from charting import build_signal_chart
@@ -73,7 +74,7 @@ MIN_SCORE = int(os.getenv("MIN_SCORE", "84"))
 DAILY_MAX = int(os.getenv("DAILY_MAX_ALERTS", "5"))
 ALERT_EVERY_MINUTES = int(os.getenv("ALERT_EVERY_MINUTES", "90"))
 INTRADAY_MAX = int(os.getenv("INTRADAY_MAX_ALERTS", "3"))
-INTRADAY_EVERY_MINUTES = int(os.getenv("INTRADAY_EVERY_MINUTES", "120"))
+INTRADAY_EVERY_MINUTES = int(os.getenv("INTRADAY_EVERY_MINUTES", "40"))
 LIVE_SCAN_SECONDS = int(os.getenv("LIVE_SCAN_SECONDS", "60"))
 EARNINGS_DAYS = int(os.getenv("EARNINGS_DAYS", "2"))
 COOLDOWN_DAYS = int(os.getenv("COOLDOWN_DAYS", "5"))
@@ -84,7 +85,6 @@ PERF_FILE = DATA_DIR / "signals_log.json"
 PERF_INTRA_FILE = DATA_DIR / "signals_log_intraday.json"
 COOL_FILE = DATA_DIR / "cooldown.json"
 REPORTS_FILE = DATA_DIR / "reports_state.json"
-LEARNING_ALERT_SENT_FILE = DATA_DIR / "learning_alert_sent.json"
 WEIGHTS_FILE = DATA_DIR / "weights_state.json"
 CHART_DIR = DATA_DIR / "charts"
 
@@ -131,8 +131,6 @@ def _empty_state(day: str) -> dict:
         "sent_intraday": [],
         "scores_intraday": {},
         "last_sent_intraday_at": None,
-        "intraday_alert_meta": {},
-        "intraday_watch": {},
     }
 
 
@@ -148,8 +146,6 @@ def load_state() -> dict:
                 data.setdefault("sent_intraday", [])
                 data.setdefault("scores_intraday", {})
                 data.setdefault("last_sent_intraday_at", None)
-                data.setdefault("intraday_alert_meta", {})
-                data.setdefault("intraday_watch", {})
                 return data
         except Exception:
             pass
@@ -860,7 +856,7 @@ def minutes_since_last_intraday(state: dict) -> float | None:
 
 
 async def live_scan_intraday_job(context: ContextTypes.DEFAULT_TYPE) -> None:
-    """مسح لحظي: Watch → Confirm → Alert | ساعة + 15د + 5د | سقف 3."""
+    """مسح لحظي معزول: ساعة + 5د | سقف 3 | خارج أول/آخر الجلسة."""
     if not SUBSCRIBERS or not is_us_regular_session():
         return
     ok, reason = session_window_ok()
@@ -882,97 +878,45 @@ async def live_scan_intraday_job(context: ContextTypes.DEFAULT_TYPE) -> None:
             scan_intraday,
             CORE_WATCHLIST,
             HALAL_STOCKS,
-            max(76, INTRADAY_MIN_SCORE - 6),
+            INTRADAY_MIN_SCORE,
             10,
         )
-        # Watch → Confirm → Alert: أول مسح يسلّح المرشح، والمسح التالي يؤكده.
-        meta = state.get("intraday_alert_meta") or {}
-        def _duplicate_ok(sig):
-            old = meta.get(sig.symbol)
-            if not old:
-                return True
-            try:
-                old_score = float(old.get("score", 0) or 0)
-                old_price = float(old.get("price", 0) or 0)
-                old_type = str(old.get("entry_type", ""))
-                new_price = float(sig.price)
-                price_move = abs(new_price - old_price) / max(old_price, 1e-9) * 100
-                type_changed = str(getattr(sig, "entry_type", "")) != old_type
-                score_improved = float(sig.score) >= old_score + 5
-                return type_changed and score_improved or price_move >= 1.5 and score_improved
-            except Exception:
-                return False
+        # يستبعد فقط ما أُرسل لحظياً اليوم (لا يمنع بسبب السوينغ)
         already = set(sent_i)
         fresh = [
-            s for s in hits
-            if (s.symbol not in already or _duplicate_ok(s))
+            s
+            for s in hits
+            if s.symbol not in already and getattr(s, "entry_type", "") != "اختراق فاشل"
         ]
         if not fresh:
             return
 
-        fresh.sort(key=lambda s: (
-            -(float(s.score) + 1.5 * min(float(getattr(s, "reward_r", 0) or 0), 3.0)
-              + 2.0 * ("multi_level_confluence" in (getattr(s, "factor_keys", []) or []))
-              + 1.5 * ("vwap_h1_confluence" in (getattr(s, "factor_keys", []) or []))
-              - 1.5 * float(getattr(s, "spread_pct", 0) or 0)
-              - 1.0 * float(getattr(s, "expected_slippage_pct", 0) or 0)
-              - 0.8 * max(float(getattr(s, "ext_sma20", 0) or 0) - 2.0, 0.0)),
-            rank.get(getattr(s, "entry_type", ""), 99), -float(s.score), -float(getattr(s, "reward_r", 0) or 0)
-        ))
-        candidate = fresh[0]
-        watch = state.get("intraday_watch") or {}
-        now_iso = now_ny().isoformat()
-        confirmed = False
-        if watch.get("symbol") == candidate.symbol:
-            try:
-                age = (now_ny() - datetime.fromisoformat(watch.get("at"))).total_seconds() / 60.0
-            except Exception:
-                age = 999
-            type_rank = {"اختراق مؤكد": 0, "سحب سيولة مع Displacement": 1, "استعادة بعد فشل ORB": 2, "استمرار ABC": 3, "اختراق نطاق الافتتاح": 4, "علم صاعد": 5, "استعادة مستوى": 6, "دخول بعد Opening Drive": 7, "استعادة قمة اليوم": 8, "إعادة اختبار": 9, "سحب سيولة": 10, "ضغط ثم انفجار": 11, "استمرار الزخم": 12, "ارتداد VWAP": 13, "ارتداد EMA20": 14, "دخول مبكر": 15}
-            old_type = str(watch.get("entry_type") or "دخول مبكر")
-            new_type = str(getattr(candidate, "entry_type", "دخول مبكر"))
-            type_same_or_stronger = type_rank.get(new_type, 9) <= type_rank.get(old_type, 9)
-            old_score = float(watch.get("score") or 0)
-            old_price = float(watch.get("price") or candidate.price)
-            price_move = abs(float(candidate.price) - old_price) / max(old_price, 1e-9) * 100
-            old_bq = float(watch.get("breakout_quality") or 0)
-            bq_ok = float(getattr(candidate, "breakout_quality", 0) or 0) >= max(0.0, old_bq - 5.0)
-            price_zone_ok = price_move <= 2.0
-            confirmation_ok = (
-                candidate.score >= max(INTRADAY_MIN_SCORE, old_score - 2)
-                and getattr(candidate, "live_ok", False)
-                and getattr(candidate, "above_open", False)
-                and "تحت" not in str(getattr(candidate, "vwap_day_note", ""))
-                and type_same_or_stronger
-                and bq_ok
-                and price_zone_ok
-            )
-            confirmed = age <= 20 and confirmation_ok
-
-        if not confirmed:
+        # scan_intraday already returns the composite-ranked winner first.
+        # Do not override the 16-strategy composite ranking here.
+        watch = state.setdefault("intraday_watch", None)
+        if watch:
+            watched_symbol = str(watch.get("symbol") or "")
+            confirmed = next((s for s in fresh if s.symbol == watched_symbol), None)
+            if confirmed is None:
+                # Candidate disappeared before confirmation: clear the watch.
+                state["intraday_watch"] = None
+                save_state(state)
+                return
+            sig = confirmed
+            state["intraday_watch"] = None
+        else:
+            candidate = fresh[0]
             state["intraday_watch"] = {
                 "symbol": candidate.symbol,
-                "score": candidate.score,
-                "price": candidate.price,
-                "entry_type": candidate.entry_type,
-                "breakout_quality": float(getattr(candidate, "breakout_quality", 0) or 0),
-                "buy_low": float(getattr(candidate, "buy_low", candidate.price)),
-                "buy_high": float(getattr(candidate, "buy_high", candidate.price)),
-                "at": now_iso,
+                "entry_type": getattr(candidate, "entry_type", ""),
+                "score": int(candidate.score),
+                "created_at": now_ny().isoformat(),
             }
             save_state(state)
+            log.info("INTRADAY WATCH: %s | %s | score=%s", candidate.symbol, getattr(candidate, "entry_type", ""), candidate.score)
             return
-
-        sig = candidate
-        state.pop("intraday_watch", None)
         state.setdefault("sent_intraday", []).append(sig.symbol)
         state.setdefault("scores_intraday", {})[sig.symbol] = sig.score
-        state.setdefault("intraday_alert_meta", {})[sig.symbol] = {
-            "score": sig.score,
-            "price": sig.price,
-            "entry_type": getattr(sig, "entry_type", ""),
-            "at": now_ny().isoformat(),
-        }
         state["last_sent_intraday_at"] = now_ny().isoformat()
         save_state(state)
         PERF_INTRA.add_signal(sig, source="auto_intraday")
@@ -981,7 +925,7 @@ async def live_scan_intraday_job(context: ContextTypes.DEFAULT_TYPE) -> None:
         header = (
             f"⚡ لحظي — الدفعة {slot}/{INTRADAY_MAX}\n"
             f"{session_label()}\n"
-            f"النوع: لحظي (ساعة + 15د + 5د) — Watch→Confirm\n"
+            f"النوع: لحظي (ساعة + 5د)\n"
             f"{getattr(sig, 'entry_emoji', '🟢')} {getattr(sig, 'entry_type', 'دخول')}\n"
             f"فاصل {INTRADAY_EVERY_MINUTES} د | يفضّل الخروج قبل الإغلاق"
         )
@@ -1041,6 +985,85 @@ async def daily_close_job(context: ContextTypes.DEFAULT_TYPE) -> None:
     save_reports(reports)
 
 
+async def monthly_learning_job(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """مراجعة التعلم الشاملة مرة واحدة شهريًا وإرسال تقرير Telegram."""
+    if not SUBSCRIBERS:
+        return
+
+    now = now_ny()
+    if now.day != 1:
+        return
+
+    reports = load_reports()
+    month_key = now.strftime("%Y-%m")
+    if reports.get("monthly_learning_sent_on") == month_key:
+        return
+
+    try:
+        result = await asyncio.to_thread(monthly_self_optimization)
+
+        status = result.get("status", "unknown")
+        samples = int(result.get("samples", 0))
+        generation = int(result.get("generation", 0))
+        regime = "مفعل" if result.get("regime_active") else "غير مفعل"
+        exit_active = "مفعل" if result.get("exit_active") else "غير مفعل"
+        reason = "مفعل" if result.get("reason_active") else "غير مفعل"
+        opportunity = "مفعل" if result.get("opportunity_active") else "غير مفعل"
+
+        if status in {"waiting", "waiting_oos"}:
+            body = (
+                "🧠 التقرير الشهري للتعلم\n\n"
+                f"📊 البيانات المتاحة: {samples} صفقة\n"
+                "⏳ لم تتوفر عينة كافية لاختبار OOS بأمان.\n"
+                "🔒 لم يتم تغيير أي سياسة.\n\n"
+                f"Regime: {regime}\n"
+                f"Exit: {exit_active}\n"
+                f"Reason: {reason}\n"
+                f"Opportunity: {opportunity}\n"
+                f"Policy: #{generation}"
+            )
+        elif status == "unchanged":
+            body = (
+                "🧠 التقرير الشهري للتعلم\n\n"
+                f"📊 الصفقات المحللة: {samples}\n"
+                "🔒 لم يتم اعتماد تغيير جديد.\n"
+                "النظام مستمر على أفضل Policy حالية.\n\n"
+                f"Regime: {regime}\n"
+                f"Exit: {exit_active}\n"
+                f"Reason: {reason}\n"
+                f"Opportunity: {opportunity}\n"
+                f"Policy: #{generation}"
+            )
+        else:
+            approved = bool(result.get("approved")) or status in {
+                "regime_or_exit_approved", "regime_approved"
+            }
+            decision = "✅ تم اعتماد تحسين" if approved else "🔒 لم يثبت التحسن — بدون تغيير"
+            body = (
+                "🧠 التقرير الشهري للتعلم\n\n"
+                f"📊 الصفقات المحللة: {samples}\n"
+                f"📈 OOS الحالي: {float(result.get('current_shadow_rate', 0))*100:.1f}%\n"
+                f"📈 المرشح: {float(result.get('candidate_shadow_rate', 0))*100:.1f}%\n"
+                f"🧠 Regime: {float(result.get('regime_shadow_rate', 0))*100:.1f}%\n"
+                f"🎯 Exit: {float(result.get('exit_shadow_rate', 0))*100:.1f}%\n"
+                f"🔎 Reason: {float(result.get('reason_shadow_rate', 0))*100:.1f}%\n\n"
+                f"{decision}\n"
+                f"Regime: {regime}\n"
+                f"Exit: {exit_active}\n"
+                f"Reason: {reason}\n"
+                f"Opportunity: {opportunity}\n"
+                f"Policy: #{generation}"
+            )
+
+        await broadcast(context.bot, body)
+        reports["monthly_learning_sent_on"] = month_key
+        save_reports(reports)
+        log.info("monthly learning report sent: %s", month_key)
+
+    except Exception as exc:
+        log.exception("monthly learning job: %s", exc)
+
+
 async def weekly_report_job(context: ContextTypes.DEFAULT_TYPE) -> None:
     if not SUBSCRIBERS or not is_friday_post_close():
         return
@@ -1055,7 +1078,7 @@ async def weekly_report_job(context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def perf_update_job(context: ContextTypes.DEFAULT_TYPE) -> None:
-    """متابعة الصفقات المفتوحة + إرسال تحديثات التعلم الذاتي مرة واحدة."""
+    """متابعة الصفقات المفتوحة (سوينغ + لحظي): وقف / أهداف."""
     try:
         prefer_intraday = is_us_regular_session()
 
@@ -1069,33 +1092,8 @@ async def perf_update_job(context: ContextTypes.DEFAULT_TYPE) -> None:
             return evs
 
         events = await asyncio.to_thread(_all_events)
-
-        # التعلم الذاتي يعمل بعد تسجيل نتائج الصفقات داخل PerformanceLog.
-        # نقرأ آخر نتيجة ونرسلها مرة واحدة فقط.
-        if SUBSCRIBERS:
-            try:
-                alert = get_learning_alert()
-                sent_key = None
-                if LEARNING_ALERT_SENT_FILE.exists():
-                    try:
-                        sent_key = json.loads(
-                            LEARNING_ALERT_SENT_FILE.read_text(encoding="utf-8")
-                        ).get("at")
-                    except Exception:
-                        sent_key = None
-
-                if alert and alert.get("message") and alert.get("at") != sent_key:
-                    await broadcast(context.bot, alert["message"])
-                    LEARNING_ALERT_SENT_FILE.write_text(
-                        json.dumps({"at": alert.get("at")}, ensure_ascii=False),
-                        encoding="utf-8",
-                    )
-            except Exception as exc:
-                log.warning("learning alert: %s", exc)
-
         if not events or not SUBSCRIBERS:
             return
-
         for ev in events:
             text = PerformanceLog.format_event_ar(ev)
             await broadcast(context.bot, text)
@@ -1141,6 +1139,11 @@ def build_app() -> Application:
         app.job_queue.run_repeating(perf_update_job, interval=180, first=90, name="perf")
         app.job_queue.run_repeating(daily_close_job, interval=300, first=40, name="daily-close")
         app.job_queue.run_repeating(weekly_report_job, interval=300, first=50, name="weekly")
+        app.job_queue.run_daily(
+            monthly_learning_job,
+            time=dt_time(17, 15, tzinfo=ZoneInfo("America/New_York")),
+            name="monthly-learning",
+        )
     return app
 
 

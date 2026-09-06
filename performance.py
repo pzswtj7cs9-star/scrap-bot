@@ -264,6 +264,9 @@ class PerformanceLog:
                                 kind,
                                 exit_price=price,
                                 note="تعلم لحظي: إغلاق كامل عند TP1" if kind == "tp1" else "",
+                                mfe_pct=row.get("mfe_pct"),
+                                mae_pct=row.get("mae_pct"),
+                                time_to_result_min=row.get("time_to_result_min"),
                             )
                             try:
                                 from analyzer_intraday import adaptive_retrain_if_ready
