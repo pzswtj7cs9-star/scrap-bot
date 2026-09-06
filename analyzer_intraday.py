@@ -29,17 +29,17 @@ SKIP_OPEN_MIN = 20
 SKIP_CLOSE_MIN = 20
 INTRADAY_MIN_SCORE = 82
 
-INTRADAY_LEARNING_FILE = Path("intraday_learning.jsonl")
+INTRADAY_LEARNING_FILE = Path("/var/data/intraday_learning.jsonl")
 LEARNING_MIN_SAMPLES = 20
 LEARNING_LOOKBACK = 60
 LEARNING_MAX_ADJUSTMENT = 4.0
-ADAPTIVE_POLICY_FILE = Path("intraday_adaptive_policy.json")
+ADAPTIVE_POLICY_FILE = Path("/var/data/intraday_adaptive_policy.json")
 ADAPTIVE_MIN_SAMPLES = 30
 ADAPTIVE_CONFIRM_SAMPLES = 40
 ADAPTIVE_MAX_CHANGE = 0.15
-ADAPTIVE_BEST_FILE = Path("intraday_adaptive_best.json")
-ADAPTIVE_SHADOW_FILE = Path("intraday_shadow_results.jsonl")
-LEARNING_ALERT_FILE = Path("intraday_learning_alert.json")
+ADAPTIVE_BEST_FILE = Path("/var/data/intraday_adaptive_best.json")
+ADAPTIVE_SHADOW_FILE = Path("/var/data/intraday_shadow_results.jsonl")
+LEARNING_ALERT_FILE = Path("/var/data/intraday_learning_alert.json")
 
 # Canonical list: the adaptive learner must track every real entry strategy.
 ENTRY_TYPES = (
