@@ -679,18 +679,13 @@ async def _run_scan_message_locked(target_message, symbols: list[str]) -> None:
     # Daily V2 scan API is (symbols, names, min_score, limit).
     # The previous main.py still used the old analyzer signature, which raised
     # a TypeError inside the Telegram handler and left /scan waiting forever.
-    try:
-        hits = await asyncio.to_thread(
-            scan_symbols,
-            symbols,
-            HALAL_STOCKS,
-            regime["min_score_adj"],
-            DAILY_MAX,
-        )
-    except Exception as exc:
-        log.exception("/scan failed")
-        await status.edit_text(f"❌ تعذر إكمال المسح اليومي: {type(exc).__name__}: {exc}")
-        return
+    hits = await asyncio.to_thread(
+        scan_symbols,
+        symbols,
+        HALAL_STOCKS,
+        regime["min_score_adj"],
+        DAILY_MAX,
+    )
     if not hits:
         await status.edit_text(
             f"لا يوجد تأكيد {regime['min_score_adj']}+ حاليًا.\n\n{today_summary()}"
@@ -699,7 +694,7 @@ async def _run_scan_message_locked(target_message, symbols: list[str]) -> None:
     skip_txt = ""
     await status.edit_text(f"أقوى {len(hits)} تأكيد:{skip_txt}")
     for i, sig in enumerate(hits, 1):
-        await target_message.reply_text(format_signal_ar(sig, regime["min_score_adj"], rank=i))
+        await target_message.reply_text(format_signal_ar(sig, regime["min_score_adj"]))
         path = await asyncio.to_thread(build_signal_chart, sig, CHART_DIR)
         if path and path.exists():
             with open(path, "rb") as f:
@@ -726,12 +721,7 @@ async def cmd_scan_intra(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             return scan_intraday(CORE_WATCHLIST, HALAL_STOCKS, INTRADAY_MIN_SCORE, 5)
         global LAST_INTRADAY_SCAN_ATTEMPT
         LAST_INTRADAY_SCAN_ATTEMPT = now_ny()
-        try:
-            hits = await asyncio.to_thread(_run)
-        except Exception as exc:
-            log.exception("/scani failed")
-            await msg.edit_text(f"❌ تعذر إكمال المسح اللحظي: {type(exc).__name__}: {exc}")
-            return
+        hits = await asyncio.to_thread(_run)
     if not hits:
         await msg.edit_text(
             f"لا مرشحين لحظيين الآن.\n{session_label()}\n"
@@ -825,17 +815,13 @@ async def live_scan_job(context: ContextTypes.DEFAULT_TYPE) -> None:
 
         # Daily V2 API: (symbols, names, min_score, limit).
         # Keep the automatic path aligned with the manual /scan command.
-        try:
-            hits = await asyncio.to_thread(
-                scan_symbols,
-                CORE_WATCHLIST,
-                HALAL_STOCKS,
-                effective_min,
-                DAILY_MAX,
-            )
-        except Exception:
-            log.exception("automatic daily scan failed")
-            return
+        hits = await asyncio.to_thread(
+            scan_symbols,
+            CORE_WATCHLIST,
+            HALAL_STOCKS,
+            effective_min,
+            DAILY_MAX,
+        )
         fresh = [
             s
             for s in hits
@@ -863,12 +849,10 @@ async def live_scan_job(context: ContextTypes.DEFAULT_TYPE) -> None:
             f"{regime_label()}\n"
             f"النوع: يومي V2 (أسبوعي + يومي + 4س) | التالي بعد {ALERT_EVERY_MINUTES} د"
         )
-        body = format_signal_ar(sig, effective_min, rank=slot)
-        sent_ok = False
+        body = format_signal_ar(sig, effective_min)
         for chat_id in list(SUBSCRIBERS):
             try:
                 await context.bot.send_message(chat_id=chat_id, text=header + "\n\n" + body)
-                sent_ok = True
                 path = await asyncio.to_thread(build_signal_chart, sig, CHART_DIR)
                 if path and path.exists():
                     with open(path, "rb") as f:
@@ -877,14 +861,6 @@ async def live_scan_job(context: ContextTypes.DEFAULT_TYPE) -> None:
                         )
             except Exception as exc:
                 log.warning("إرسال %s فشل: %s", chat_id, exc)
-
-        if not sent_ok:
-            # Do not consume an alert slot when Telegram rejected every delivery.
-            state["sent"] = [x for x in state["sent"] if x != sig.symbol]
-            state["scores"].pop(sig.symbol, None)
-            state["last_sent_at"] = None
-            save_state(state)
-            return
 
         if len(state["sent"]) >= DAILY_MAX:
             await broadcast(
@@ -931,17 +907,13 @@ async def live_scan_intraday_job(context: ContextTypes.DEFAULT_TYPE) -> None:
         if elapsed is not None and elapsed < INTRADAY_EVERY_MINUTES:
             return
 
-        try:
-            hits = await asyncio.to_thread(
-                scan_intraday,
-                CORE_WATCHLIST,
-                HALAL_STOCKS,
-                INTRADAY_MIN_SCORE,
-                10,
-            )
-        except Exception:
-            log.exception("automatic intraday scan failed")
-            return
+        hits = await asyncio.to_thread(
+            scan_intraday,
+            CORE_WATCHLIST,
+            HALAL_STOCKS,
+            INTRADAY_MIN_SCORE,
+            10,
+        )
         # يستبعد فقط ما أُرسل لحظياً اليوم (لا يمنع بسبب السوينغ)
         already = set(sent_i)
         fresh = [
@@ -971,20 +943,11 @@ async def live_scan_intraday_job(context: ContextTypes.DEFAULT_TYPE) -> None:
             f"فاصل {INTRADAY_EVERY_MINUTES} د | يفضّل الخروج قبل الإغلاق"
         )
         body = format_intraday_ar(sig, INTRADAY_MIN_SCORE)
-        sent_ok = False
         for chat_id in list(SUBSCRIBERS):
             try:
                 await context.bot.send_message(chat_id=chat_id, text=header + "\n\n" + body)
-                sent_ok = True
             except Exception as exc:
                 log.warning("إرسال لحظي %s فشل: %s", chat_id, exc)
-
-        if not sent_ok:
-            state["sent_intraday"] = [x for x in state.get("sent_intraday", []) if x != sig.symbol]
-            state.get("scores_intraday", {}).pop(sig.symbol, None)
-            state["last_sent_intraday_at"] = None
-            save_state(state)
-            return
 
 
 def build_daily_close_text() -> str:
