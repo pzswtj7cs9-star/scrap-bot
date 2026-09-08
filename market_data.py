@@ -17,7 +17,7 @@ APCA_KEY = os.getenv("APCA_API_KEY_ID", "").strip()
 APCA_SECRET = os.getenv("APCA_API_SECRET_KEY", "").strip()
 DATA_URL = os.getenv("APCA_DATA_URL", "https://data.alpaca.markets").rstrip("/")
 # auto = جرّب SIP ثم IEX تلقائيًا. إذا لم يكن SIP متاحًا يعود إلى IEX المجاني.
-APCA_FEED = os.getenv("APCA_FEED", "auto").strip().lower()
+APCA_FEED = os.getenv("APCA_FEED", "iex").strip().lower()
 SIP_RETRY_COOLDOWN_MIN = 15
 _SIP_DISABLED_UNTIL: datetime | None = None
 _LAST_ALPACA_FEED = "iex"
@@ -91,7 +91,7 @@ def _alpaca_request_bars(symbol: str, timeframe: str, start: datetime, end: date
         "feed": feed,
     }
     url = f"{DATA_URL}/v2/stocks/{symbol.upper()}/bars"
-    r = requests.get(url, headers=_alpaca_headers(), params=params, timeout=20)
+    r = requests.get(url, headers=_alpaca_headers(), params=params, timeout=10)
     if r.status_code >= 400:
         raise RuntimeError(f"Alpaca {r.status_code}: {r.text[:180]}")
     data = r.json() or {}
@@ -99,7 +99,7 @@ def _alpaca_request_bars(symbol: str, timeframe: str, start: datetime, end: date
     next_token = data.get("next_page_token")
     while next_token and len(bars) < limit:
         params["page_token"] = next_token
-        r = requests.get(url, headers=_alpaca_headers(), params=params, timeout=20)
+        r = requests.get(url, headers=_alpaca_headers(), params=params, timeout=10)
         if r.status_code >= 400:
             break
         data = r.json() or {}
@@ -230,14 +230,25 @@ def fetch_history(symbol: str, period: str = "1y") -> pd.DataFrame:
         raise
 
 
-def fetch_intraday(symbol: str, period: str = "5d", interval: str = "5m") -> pd.DataFrame:
-    """لحظي: يدعم 5m و 15m."""
-    days = 5
+def _period_days(period: str, default: int = 5) -> int:
+    p = str(period or "").strip().lower()
     try:
-        days = int(period.replace("d", ""))
+        if p.endswith("d"):
+            return max(1, int(p[:-1]))
+        if p.endswith("mo"):
+            return max(1, int(p[:-2]) * 31)
+        if p.endswith("y"):
+            return max(1, int(p[:-1]) * 365)
     except Exception:
-        days = 5
-    start = datetime.now(timezone.utc) - timedelta(days=max(days, 3))
+        pass
+    return default
+
+
+def fetch_intraday(symbol: str, period: str = "5d", interval: str = "5m") -> pd.DataFrame:
+    """Unified timeframe loader. Keeps the old API but now correctly supports
+    intraday + daily + weekly frames used by Daily V2."""
+    interval = str(interval or "5m")
+    period = str(period or "5d")
 
     tf_map = {
         "1m": "1Min",
@@ -246,8 +257,21 @@ def fetch_intraday(symbol: str, period: str = "5d", interval: str = "5m") -> pd.
         "60m": "1Hour",
         "1h": "1Hour",
         "1Hour": "1Hour",
+        "1d": "1Day",
+        "1D": "1Day",
+        "1wk": "1Week",
+        "1w": "1Week",
+        "1Week": "1Week",
     }
     alpaca_tf = tf_map.get(interval, "5Min")
+    days = _period_days(period, 5)
+    # Intraday needs a little calendar buffer for weekends/holidays;
+    # daily/weekly use the requested lookback directly.
+    if alpaca_tf in {"1Min", "5Min", "15Min", "1Hour"}:
+        lookback_days = max(days + 3, 3)
+    else:
+        lookback_days = max(days + 5, 10)
+    start = datetime.now(timezone.utc) - timedelta(days=lookback_days)
 
     if alpaca_configured():
         try:

@@ -1359,7 +1359,7 @@ def _market_alignment(fetch_intraday) -> tuple[bool, str]:
     states = []
     for sym in ("SPY", "QQQ"):
         try:
-            d = fetch_daily(sym, interval="1d", period="6mo")
+            d = fetch_intraday(sym, interval="1d", period="6mo")
             if d is None or len(d) < 50:
                 states.append(None)
                 continue
@@ -2587,6 +2587,21 @@ def scan_daily(
             if not sig: continue
             if sig.score < min_score or not sig.live_ok or not sig.quality_ok: continue
             if sig.news_state == "negative": continue
+            # Validate current bid/ask only for the Stage-2 finalists.
+            # This keeps the full-universe scan fast while preventing Daily V2
+            # from reporting a false "liquidity suitable" result.
+            try:
+                liq = _quote_liquidity(sig.symbol, sig.price)
+                sig.spread_pct = round(float(liq.get("spread_pct", 0) or 0), 3)
+                sig.expected_slippage_pct = round(float(liq.get("slippage_pct", 0) or 0), 3)
+                sig.dollar_volume_3m = round(float(liq.get("dollar_volume", 0) or 0), 0)
+                sig.liquidity_ok = bool(liq.get("ok", False))
+                if not sig.liquidity_ok:
+                    continue
+                if liq.get("quote_source") == "none" or float(liq.get("quote_age_min", 999) or 999) > 2.0:
+                    continue
+            except Exception:
+                continue
             results.append(sig)
     rank={et:i for i,et in enumerate(ENTRY_TYPES)}
     results.sort(key=lambda x:(
@@ -2607,5 +2622,5 @@ scan_daily.last_window = ""
 analyze = analyze_daily
 format_signal_ar = format_daily_ar
 scan_symbols = scan_daily
-rank_all = lambda symbols, names: scan_daily(symbols, names, DAILY_MIN_SCORE, max(10, len(symbols)))
+rank_all = lambda symbols, names: scan_daily(symbols, names, DAILY_MIN_SCORE, 5)
 

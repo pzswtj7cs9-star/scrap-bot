@@ -165,6 +165,9 @@ def save_state(state: dict) -> None:
 SUBSCRIBERS = load_subs()
 _scan_lock = asyncio.Lock()
 _intra_scan_lock = asyncio.Lock()
+LAST_DAILY_SCAN_ATTEMPT: datetime | None = None
+LAST_INTRADAY_SCAN_ATTEMPT: datetime | None = None
+SCAN_RETRY_MINUTES = int(os.getenv("SCAN_RETRY_MINUTES", "5"))
 
 
 def load_reports() -> dict:
@@ -658,36 +661,37 @@ async def run_scan_message(target_message, symbols: list[str]) -> None:
     if not is_us_trading_day():
         await target_message.reply_text(session_label())
         return
+    if _scan_lock.locked():
+        await target_message.reply_text("⏳ يوجد مسح يومي جارٍ الآن؛ انتظر نتيجته بدل بدء مسح موازٍ.")
+        return
+    async with _scan_lock:
+        await _run_scan_message_locked(target_message, symbols)
+
+
+async def _run_scan_message_locked(target_message, symbols: list[str]) -> None:
+    global LAST_DAILY_SCAN_ATTEMPT
+    LAST_DAILY_SCAN_ATTEMPT = now_ny()
     regime = await asyncio.to_thread(get_market_regime, "SPY")
     status = await target_message.reply_text(
         f"{session_label()}\n{regime_label()}\n"
         f"جاري الترتيب (حد {regime['min_score_adj']} + بدون إعلانات قريبة)..."
     )
+    # Daily V2 scan API is (symbols, names, min_score, limit).
+    # The previous main.py still used the old analyzer signature, which raised
+    # a TypeError inside the Telegram handler and left /scan waiting forever.
     hits = await asyncio.to_thread(
         scan_symbols,
         symbols,
         HALAL_STOCKS,
         regime["min_score_adj"],
-        True,
         DAILY_MAX,
-        True,
-        EARNINGS_DAYS,
     )
-    skipped = getattr(scan_symbols, "last_skipped_earnings", [])
     if not hits:
-        ranked = await asyncio.to_thread(rank_all, symbols, HALAL_STOCKS)
-        top = ranked[:5]
-        extra = ""
-        if top:
-            extra = "\n\nأقرب المرشحين:"
-            for i, s in enumerate(top, 1):
-                extra += f"\n{i}. {s.symbol} {s.score}/100"
-        skip_txt = f"\nتم استبعاد قرب أرباح: {', '.join(skipped)}" if skipped else ""
         await status.edit_text(
-            f"لا يوجد تأكيد {regime['min_score_adj']}+ مع لحظة حالياً.{skip_txt}{extra}\n\n{today_summary()}"
+            f"لا يوجد تأكيد {regime['min_score_adj']}+ حاليًا.\n\n{today_summary()}"
         )
         return
-    skip_txt = f"\n(استُبعد قرب أرباح: {', '.join(skipped)})" if skipped else ""
+    skip_txt = ""
     await status.edit_text(f"أقوى {len(hits)} تأكيد:{skip_txt}")
     for i, sig in enumerate(hits, 1):
         await target_message.reply_text(format_signal_ar(sig, regime["min_score_adj"], rank=i))
@@ -709,10 +713,15 @@ async def cmd_scan_intra(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await msg.edit_text(f"خارج نافذة اللحظي الآن.\n{reason}")
         return
 
-    def _run():
-        return scan_intraday(CORE_WATCHLIST, HALAL_STOCKS, INTRADAY_MIN_SCORE, 5)
-
-    hits = await asyncio.to_thread(_run)
+    if _intra_scan_lock.locked():
+        await msg.edit_text("⏳ يوجد مسح لحظي جارٍ الآن؛ انتظر نتيجته بدل بدء مسح موازٍ.")
+        return
+    async with _intra_scan_lock:
+        def _run():
+            return scan_intraday(CORE_WATCHLIST, HALAL_STOCKS, INTRADAY_MIN_SCORE, 5)
+        global LAST_INTRADAY_SCAN_ATTEMPT
+        LAST_INTRADAY_SCAN_ATTEMPT = now_ny()
+        hits = await asyncio.to_thread(_run)
     if not hits:
         await msg.edit_text(
             f"لا مرشحين لحظيين الآن.\n{session_label()}\n"
@@ -779,8 +788,14 @@ async def live_scan_job(context: ContextTypes.DEFAULT_TYPE) -> None:
         return
     if _scan_lock.locked():
         return
+    global LAST_DAILY_SCAN_ATTEMPT
+    if LAST_DAILY_SCAN_ATTEMPT is not None:
+        elapsed_attempt = (now_ny() - LAST_DAILY_SCAN_ATTEMPT).total_seconds() / 60.0
+        if elapsed_attempt < SCAN_RETRY_MINUTES:
+            return
 
     async with _scan_lock:
+        LAST_DAILY_SCAN_ATTEMPT = now_ny()
         # ---- فلتر نظام السوق ----
         regime = await asyncio.to_thread(get_market_regime, "SPY")
         if not regime.get("allow_auto", True):
@@ -798,15 +813,14 @@ async def live_scan_job(context: ContextTypes.DEFAULT_TYPE) -> None:
         if elapsed is not None and elapsed < ALERT_EVERY_MINUTES:
             return
 
+        # Daily V2 API: (symbols, names, min_score, limit).
+        # Keep the automatic path aligned with the manual /scan command.
         hits = await asyncio.to_thread(
             scan_symbols,
             CORE_WATCHLIST,
             HALAL_STOCKS,
             effective_min,
-            True,
-            12,
-            True,
-            EARNINGS_DAYS,
+            DAILY_MAX,
         )
         fresh = [
             s
@@ -877,8 +891,14 @@ async def live_scan_intraday_job(context: ContextTypes.DEFAULT_TYPE) -> None:
         return
     if _intra_scan_lock.locked():
         return
+    global LAST_INTRADAY_SCAN_ATTEMPT
+    if LAST_INTRADAY_SCAN_ATTEMPT is not None:
+        elapsed_attempt = (now_ny() - LAST_INTRADAY_SCAN_ATTEMPT).total_seconds() / 60.0
+        if elapsed_attempt < SCAN_RETRY_MINUTES:
+            return
 
     async with _intra_scan_lock:
+        LAST_INTRADAY_SCAN_ATTEMPT = now_ny()
         state = load_state()
         sent_i = list(state.get("sent_intraday") or [])
         if len(sent_i) >= INTRADAY_MAX:
