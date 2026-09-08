@@ -32,7 +32,7 @@ from telegram.ext import (
     filters,
 )
 
-from analyzer import analyze, format_signal_ar, rank_all, scan_symbols
+from analyzer import analyze, format_signal_ar, rank_all, scan_symbols, register_daily_signal
 from analyzer_intraday import (
     INTRADAY_MIN_SCORE,
     analyze_intraday,
@@ -50,6 +50,7 @@ from market import (
     is_friday_post_close,
     is_post_close_window,
     is_us_regular_session,
+    is_us_trading_day,
     now_ny,
     regime_label,
     session_label,
@@ -74,7 +75,7 @@ MIN_SCORE = int(os.getenv("MIN_SCORE", "84"))
 DAILY_MAX = int(os.getenv("DAILY_MAX_ALERTS", "5"))
 ALERT_EVERY_MINUTES = int(os.getenv("ALERT_EVERY_MINUTES", "90"))
 INTRADAY_MAX = int(os.getenv("INTRADAY_MAX_ALERTS", "3"))
-INTRADAY_EVERY_MINUTES = int(os.getenv("INTRADAY_EVERY_MINUTES", "40"))
+INTRADAY_EVERY_MINUTES = int(os.getenv("INTRADAY_EVERY_MINUTES", "120"))
 LIVE_SCAN_SECONDS = int(os.getenv("LIVE_SCAN_SECONDS", "60"))
 EARNINGS_DAYS = int(os.getenv("EARNINGS_DAYS", "2"))
 COOLDOWN_DAYS = int(os.getenv("COOLDOWN_DAYS", "5"))
@@ -366,6 +367,11 @@ def today_summary() -> str:
 
 async def send_signal_with_chart(chat_id: int, bot, sig, header: str, source: str = "manual") -> None:
     PERF.add_signal(sig, source=source)
+    if getattr(sig, "mode", "") == "daily":
+        try:
+            register_daily_signal(sig)
+        except Exception as exc:
+            log.warning("تعذر تسجيل التعلم اليومي %s: %s", sig.symbol, exc)
     text = header + "\n\n" + format_signal_ar(sig, MIN_SCORE)
     try:
         near, edt = await asyncio.to_thread(is_near_earnings, sig.symbol, EARNINGS_DAYS)
@@ -612,7 +618,7 @@ async def analyze_and_reply(update: Update, symbol: str) -> None:
     if not symbol.isalnum() or len(symbol) > 6:
         await update.message.reply_text("رمز غير صالح. مثال: NVDA")
         return
-    msg = await update.message.reply_text(f"جاري التحليل اللحظي لـ {symbol}...")
+    msg = await update.message.reply_text(f"جاري التحليل اليومي لـ {symbol}...")
     try:
         extra = ""
         if not is_known_halal(symbol):
@@ -649,6 +655,9 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def run_scan_message(target_message, symbols: list[str]) -> None:
+    if not is_us_trading_day():
+        await target_message.reply_text(session_label())
+        return
     regime = await asyncio.to_thread(get_market_regime, "SPY")
     status = await target_message.reply_text(
         f"{session_label()}\n{regime_label()}\n"
@@ -814,13 +823,17 @@ async def live_scan_job(context: ContextTypes.DEFAULT_TYPE) -> None:
         save_state(state)
         COOL.mark(sig.symbol)
         PERF.add_signal(sig, source="auto")
+        try:
+            register_daily_signal(sig)
+        except Exception as exc:
+            log.warning("تعذر تسجيل إشارة التعلم اليومي %s: %s", sig.symbol, exc)
 
         slot = len(state["sent"])
         header = (
             f"🔔 سوينغ/يومي — الدفعة {slot}/{DAILY_MAX}\n"
             f"{session_label()}\n"
             f"{regime_label()}\n"
-            f"النوع: سوينغ (إطار يومي) | التالي بعد {ALERT_EVERY_MINUTES} د"
+            f"النوع: يومي V2 (أسبوعي + يومي + 4س) | التالي بعد {ALERT_EVERY_MINUTES} د"
         )
         body = format_signal_ar(sig, effective_min, rank=slot)
         for chat_id in list(SUBSCRIBERS):
@@ -891,30 +904,10 @@ async def live_scan_intraday_job(context: ContextTypes.DEFAULT_TYPE) -> None:
         if not fresh:
             return
 
-        # scan_intraday already returns the composite-ranked winner first.
-        # Do not override the 16-strategy composite ranking here.
-        watch = state.setdefault("intraday_watch", None)
-        if watch:
-            watched_symbol = str(watch.get("symbol") or "")
-            confirmed = next((s for s in fresh if s.symbol == watched_symbol), None)
-            if confirmed is None:
-                # Candidate disappeared before confirmation: clear the watch.
-                state["intraday_watch"] = None
-                save_state(state)
-                return
-            sig = confirmed
-            state["intraday_watch"] = None
-        else:
-            candidate = fresh[0]
-            state["intraday_watch"] = {
-                "symbol": candidate.symbol,
-                "entry_type": getattr(candidate, "entry_type", ""),
-                "score": int(candidate.score),
-                "created_at": now_ny().isoformat(),
-            }
-            save_state(state)
-            log.info("INTRADAY WATCH: %s | %s | score=%s", candidate.symbol, getattr(candidate, "entry_type", ""), candidate.score)
-            return
+        # تفضيل: اختراق مؤكد ثم إعادة اختبار ثم دخول مبكر
+        rank = {"اختراق مؤكد": 0, "إعادة اختبار": 1, "دخول مبكر": 2}
+        fresh.sort(key=lambda s: (rank.get(getattr(s, "entry_type", ""), 9), -s.score))
+        sig = fresh[0]
         state.setdefault("sent_intraday", []).append(sig.symbol)
         state.setdefault("scores_intraday", {})[sig.symbol] = sig.score
         state["last_sent_intraday_at"] = now_ny().isoformat()
@@ -1001,6 +994,12 @@ async def monthly_learning_job(context: ContextTypes.DEFAULT_TYPE) -> None:
 
     try:
         result = await asyncio.to_thread(monthly_self_optimization)
+        try:
+            from analyzer import monthly_self_optimization as daily_monthly_self_optimization
+            daily_v2_result = await asyncio.to_thread(daily_monthly_self_optimization)
+        except Exception as exc:
+            log.warning("daily V2 monthly optimization failed: %s", exc)
+            daily_v2_result = {"status": "error", "samples": 0, "generation": 0}
 
         status = result.get("status", "unknown")
         samples = int(result.get("samples", 0))
@@ -1008,7 +1007,6 @@ async def monthly_learning_job(context: ContextTypes.DEFAULT_TYPE) -> None:
         regime = "مفعل" if result.get("regime_active") else "غير مفعل"
         exit_active = "مفعل" if result.get("exit_active") else "غير مفعل"
         reason = "مفعل" if result.get("reason_active") else "غير مفعل"
-        opportunity = "مفعل" if result.get("opportunity_active") else "غير مفعل"
 
         if status in {"waiting", "waiting_oos"}:
             body = (
@@ -1019,7 +1017,6 @@ async def monthly_learning_job(context: ContextTypes.DEFAULT_TYPE) -> None:
                 f"Regime: {regime}\n"
                 f"Exit: {exit_active}\n"
                 f"Reason: {reason}\n"
-                f"Opportunity: {opportunity}\n"
                 f"Policy: #{generation}"
             )
         elif status == "unchanged":
@@ -1031,7 +1028,6 @@ async def monthly_learning_job(context: ContextTypes.DEFAULT_TYPE) -> None:
                 f"Regime: {regime}\n"
                 f"Exit: {exit_active}\n"
                 f"Reason: {reason}\n"
-                f"Opportunity: {opportunity}\n"
                 f"Policy: #{generation}"
             )
         else:
@@ -1051,10 +1047,18 @@ async def monthly_learning_job(context: ContextTypes.DEFAULT_TYPE) -> None:
                 f"Regime: {regime}\n"
                 f"Exit: {exit_active}\n"
                 f"Reason: {reason}\n"
-                f"Opportunity: {opportunity}\n"
                 f"Policy: #{generation}"
             )
 
+        daily_line = (
+            "\n\n🌆 Daily V2: "
+            f"{int(daily_v2_result.get('samples', 0))} صفقة | "
+            f"OOS {float(daily_v2_result.get('current_shadow_rate', 0))*100:.1f}% → "
+            f"{float(daily_v2_result.get('candidate_shadow_rate', 0))*100:.1f}% | "
+            f"Policy #{int(daily_v2_result.get('generation', 0))} | "
+            f"{'تم الاعتماد' if daily_v2_result.get('approved') else 'بدون تغيير'}"
+        )
+        body += daily_line
         await broadcast(context.bot, body)
         reports["monthly_learning_sent_on"] = month_key
         save_reports(reports)

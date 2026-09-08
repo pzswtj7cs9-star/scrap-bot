@@ -253,29 +253,41 @@ class PerformanceLog:
                         except Exception:
                             pass
 
-                    # التعلم الجديد للحظي فقط.
-                    # TP1 = نجاح لأن الاستراتيجية تغلق كامل المركز عند TP1.
+                    # التعلم الذاتي: مستقل للحظي واليومي، وكل مسار يقرأ سجله الخاص.
                     if row_mode == "intraday" and kind in {"tp1", "stop", "timeout"}:
                         try:
                             from analyzer_intraday import record_intraday_outcome
                             record_intraday_outcome(
-                                row.get("learning_id"),
-                                symbol,
-                                kind,
-                                exit_price=price,
+                                row.get("learning_id"), symbol, kind, exit_price=price,
                                 note="تعلم لحظي: إغلاق كامل عند TP1" if kind == "tp1" else "",
-                                mfe_pct=row.get("mfe_pct"),
-                                mae_pct=row.get("mae_pct"),
+                                mfe_pct=row.get("mfe_pct"), mae_pct=row.get("mae_pct"),
                                 time_to_result_min=row.get("time_to_result_min"),
                             )
                             try:
                                 from analyzer_intraday import adaptive_retrain_if_ready
                                 retrain_result = adaptive_retrain_if_ready()
-                                log.info("التعلم الذاتي: %s", retrain_result.get("message", ""))
+                                log.info("التعلم الذاتي اللحظي: %s", retrain_result.get("message", ""))
                             except Exception as exc:
                                 log.warning("تعذر تحديث التعلم الذاتي للحظي %s: %s", symbol, exc)
                         except Exception as exc:
                             log.warning("تعذر حفظ نتيجة تعلم اللحظي %s: %s", symbol, exc)
+                    elif row_mode in {"daily", "swing"} and kind in {"tp1", "stop", "timeout"}:
+                        try:
+                            from analyzer import record_daily_outcome
+                            record_daily_outcome(
+                                row.get("learning_id"), symbol, kind, exit_price=price,
+                                note="تعلم يومي: وصول TP1" if kind == "tp1" else "",
+                                mfe_pct=row.get("mfe_pct"), mae_pct=row.get("mae_pct"),
+                                time_to_result_min=row.get("time_to_result_min"),
+                            )
+                            try:
+                                from analyzer import adaptive_retrain_if_ready
+                                retrain_result = adaptive_retrain_if_ready()
+                                log.info("التعلم الذاتي اليومي: %s", retrain_result.get("message", ""))
+                            except Exception as exc:
+                                log.warning("تعذر تحديث التعلم الذاتي اليومي %s: %s", symbol, exc)
+                        except Exception as exc:
+                            log.warning("تعذر حفظ نتيجة تعلم اليومي %s: %s", symbol, exc)
 
                 return {
                     "symbol": symbol,
