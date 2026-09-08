@@ -831,6 +831,34 @@ async def live_scan_job(context: ContextTypes.DEFAULT_TYPE) -> None:
             return
 
         sig = fresh[0]
+        # لا نسجل الإشارة كـ"مُرسلة" قبل نجاح Telegram فعلياً.
+        # هذا يمنع ضياع التنبيه إذا فشل الإرسال.
+        slot = len(state["sent"]) + 1
+        header = (
+            f"🔔 سوينغ/يومي — الدفعة {slot}/{DAILY_MAX}\n"
+            f"{session_label()}\n"
+            f"{regime_label()}\n"
+            f"النوع: يومي V2 (أسبوعي + يومي + 4س) | التالي بعد {ALERT_EVERY_MINUTES} د"
+        )
+        body = format_signal_ar(sig, effective_min)
+        delivered = False
+        for chat_id in list(SUBSCRIBERS):
+            try:
+                await context.bot.send_message(chat_id=chat_id, text=header + "\n\n" + body)
+                delivered = True
+                path = await asyncio.to_thread(build_signal_chart, sig, CHART_DIR)
+                if path and path.exists():
+                    with open(path, "rb") as f:
+                        await context.bot.send_photo(
+                            chat_id=chat_id, photo=InputFile(f, filename=path.name)
+                        )
+            except Exception as exc:
+                log.warning("إرسال %s فشل: %s", chat_id, exc)
+
+        if not delivered:
+            log.warning("لم يُرسل التنبيه اليومي %s لأي مشترك؛ لن يُحسب ضمن الحصة", sig.symbol)
+            return
+
         state["sent"].append(sig.symbol)
         state["scores"][sig.symbol] = sig.score
         state["last_sent_at"] = now_ny().isoformat()
@@ -841,26 +869,6 @@ async def live_scan_job(context: ContextTypes.DEFAULT_TYPE) -> None:
             register_daily_signal(sig)
         except Exception as exc:
             log.warning("تعذر تسجيل إشارة التعلم اليومي %s: %s", sig.symbol, exc)
-
-        slot = len(state["sent"])
-        header = (
-            f"🔔 سوينغ/يومي — الدفعة {slot}/{DAILY_MAX}\n"
-            f"{session_label()}\n"
-            f"{regime_label()}\n"
-            f"النوع: يومي V2 (أسبوعي + يومي + 4س) | التالي بعد {ALERT_EVERY_MINUTES} د"
-        )
-        body = format_signal_ar(sig, effective_min)
-        for chat_id in list(SUBSCRIBERS):
-            try:
-                await context.bot.send_message(chat_id=chat_id, text=header + "\n\n" + body)
-                path = await asyncio.to_thread(build_signal_chart, sig, CHART_DIR)
-                if path and path.exists():
-                    with open(path, "rb") as f:
-                        await context.bot.send_photo(
-                            chat_id=chat_id, photo=InputFile(f, filename=path.name)
-                        )
-            except Exception as exc:
-                log.warning("إرسال %s فشل: %s", chat_id, exc)
 
         if len(state["sent"]) >= DAILY_MAX:
             await broadcast(
@@ -928,13 +936,8 @@ async def live_scan_intraday_job(context: ContextTypes.DEFAULT_TYPE) -> None:
         rank = {"اختراق مؤكد": 0, "إعادة اختبار": 1, "دخول مبكر": 2}
         fresh.sort(key=lambda s: (rank.get(getattr(s, "entry_type", ""), 9), -s.score))
         sig = fresh[0]
-        state.setdefault("sent_intraday", []).append(sig.symbol)
-        state.setdefault("scores_intraday", {})[sig.symbol] = sig.score
-        state["last_sent_intraday_at"] = now_ny().isoformat()
-        save_state(state)
-        PERF_INTRA.add_signal(sig, source="auto_intraday")
-
-        slot = len(state["sent_intraday"])
+        # لا نسجل الإشارة كـ"مُرسلة" قبل نجاح Telegram فعلياً.
+        slot = len(state.get("sent_intraday") or []) + 1
         header = (
             f"⚡ لحظي — الدفعة {slot}/{INTRADAY_MAX}\n"
             f"{session_label()}\n"
@@ -943,11 +946,23 @@ async def live_scan_intraday_job(context: ContextTypes.DEFAULT_TYPE) -> None:
             f"فاصل {INTRADAY_EVERY_MINUTES} د | يفضّل الخروج قبل الإغلاق"
         )
         body = format_intraday_ar(sig, INTRADAY_MIN_SCORE)
+        delivered = False
         for chat_id in list(SUBSCRIBERS):
             try:
                 await context.bot.send_message(chat_id=chat_id, text=header + "\n\n" + body)
+                delivered = True
             except Exception as exc:
                 log.warning("إرسال لحظي %s فشل: %s", chat_id, exc)
+
+        if not delivered:
+            log.warning("لم يُرسل التنبيه اللحظي %s لأي مشترك؛ لن يُحسب ضمن الحصة", sig.symbol)
+            return
+
+        state.setdefault("sent_intraday", []).append(sig.symbol)
+        state.setdefault("scores_intraday", {})[sig.symbol] = sig.score
+        state["last_sent_intraday_at"] = now_ny().isoformat()
+        save_state(state)
+        PERF_INTRA.add_signal(sig, source="auto_intraday")
 
 
 def build_daily_close_text() -> str:
