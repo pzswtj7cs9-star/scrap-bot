@@ -153,6 +153,9 @@ class DailySignal:
     liquidity_ok: bool = True
 
 
+
+# Backward-compatible name used by charting.py/performance.py.
+SignalResult = DailySignal
 def _read_learning_records() -> list[dict]:
     if not DAILY_LEARNING_FILE.exists():
         return []
