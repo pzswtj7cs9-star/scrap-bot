@@ -15,7 +15,6 @@ from pathlib import Path
 from typing import Optional
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import json
-import logging
 import os
 import urllib.parse
 import urllib.request
@@ -23,10 +22,8 @@ import urllib.request
 import numpy as np
 import pandas as pd
 
-from market import now_ny, REGULAR_OPEN, REGULAR_CLOSE, is_us_regular_session, session_label
+from market import now_ny, REGULAR_OPEN, REGULAR_CLOSE
 from stocks import MAX_AUTO_PRICE
-
-log = logging.getLogger("halal-bot.intraday")
 
 SKIP_OPEN_MIN = 20
 SKIP_CLOSE_MIN = 20
@@ -139,6 +136,8 @@ class IntradaySignal:
     sma20: float = 0.0
     atr_pct: float = 0.0
     ext_sma20: float = 0.0
+    # سعر الدخول الفعلي وقت إرسال التنبيه؛ لا يغيّر سعر التحليل الأصلي
+    alert_entry_price: float = 0.0
     m15_state: str = "محايد"
     learning_adjustment: float = 0.0
     resistance_tp1: float = 0.0
@@ -1117,7 +1116,8 @@ def register_intraday_signal(sig: IntradaySignal) -> str:
             "signal_id": signal_id,
             "created_at": datetime.now(timezone.utc).isoformat(),
             "symbol": sig.symbol,
-            "entry": round(float(sig.price), 4),
+            "entry": round(float(getattr(sig, "alert_entry_price", 0.0) or sig.price), 4),
+            "analysis_price": round(float(sig.price), 4),
             "stop_loss": round(float(sig.stop_loss), 4),
             "tp1": round(float(sig.tp1), 4),
             "score": int(sig.score),
@@ -1390,8 +1390,6 @@ def _market_alignment(fetch_intraday) -> tuple[bool, str]:
 
 def session_window_ok(dt=None) -> tuple[bool, str]:
     dt = dt or now_ny()
-    if not is_us_regular_session(dt):
-        return False, session_label(dt)
     t = dt.time()
     open_ok_after = time(9, 50)
     close_cut = time(15, 40)
@@ -1530,6 +1528,28 @@ def _quote_liquidity(symbol: str, price: float) -> dict:
         pass
     _QUOTE_CACHE[symbol] = (now, result)
     return result
+
+
+def get_live_entry_price(symbol: str) -> float:
+    """يأخذ سعرًا لحظيًا واحدًا وقت الإرسال من Alpaca (متوسط Bid/Ask).
+    مستقل عن سعر التحليل ولا يعيد حساب الوقف أو الأهداف.
+    """
+    try:
+        from market_data import fetch_latest_quote, data_age_minutes
+        q = fetch_latest_quote(symbol)
+        bid = float(q.get("bid") or 0)
+        ask = float(q.get("ask") or 0)
+        if bid <= 0 or ask <= 0 or ask < bid:
+            return 0.0
+        ts = q.get("timestamp")
+        if ts:
+            mid = (bid + ask) / 2.0
+            qdf = pd.DataFrame({"Close": [mid]}, index=[pd.Timestamp(ts)])
+            if data_age_minutes(qdf) > 2.0:
+                return 0.0
+        return round((bid + ask) / 2.0, 4)
+    except Exception:
+        return 0.0
 
 
 def analyze_intraday(
@@ -2482,7 +2502,7 @@ def format_intraday_ar(sig: IntradaySignal, min_score: int = INTRADAY_MIN_SCORE)
         f"{sig.entry_emoji} نوع الدخول: {sig.entry_type}",
         f"{sig.name}",
         "—————————————",
-        f"السعر: {sig.price:.2f} $  ({arrow} {sig.change_pct:+.2f}%)",
+        f"السعر: {(getattr(sig, 'alert_entry_price', 0.0) or sig.price):.2f} $  ({arrow} {sig.change_pct:+.2f}%)",
         f"شراء: {sig.buy_low:.2f} — {sig.buy_high:.2f}",
         f"وقف: {sig.stop_loss:.2f} ({sig.sl_method}) | مخاطرة {sig.risk_pct:.2f}%",
         f"TP1: {sig.tp1:.2f} | TP2: {sig.tp2:.2f} | TP3: {sig.tp3:.2f}",
@@ -2576,36 +2596,6 @@ def _prefilter_intraday(symbol: str) -> tuple[float, pd.DataFrame, pd.DataFrame]
         return None
 
 
-
-def _prefilter_intraday_from_frames(symbol: str, h1: pd.DataFrame, m5: pd.DataFrame) -> tuple[float, pd.DataFrame, pd.DataFrame] | None:
-    """Run the existing Stage-1 logic on already downloaded bars."""
-    try:
-        if h1 is None or m5 is None or len(h1) < 40 or len(m5) < 30:
-            return None
-        last_day = m5.index[-1].date(); today = m5[m5.index.date == last_day]
-        if len(today) < 6:
-            return None
-        price = float(today["Close"].iloc[-1])
-        if price <= 0 or price > float(MAX_AUTO_PRICE):
-            return None
-        hc = h1["Close"]; e20 = float(_ema(hc,20).iloc[-1]); e50 = float(_ema(hc,50).iloc[-1])
-        h_rsi = float(_rsi(hc,14).iloc[-1]); trend = price > e20 > e50 * 0.998 and h_rsi >= 45
-        vwap_s = _vwap(today); vwap = float(vwap_s.iloc[-1]) if pd.notna(vwap_s.iloc[-1]) else price
-        vwap_dist = (price-vwap)/max(vwap,1e-9)*100; above_vwap = price >= vwap*0.996
-        above_open = price >= float(today["Open"].iloc[0])*0.997
-        last_green = float(today["Close"].iloc[-1]) >= float(today["Open"].iloc[-1])
-        c5=today["Close"]; mom=(price-float(c5.iloc[-6]))/max(float(c5.iloc[-6]),1e-9)*100
-        r5=float(_rsi(c5,14).iloc[-1]); hist=m5[m5.index.date<last_day].tail(120)
-        avg_today=float(today["Volume"].mean()); avg_hist=float(hist["Volume"].mean()) if not hist.empty else float(m5["Volume"].tail(60).mean() or 1)
-        vol_ratio=avg_today/avg_hist if avg_hist else 1.0
-        route=(3.0 if trend else 0.0)+(2.0 if above_vwap else 0.0)+(1.5 if above_open else 0.0)
-        route += min(2.0,max(0.0,mom))+min(2.0,max(0.0,vol_ratio-0.75)*2.0)-max(0.0,vwap_dist-3.0)*0.5-(1.0 if r5>=82 else 0.0)
-        if not trend and not above_vwap and mom <= 0 or vol_ratio < 0.65:
-            return None
-        return route,h1,m5
-    except Exception:
-        return None
-
 def scan_intraday(
     symbols: list[str],
     names: dict,
@@ -2631,39 +2621,18 @@ def scan_intraday(
 
     log.info("INTRADAY SCAN: %d symbols loaded", len(symbols))
 
-    # Stage 1 — batch H1 + 5m for the full universe. This replaces ~400
-    # per-symbol HTTP requests with a handful of multi-symbol requests.
-    try:
-        from market_data import fetch_alpaca_bars_multi, alpaca_configured
-        if alpaca_configured():
-            now_utc = datetime.now(timezone.utc)
-            h1_map = fetch_alpaca_bars_multi(symbols, "1Hour", now_utc - timedelta(days=13), now_utc)
-            m5_map = fetch_alpaca_bars_multi(symbols, "5Min", now_utc - timedelta(days=7), now_utc)
-            for sym in symbols:
-                h1 = h1_map.get(str(sym).upper()); m5 = m5_map.get(str(sym).upper())
-                if h1 is None or m5 is None:
-                    continue
-                ok_h1, _ = intraday_data_fresh(h1, "60m", 90)
-                ok_m5, _ = intraday_data_fresh(m5, "5m", 12)
-                if not ok_h1 or not ok_m5 or len(h1) < 40 or len(m5) < 30:
-                    continue
-                item = _prefilter_intraday_from_frames(sym, h1, m5)
-                if item:
-                    route_score, h1, m5 = item
-                    stage1.append((route_score, sym, h1, m5))
-        else:
-            raise RuntimeError("Alpaca not configured")
-    except Exception as exc:
-        log.warning("Intraday batch scan unavailable; using per-symbol fallback: %s", exc)
-        with ThreadPoolExecutor(max_workers=workers) as pool:
-            futures = {pool.submit(_prefilter_intraday, sym): sym for sym in symbols}
-            for fut in as_completed(futures):
-                sym = futures[fut]
-                try: item = fut.result()
-                except Exception: item = None
-                if item:
-                    route_score, h1, m5 = item
-                    stage1.append((route_score, sym, h1, m5))
+    # Stage 1 — H1 + 5m only for the full universe.
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        futures = {pool.submit(_prefilter_intraday, sym): sym for sym in symbols}
+        for fut in as_completed(futures):
+            sym = futures[fut]
+            try:
+                item = fut.result()
+            except Exception:
+                item = None
+            if item:
+                route_score, h1, m5 = item
+                stage1.append((route_score, sym, h1, m5))
 
     stage1.sort(key=lambda x: x[0], reverse=True)
     log.info(
