@@ -2539,6 +2539,34 @@ def _prefilter_daily(symbol: str) -> tuple[float, pd.DataFrame, pd.DataFrame] | 
         return None
 
 
+
+def _prefilter_daily_from_frames(symbol: str, weekly: pd.DataFrame, daily: pd.DataFrame) -> tuple[float, pd.DataFrame, pd.DataFrame] | None:
+    try:
+        if weekly is None or daily is None or len(weekly) < 60 or len(daily) < 80:
+            return None
+        price = float(daily["Close"].iloc[-1])
+        if price <= 0 or price > float(MAX_AUTO_PRICE):
+            return None
+        wc = weekly["Close"].astype(float); dc = daily["Close"].astype(float)
+        we20 = float(_ema(wc,20).iloc[-1]); we50 = float(_ema(wc,50).iloc[-1])
+        wrsi = float(_rsi(wc,14).iloc[-1]); drsi = float(_rsi(dc,14).iloc[-1])
+        trend = price >= we20 * 0.99 and we20 >= we50 * 0.995 and drsi >= 42
+        v = _vwap(daily.tail(60)); vw = float(v.iloc[-1]) if pd.notna(v.iloc[-1]) else price
+        above_vwap = price >= vw * 0.995
+        above_open = price >= float(daily["Open"].iloc[-1]) * 0.995
+        hist = daily.iloc[:-1].tail(120)
+        avg_cur = float(daily["Volume"].tail(5).mean()); avg_hist = float(hist["Volume"].mean()) if not hist.empty else 1.0
+        vol_ratio = avg_cur / avg_hist if avg_hist else 1.0
+        mom = (price - float(dc.iloc[-6])) / max(float(dc.iloc[-6]),1e-9) * 100 if len(dc)>=6 else 0.0
+        route = (3.0 if trend else 0.0) + (2.0 if above_vwap else 0.0) + (1.5 if above_open else 0.0)
+        route += min(2.5,max(0.0,mom)) + min(2.0,max(0.0,vol_ratio-0.75)*2.0) + (1.0 if we20 > we50 else 0.0)
+        route -= 1.0 if wrsi >= 80 else 0.0
+        if not trend and not above_vwap and mom <= 0 or vol_ratio < 0.55:
+            return None
+        return route, weekly, daily
+    except Exception:
+        return None
+
 def scan_daily(
     symbols: list[str],
     names: dict,
@@ -2561,14 +2589,35 @@ def scan_daily(
     workers = min(8, max(2, len(symbols)))
     stage1=[]
     log.info("DAILY V2 SCAN: %d symbols loaded", len(symbols))
-    with ThreadPoolExecutor(max_workers=workers) as pool:
-        futures={pool.submit(_prefilter_daily,sym):sym for sym in symbols}
-        for fut in as_completed(futures):
-            sym=futures[fut]
-            try: item=fut.result()
-            except Exception: item=None
-            if item:
-                route,weekly,daily=item; stage1.append((route,sym,weekly,daily))
+    try:
+        from market_data import fetch_alpaca_bars_multi, alpaca_configured
+        if alpaca_configured():
+            days_w = _period_days("5y", 365)
+            days_d = _period_days("2y", 365)
+            now_utc = datetime.now(timezone.utc)
+            weekly_map = fetch_alpaca_bars_multi(symbols, "1Week", now_utc - timedelta(days=days_w + 5), now_utc)
+            daily_map = fetch_alpaca_bars_multi(symbols, "1Day", now_utc - timedelta(days=days_d + 5), now_utc)
+            def _route_from_frames(sym):
+                weekly = weekly_map.get(sym.upper()); daily = daily_map.get(sym.upper())
+                if weekly is None or daily is None or len(weekly) < 60 or len(daily) < 80:
+                    return None
+                return _prefilter_daily_from_frames(sym, weekly, daily)
+            for sym in symbols:
+                item = _route_from_frames(sym)
+                if item:
+                    route, weekly, daily = item; stage1.append((route, sym, weekly, daily))
+        else:
+            raise RuntimeError("Alpaca not configured")
+    except Exception as exc:
+        log.warning("Daily batch scan unavailable; using per-symbol fallback: %s", exc)
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            futures={pool.submit(_prefilter_daily,sym):sym for sym in symbols}
+            for fut in as_completed(futures):
+                sym=futures[fut]
+                try: item=fut.result()
+                except Exception: item=None
+                if item:
+                    route,weekly,daily=item; stage1.append((route,sym,weekly,daily))
     stage1.sort(key=lambda x:x[0], reverse=True)
     log.info("STAGE 1 DAILY: %d/%d passed", len(stage1), len(symbols))
     finalists=stage1[:max(PREFILTER_MAX_CANDIDATES, limit*5)]

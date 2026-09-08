@@ -244,6 +244,74 @@ def _period_days(period: str, default: int = 5) -> int:
     return default
 
 
+
+def fetch_alpaca_bars_multi(
+    symbols: list[str],
+    timeframe: str,
+    start: datetime,
+    end: Optional[datetime] = None,
+    limit: int = 10000,
+    chunk_size: int = 50,
+) -> dict[str, pd.DataFrame]:
+    """Fetch many symbols in batches from Alpaca's multi-symbol bars endpoint.
+
+    This is used by the scanners so 200 symbols do not become 400 individual
+    HTTP requests.  The per-symbol fetch API remains unchanged for compatibility.
+    """
+    if not alpaca_configured():
+        raise RuntimeError("Alpaca keys missing")
+    end = end or datetime.now(timezone.utc)
+    if start.tzinfo is None:
+        start = start.replace(tzinfo=timezone.utc)
+    if end.tzinfo is None:
+        end = end.replace(tzinfo=timezone.utc)
+
+    clean = []
+    seen = set()
+    for sym in symbols or []:
+        sym = str(sym).upper().strip()
+        if sym and sym not in seen:
+            clean.append(sym); seen.add(sym)
+
+    out: dict[str, pd.DataFrame] = {}
+    for i in range(0, len(clean), max(1, int(chunk_size))):
+        chunk = clean[i:i + max(1, int(chunk_size))]
+        params = {
+            "symbols": ",".join(chunk),
+            "timeframe": timeframe,
+            "start": start.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "end": end.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "limit": min(limit, 10000),
+            "adjustment": "split",
+            "feed": APCA_FEED if APCA_FEED in {"iex", "sip", "delayed_sip"} else "iex",
+        }
+        url = f"{DATA_URL}/v2/stocks/bars"
+        r = requests.get(url, headers=_alpaca_headers(), params=params, timeout=15)
+        if r.status_code >= 400:
+            raise RuntimeError(f"Alpaca multi {r.status_code}: {r.text[:180]}")
+        data = r.json() or {}
+        bars_by_symbol = data.get("bars") or {}
+        next_token = data.get("next_page_token")
+        while next_token:
+            params["page_token"] = next_token
+            r = requests.get(url, headers=_alpaca_headers(), params=params, timeout=15)
+            if r.status_code >= 400:
+                raise RuntimeError(f"Alpaca multi page {r.status_code}: {r.text[:180]}")
+            page = r.json() or {}
+            for sym, bars in (page.get("bars") or {}).items():
+                bars_by_symbol.setdefault(sym, []).extend(bars or [])
+            next_token = page.get("next_page_token")
+
+        for sym, bars in bars_by_symbol.items():
+            df = _bars_to_df(bars or [])
+            if df is not None and not df.empty:
+                df.attrs["data_source"] = f"alpaca-{params['feed']}"
+                df.attrs["feed"] = params["feed"]
+                out[str(sym).upper()] = df
+
+    _set_status(f"alpaca-{params['feed']}")
+    return out
+
 def fetch_intraday(symbol: str, period: str = "5d", interval: str = "5m") -> pd.DataFrame:
     """Unified timeframe loader. Keeps the old API but now correctly supports
     intraday + daily + weekly frames used by Daily V2."""

@@ -22,7 +22,7 @@ import urllib.request
 import numpy as np
 import pandas as pd
 
-from market import now_ny, REGULAR_OPEN, REGULAR_CLOSE
+from market import now_ny, REGULAR_OPEN, REGULAR_CLOSE, is_us_regular_session, session_label
 from stocks import MAX_AUTO_PRICE
 
 SKIP_OPEN_MIN = 20
@@ -83,14 +83,6 @@ REASON_EDGE = 0.08
 REASON_WEIGHT_STEP = 0.03
 REASON_WEIGHT_MIN = 0.85
 REASON_WEIGHT_MAX = 1.15
-
-OPPORTUNITY_MIN_SAMPLES = 15
-OPPORTUNITY_ACTIVE_MIN_SAMPLES = 40
-OPPORTUNITY_EDGE = 0.05
-OPPORTUNITY_WEIGHT_STEP = 0.03
-OPPORTUNITY_WEIGHT_MIN = 0.85
-OPPORTUNITY_WEIGHT_MAX = 1.15
-OPPORTUNITY_MIN_COVERAGE = 0.45
 
 # أخبار: اختياري عبر FINNHUB_API_KEY. إذا لم يوجد المفتاح لا يمنع التحليل.
 FINNHUB_API_KEY = os.getenv("FINNHUB_API_KEY", "").strip()
@@ -241,11 +233,6 @@ def _default_adaptive_policy() -> dict:
             "active": False,
             "generation": 0,
         },
-        "opportunity_policy": {
-            "weights": {},
-            "active": False,
-            "generation": 0,
-        },
         "history": [],
     }
 
@@ -287,10 +274,6 @@ def _load_adaptive_policy() -> dict:
         data["reason_policy"].setdefault("weights", {})
         data["reason_policy"].setdefault("active", False)
         data["reason_policy"].setdefault("generation", 0)
-        data.setdefault("opportunity_policy", {"weights": {}, "active": False, "generation": 0})
-        data["opportunity_policy"].setdefault("weights", {})
-        data["opportunity_policy"].setdefault("active", False)
-        data["opportunity_policy"].setdefault("generation", 0)
         return data
     except Exception:
         return default
@@ -338,13 +321,6 @@ def _adaptive_score_adjustment(
                 ]
                 if vals:
                     adjustment += max(-1.0, min(1.0, (sum(vals) / len(vals) - 1.0) * 4.0))
-
-        if p.get("opportunity_policy", {}).get("active") and entry_type:
-            key = f"{market_regime}|{entry_type}"
-            opp_map = p.get("opportunity_policy", {}).get("weights", {}).get(key, {})
-            vals = [float(v) for k, v in opp_map.items() if k != "samples" and isinstance(v, (int, float))]
-            if vals:
-                adjustment += max(-1.25, min(1.25, (sum(vals) / len(vals) - 1.0) * 5.0))
 
         return max(-5.0, min(5.0, adjustment))
     except Exception:
@@ -563,7 +539,6 @@ def monthly_self_optimization() -> dict:
             "regime_active": bool(policy.get("regime_active", False)),
             "exit_active": bool(policy.get("exit_active", False)),
             "reason_active": bool(policy.get("reason_policy", {}).get("active", False)),
-            "opportunity_active": bool(policy.get("opportunity_policy", {}).get("active", False)),
         }
 
     return {
@@ -572,7 +547,6 @@ def monthly_self_optimization() -> dict:
         "regime_active": bool(policy.get("regime_active", False)),
         "exit_active": bool(policy.get("exit_active", False)),
         "reason_active": bool(policy.get("reason_policy", {}).get("active", False)),
-        "opportunity_active": bool(policy.get("opportunity_policy", {}).get("active", False)),
     }
 
 
@@ -817,53 +791,6 @@ def _apply_adaptive_exit(sig_price: float, structural_stop: float, regime: str,
     return new_stop, tp1, max(EXIT_TP_MIN_R, min(EXIT_TP_MAX_R, tp1_r))
 
 
-def _opportunity_key(row: dict) -> str:
-    regime = str(row.get("market_regime") or "neutral")
-    et = str(row.get("entry_type") or "")
-    m15 = str(row.get("m15_state") or "محايد")
-    vol = float(row.get("volume_ratio", 1.0) or 1.0)
-    bq = float(row.get("breakout_quality", 0) or 0)
-    vb = "vol_strong" if vol >= 1.5 else ("vol_ok" if vol >= 1.0 else "vol_weak")
-    bb = "breakout_strong" if bq >= 70 else ("breakout_ok" if bq >= 55 else "breakout_weak")
-    return f"{regime}|{et}|m15:{m15}|{vb}|{bb}"
-
-
-def _build_opportunity_candidate(policy: dict, train: list[dict]) -> dict:
-    candidate = json.loads(json.dumps(policy))
-    op = candidate.setdefault("opportunity_policy", {"weights": {}, "active": False, "generation": 0})
-    weights = op.setdefault("weights", {})
-    outcomes = [r for r in train if r.get("record_type") == "outcome" and r.get("status") in {"tp1", "stop", "timeout"}]
-    baseline = _rate(outcomes)
-    groups = {}
-    for r in outcomes:
-        groups.setdefault(_opportunity_key(r), []).append(r)
-    for key, rows in groups.items():
-        if len(rows) < OPPORTUNITY_MIN_SAMPLES:
-            continue
-        rate = _rate(rows)
-        old = float(weights.get(key, 1.0))
-        if rate >= baseline + 0.08:
-            old = min(OPPORTUNITY_WEIGHT_MAX, old + OPPORTUNITY_WEIGHT_STEP)
-        elif rate <= baseline - 0.08:
-            old = max(OPPORTUNITY_WEIGHT_MIN, old - OPPORTUNITY_WEIGHT_STEP)
-        weights[key] = round(old, 4)
-        weights[key + "|samples"] = len(rows)
-    return candidate
-
-
-def _opportunity_shadow_rate(rows: list[dict], policy: dict) -> tuple[float, float, int]:
-    outcomes = [r for r in rows if r.get("record_type") == "outcome" and r.get("status") in {"tp1", "stop", "timeout"}]
-    if not outcomes:
-        return 0.0, 0.0, 0
-    selected = []
-    for r in outcomes:
-        key = _opportunity_key(r)
-        w = float(policy.get("opportunity_policy", {}).get("weights", {}).get(key, 1.0))
-        if w >= 1.0:
-            selected.append(r)
-    return _rate(selected), len(selected) / max(len(outcomes), 1), len(selected)
-
-
 def adaptive_retrain_if_ready(force_monthly: bool = False) -> dict:
     """يشغّل دورة التعلم الذاتي ويصدر نتيجة قابلة للإرسال إلى Telegram."""
     completed = _recent_learning_rows()
@@ -896,7 +823,6 @@ def adaptive_retrain_if_ready(force_monthly: bool = False) -> dict:
     candidate = _build_regime_candidate(candidate, train)
     candidate = _build_exit_candidate(candidate, train)
     candidate = _build_reason_candidate(candidate, train)
-    candidate = _build_opportunity_candidate(candidate, train)
 
     # العوامل
     for factor in candidate.get("weights", {}):
@@ -993,15 +919,6 @@ def adaptive_retrain_if_ready(force_monthly: bool = False) -> dict:
         and len(reason_selected) >= 10
     )
 
-    opportunity_policy = json.loads(json.dumps(candidate))
-    opportunity_policy["opportunity_policy"]["active"] = True
-    opportunity_rate, opportunity_coverage, opportunity_n = _opportunity_shadow_rate(test, opportunity_policy)
-    opportunity_improved = (
-        opportunity_rate >= current_rate + OPPORTUNITY_EDGE
-        and opportunity_coverage >= OPPORTUNITY_MIN_COVERAGE
-        and opportunity_n >= 10
-    )
-
     approved = (
         candidate_rate >= current_rate + ADAPTIVE_MIN_EDGE
         and coverage >= ADAPTIVE_MIN_COVERAGE
@@ -1027,10 +944,6 @@ def adaptive_retrain_if_ready(force_monthly: bool = False) -> dict:
         "reason_coverage": round(reason_coverage, 4),
         "reason_improved": bool(reason_improved),
         "reason_active_before": bool(policy.get("reason_policy", {}).get("active", False)),
-        "opportunity_shadow_rate": round(opportunity_rate, 4),
-        "opportunity_coverage": round(opportunity_coverage, 4),
-        "opportunity_improved": bool(opportunity_improved),
-        "opportunity_active_before": bool(policy.get("opportunity_policy", {}).get("active", False)),
         "oos_samples": len(test),
         "train_samples": len(train),
         "approved": bool(approved),
@@ -1067,13 +980,6 @@ def adaptive_retrain_if_ready(force_monthly: bool = False) -> dict:
             candidate["generation"] if reason_improved
             else policy.get("reason_policy", {}).get("generation", 0)
         )
-        candidate["opportunity_policy"]["active"] = bool(
-            opportunity_improved or policy.get("opportunity_policy", {}).get("active", False)
-        )
-        candidate["opportunity_policy"]["generation"] = (
-            candidate["generation"] if opportunity_improved
-            else policy.get("opportunity_policy", {}).get("generation", 0)
-        )
         candidate["history"] = (policy.get("history", []) + [result])[-20:]
         _save_adaptive_policy(candidate)
 
@@ -1104,7 +1010,7 @@ def adaptive_retrain_if_ready(force_monthly: bool = False) -> dict:
         )
     else:
         # The regime layer can graduate independently if it passes its own OOS gate.
-        if regime_improved or exit_improved or reason_improved or opportunity_improved:
+        if regime_improved or exit_improved or reason_improved:
             policy["generation"] = int(policy.get("generation", 0)) + 1
             if regime_improved:
                 policy["regime_weights"] = candidate.get("regime_weights", policy.get("regime_weights", {}))
@@ -1120,12 +1026,6 @@ def adaptive_retrain_if_ready(force_monthly: bool = False) -> dict:
                 )
                 policy["reason_policy"]["active"] = True
                 policy["reason_policy"]["generation"] = policy["generation"]
-            if opportunity_improved:
-                policy["opportunity_policy"] = candidate.get(
-                    "opportunity_policy", policy.get("opportunity_policy", {})
-                )
-                policy["opportunity_policy"]["active"] = True
-                policy["opportunity_policy"]["generation"] = policy["generation"]
             policy["samples_at_update"] = len(completed)
             policy["history"] = (policy.get("history", []) + [result])[-20:]
             _save_adaptive_policy(policy)
@@ -1237,9 +1137,6 @@ def register_intraday_signal(sig: IntradaySignal) -> str:
             "reason_engine_active": bool(
                 _load_adaptive_policy().get("reason_policy", {}).get("active", False)
             ),
-            "opportunity_engine_active": bool(
-                _load_adaptive_policy().get("opportunity_policy", {}).get("active", False)
-            ),
             "outcome_reason": _classify_trade_reason({**sig.__dict__, "status": ""}),
             "interactions": list(getattr(sig, "interaction_keys", []) or []),
             "status": "pending",
@@ -1315,7 +1212,6 @@ def record_intraday_outcome(
             "chop": target.get("chop", False),
             "market_regime": target.get("market_regime", "neutral"),
             "interactions": target.get("interactions", []) or [],
-            "opportunity_engine_active": bool(target.get("opportunity_engine_active", False)),
             "mfe_pct": round(float(mfe_pct if mfe_pct is not None else target.get("mfe_pct", 0.0) or 0.0), 4),
             "mae_pct": round(float(mae_pct if mae_pct is not None else target.get("mae_pct", 0.0) or 0.0), 4),
             "time_to_result_min": (
@@ -1491,6 +1387,8 @@ def _market_alignment(fetch_intraday) -> tuple[bool, str]:
 
 def session_window_ok(dt=None) -> tuple[bool, str]:
     dt = dt or now_ny()
+    if not is_us_regular_session(dt):
+        return False, session_label(dt)
     t = dt.time()
     open_ok_after = time(9, 50)
     close_cut = time(15, 40)
@@ -2675,6 +2573,36 @@ def _prefilter_intraday(symbol: str) -> tuple[float, pd.DataFrame, pd.DataFrame]
         return None
 
 
+
+def _prefilter_intraday_from_frames(symbol: str, h1: pd.DataFrame, m5: pd.DataFrame) -> tuple[float, pd.DataFrame, pd.DataFrame] | None:
+    """Run the existing Stage-1 logic on already downloaded bars."""
+    try:
+        if h1 is None or m5 is None or len(h1) < 40 or len(m5) < 30:
+            return None
+        last_day = m5.index[-1].date(); today = m5[m5.index.date == last_day]
+        if len(today) < 6:
+            return None
+        price = float(today["Close"].iloc[-1])
+        if price <= 0 or price > float(MAX_AUTO_PRICE):
+            return None
+        hc = h1["Close"]; e20 = float(_ema(hc,20).iloc[-1]); e50 = float(_ema(hc,50).iloc[-1])
+        h_rsi = float(_rsi(hc,14).iloc[-1]); trend = price > e20 > e50 * 0.998 and h_rsi >= 45
+        vwap_s = _vwap(today); vwap = float(vwap_s.iloc[-1]) if pd.notna(vwap_s.iloc[-1]) else price
+        vwap_dist = (price-vwap)/max(vwap,1e-9)*100; above_vwap = price >= vwap*0.996
+        above_open = price >= float(today["Open"].iloc[0])*0.997
+        last_green = float(today["Close"].iloc[-1]) >= float(today["Open"].iloc[-1])
+        c5=today["Close"]; mom=(price-float(c5.iloc[-6]))/max(float(c5.iloc[-6]),1e-9)*100
+        r5=float(_rsi(c5,14).iloc[-1]); hist=m5[m5.index.date<last_day].tail(120)
+        avg_today=float(today["Volume"].mean()); avg_hist=float(hist["Volume"].mean()) if not hist.empty else float(m5["Volume"].tail(60).mean() or 1)
+        vol_ratio=avg_today/avg_hist if avg_hist else 1.0
+        route=(3.0 if trend else 0.0)+(2.0 if above_vwap else 0.0)+(1.5 if above_open else 0.0)
+        route += min(2.0,max(0.0,mom))+min(2.0,max(0.0,vol_ratio-0.75)*2.0)-max(0.0,vwap_dist-3.0)*0.5-(1.0 if r5>=82 else 0.0)
+        if not trend and not above_vwap and mom <= 0 or vol_ratio < 0.65:
+            return None
+        return route,h1,m5
+    except Exception:
+        return None
+
 def scan_intraday(
     symbols: list[str],
     names: dict,
@@ -2700,18 +2628,39 @@ def scan_intraday(
 
     log.info("INTRADAY SCAN: %d symbols loaded", len(symbols))
 
-    # Stage 1 — H1 + 5m only for the full universe.
-    with ThreadPoolExecutor(max_workers=workers) as pool:
-        futures = {pool.submit(_prefilter_intraday, sym): sym for sym in symbols}
-        for fut in as_completed(futures):
-            sym = futures[fut]
-            try:
-                item = fut.result()
-            except Exception:
-                item = None
-            if item:
-                route_score, h1, m5 = item
-                stage1.append((route_score, sym, h1, m5))
+    # Stage 1 — batch H1 + 5m for the full universe. This replaces ~400
+    # per-symbol HTTP requests with a handful of multi-symbol requests.
+    try:
+        from market_data import fetch_alpaca_bars_multi, alpaca_configured
+        if alpaca_configured():
+            now_utc = datetime.now(timezone.utc)
+            h1_map = fetch_alpaca_bars_multi(symbols, "1Hour", now_utc - timedelta(days=13), now_utc)
+            m5_map = fetch_alpaca_bars_multi(symbols, "5Min", now_utc - timedelta(days=7), now_utc)
+            for sym in symbols:
+                h1 = h1_map.get(str(sym).upper()); m5 = m5_map.get(str(sym).upper())
+                if h1 is None or m5 is None:
+                    continue
+                ok_h1, _ = intraday_data_fresh(h1, "60m", 90)
+                ok_m5, _ = intraday_data_fresh(m5, "5m", 12)
+                if not ok_h1 or not ok_m5 or len(h1) < 40 or len(m5) < 30:
+                    continue
+                item = _prefilter_intraday_from_frames(sym, h1, m5)
+                if item:
+                    route_score, h1, m5 = item
+                    stage1.append((route_score, sym, h1, m5))
+        else:
+            raise RuntimeError("Alpaca not configured")
+    except Exception as exc:
+        log.warning("Intraday batch scan unavailable; using per-symbol fallback: %s", exc)
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            futures = {pool.submit(_prefilter_intraday, sym): sym for sym in symbols}
+            for fut in as_completed(futures):
+                sym = futures[fut]
+                try: item = fut.result()
+                except Exception: item = None
+                if item:
+                    route_score, h1, m5 = item
+                    stage1.append((route_score, sym, h1, m5))
 
     stage1.sort(key=lambda x: x[0], reverse=True)
     log.info(
@@ -2769,11 +2718,7 @@ def scan_intraday(
 
     rank = {et: i for i, et in enumerate(ENTRY_TYPES)}
     results.sort(key=lambda x: (
-        -(float(x.score) + _adaptive_score_adjustment(
-            list(getattr(x, "factor_keys", []) or []),
-            str(getattr(x, "market_regime", "neutral") or "neutral"),
-            str(getattr(x, "entry_type", "") or ""),
-        ) + 1.5 * min(float(getattr(x, "reward_r", 0) or 0), 3.0)
+        -(float(x.score) + 1.5 * min(float(getattr(x, "reward_r", 0) or 0), 3.0)
           + 2.0 * ("multi_level_confluence" in (getattr(x, "factor_keys", []) or []))
           + 1.5 * ("vwap_h1_confluence" in (getattr(x, "factor_keys", []) or []))
           - 1.5 * float(getattr(x, "spread_pct", 0) or 0)
