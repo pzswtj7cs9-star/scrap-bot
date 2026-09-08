@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Optional
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import json
+import logging
 import os
 import urllib.parse
 import urllib.request
@@ -24,6 +25,8 @@ import pandas as pd
 
 from market import now_ny, REGULAR_OPEN, REGULAR_CLOSE, is_us_regular_session, session_label
 from stocks import MAX_AUTO_PRICE
+
+log = logging.getLogger("halal-bot.daily")
 
 SKIP_OPEN_MIN = 0
 SKIP_CLOSE_MIN = 0
