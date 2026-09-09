@@ -17,6 +17,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import json
 import logging
 import os
+import time as time_module
 import urllib.parse
 import urllib.request
 
@@ -1358,28 +1359,50 @@ def _breakout_quality(today_d: pd.DataFrame, level: float, price: float) -> tupl
 
 
 def _market_alignment(fetch_intraday) -> tuple[bool, str]:
-    """SPY + QQQ: اتجاه السوق العام على الإطار اليومي."""
+    """
+    Daily SPY/QQQ market gate.
+    - Missing/incomplete data is retried several times before being treated as unavailable.
+    - Mixed SPY/QQQ is NOT a rejection: the stock is still evaluated normally.
+    - Weak SPY+QQQ is NOT an automatic rejection: an exceptional stock may pass
+      through the daily strong-stock override later in analyze_daily().
+    """
+    max_attempts = 4
+    retry_delays = (0.0, 0.5, 1.0, 1.5)
     states = []
+
     for sym in ("SPY", "QQQ"):
-        try:
-            d = fetch_intraday(sym, interval="1d", period="6mo")
-            if d is None or len(d) < 50:
-                states.append(None)
-                continue
-            c = d["Close"].astype(float)
-            e20 = float(_ema(c,20).iloc[-1])
-            e50 = float(_ema(c,50).iloc[-1])
-            p = float(c.iloc[-1])
-            states.append(p >= e20 and e20 >= e50)
-        except Exception:
-            states.append(None)
-    known=[x for x in states if x is not None]
-    if not known:
-        return True, "السوق غير مؤكد"
-    if all(known):
+        state = None
+        for attempt in range(max_attempts):
+            try:
+                d = fetch_intraday(sym, interval="1d", period="6mo")
+                if d is not None and len(d) >= 50 and "Close" in d.columns:
+                    c = pd.to_numeric(d["Close"], errors="coerce").dropna()
+                    if len(c) >= 50:
+                        e20 = float(_ema(c, 20).iloc[-1])
+                        e50 = float(_ema(c, 50).iloc[-1])
+                        p = float(c.iloc[-1])
+                        if np.isfinite(e20) and np.isfinite(e50) and np.isfinite(p):
+                            state = bool(p >= e20 and e20 >= e50)
+                            break
+            except Exception as exc:
+                if attempt == max_attempts - 1:
+                    log.warning("Daily market data failed for %s after %d attempts: %s", sym, max_attempts, exc)
+            if attempt < max_attempts - 1:
+                delay = retry_delays[min(attempt + 1, len(retry_delays) - 1)]
+                if delay > 0:
+                    time_module.sleep(delay)
+        states.append(state)
+
+    # Data availability is the only market-data condition that hard-fails.
+    if any(x is None for x in states):
+        return False, "بيانات SPY/QQQ غير مكتملة بعد إعادة المحاولة"
+
+    if states[0] and states[1]:
         return True, "SPY+QQQ داعمان يوميًا"
-    if not any(known):
+    if (not states[0]) and (not states[1]):
         return False, "SPY+QQQ ضعيفان يوميًا"
+
+    # Mixed market is intentionally allowed.
     return True, "SPY/QQQ مختلطان يوميًا"
 
 
@@ -2222,6 +2245,10 @@ def analyze_daily(
         and ext <= 7.0
     )
 
+    # Daily strong-stock override: weak market can be bypassed only when the
+    # stock itself is exceptionally aligned. Mixed SPY/QQQ already passes the
+    # normal market gate and therefore does not need an override. Missing market
+    # data can never trigger this override.
     policy = _load_adaptive_policy()
     limits = policy.get("entry_limits", {})
     if entry_type == "دخول مبكر":
@@ -2260,6 +2287,18 @@ def analyze_daily(
         score = min(score, 80.0)
 
     score_i = int(max(0, min(100, round(score))))
+
+    # Daily strong-stock override: weak market does not automatically block an exceptional stock.
+    # The early-entry strategy is allowed if it independently reaches the strong daily threshold.
+    # 93 is intentional: the daily "دخول مبكر" score cap is 94, so a 95/97 threshold
+    # would make the override mathematically unreachable for that strategy.
+    strong_stock_market_override = bool(
+        (not market_ok)
+        and market_state == "SPY+QQQ ضعيفان يوميًا"
+        and score_i >= 93
+        and strong_alignment
+    )
+
     strong_for_grade = (
         score_i >= 95
         and strong_alignment
@@ -2278,7 +2317,7 @@ def analyze_daily(
             and (breakout_ok or entry_type != "دخول مبكر")
             and (breakout_quality >= 60 or entry_type != "دخول مبكر")
             and h4_state != "معاكس"
-            and market_ok
+            and (market_ok or strong_stock_market_override)
         )
 
     quality_ok = (
@@ -2290,7 +2329,7 @@ def analyze_daily(
         and not chop
         and news_momentum_ok
         and not (h4_state == "معاكس" and score_i < 92)
-        and (market_ok or score_i >= 95)
+        and (market_ok or strong_stock_market_override)
     )
 
     recent_low = float(today_d["Low"].tail(12).min())
@@ -2586,8 +2625,9 @@ def scan_daily(
         market_context = _market_alignment(fetch_intraday)
         if not market_context[0] and "ضعيفان" in market_context[1]:
             min_score = max(min_score, 88)
-    except Exception:
-        market_context = (True, "السوق غير مؤكد")
+    except Exception as exc:
+        log.warning("Daily market context unavailable after retries: %s", exc)
+        market_context = (False, "بيانات SPY/QQQ غير متاحة")
 
     workers = min(8, max(2, len(symbols)))
     stage1=[]
