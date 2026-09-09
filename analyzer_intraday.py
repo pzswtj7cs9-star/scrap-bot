@@ -2296,6 +2296,9 @@ def analyze_intraday(
 
     policy = _load_adaptive_policy()
     limits = policy.get("entry_limits", {})
+    # نحفظ الدرجة قبل سقف نوع الاستراتيجية لاستخدامها في استثناء السوق.
+    # سقف الاستراتيجية يبقى كما هو للـScore المعروض والترتيب.
+    override_score = float(score)
     if entry_type == "دخول مبكر":
         score = min(score, float(limits.get("دخول مبكر", 94)))
     elif entry_type == "إعادة اختبار":
@@ -2337,7 +2340,7 @@ def analyze_intraday(
     # يشترط 97+ مع دخول غير مبكر وجميع شروط القوة اللحظية أعلاه.
     if strong_stock_market_override:
         strong_stock_market_override = bool(
-            score_i >= 97
+            override_score >= 97.0
             and entry_type != "دخول مبكر"
         )
     market_permission = market_ok or strong_stock_market_override
