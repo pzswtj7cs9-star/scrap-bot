@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Optional
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import json
+import logging
 import os
 import urllib.parse
 import urllib.request
@@ -24,6 +25,8 @@ import pandas as pd
 
 from market import now_ny, REGULAR_OPEN, REGULAR_CLOSE
 from stocks import MAX_AUTO_PRICE
+
+log = logging.getLogger(__name__)
 
 SKIP_OPEN_MIN = 20
 SKIP_CLOSE_MIN = 20
@@ -2662,7 +2665,7 @@ def scan_intraday(
             scan_intraday.last_window = "SPY+QQQ لحظيًا ضعيفان"
             min_score = max(min_score, 88)
     except Exception:
-        market_context = (True, "السوق غير مؤكد")
+        market_context = (False, "السوق غير مؤكد")
 
     workers = min(8, max(2, len(symbols)))
     stage1: list[tuple[float, str, pd.DataFrame, pd.DataFrame]] = []
