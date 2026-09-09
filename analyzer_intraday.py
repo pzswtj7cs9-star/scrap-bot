@@ -1358,34 +1358,45 @@ def _breakout_quality(today_5: pd.DataFrame, level: float, price: float) -> tupl
         return False, 0.0
 
 
+MARKET_RETRY_ATTEMPTS = 3
+MARKET_RETRY_SLEEP_SECONDS = 0.20
+
+
 def _market_alignment(fetch_intraday) -> tuple[bool, str]:
-    """SPY + QQQ: اتجاه السوق العام يدعم/لا يدعم اللحظي."""
+    """SPY + QQQ: فلتر السوق مع Retry؛ فشل البيانات لا يُعامل كدعم."""
+    import time
+
     states = []
     for sym in ("SPY", "QQQ"):
-        try:
-            d = fetch_intraday(sym, interval="5m", period="2d")
-            if d is None or len(d) < 20:
-                states.append(None)
-                continue
-            day = d.index[-1].date()
-            cur = d[d.index.date == day]
-            if len(cur) < 6:
-                states.append(None)
-                continue
-            p = float(cur["Close"].iloc[-1])
-            op = float(cur["Open"].iloc[0])
-            vw = float(_vwap(cur).iloc[-1])
-            states.append(p >= op and p >= vw)
-        except Exception:
-            states.append(None)
-    known = [x for x in states if x is not None]
-    if not known:
-        return True, "السوق غير مؤكد"
-    if all(known):
+        state = None
+        for attempt in range(MARKET_RETRY_ATTEMPTS):
+            try:
+                d = fetch_intraday(sym, interval="5m", period="2d")
+                if d is None or len(d) < 20:
+                    raise ValueError("market data unavailable/incomplete")
+                day = d.index[-1].date()
+                cur = d[d.index.date == day]
+                if len(cur) < 6:
+                    raise ValueError("market session data incomplete")
+                p = float(cur["Close"].iloc[-1])
+                op = float(cur["Open"].iloc[0])
+                vw = float(_vwap(cur).iloc[-1])
+                state = p >= op and p >= vw
+                break
+            except Exception:
+                if attempt + 1 < MARKET_RETRY_ATTEMPTS:
+                    time.sleep(MARKET_RETRY_SLEEP_SECONDS)
+        states.append(state)
+
+    if states == [True, True]:
         return True, "SPY+QQQ داعمان"
-    if not any(known):
+    if states == [False, False]:
         return False, "SPY+QQQ ضعيفان"
-    return True, "SPY/QQQ مختلطان"
+    if all(x is None for x in states):
+        return False, "السوق غير مؤكد"
+    if any(x is None for x in states):
+        return False, "بيانات السوق غير مكتملة"
+    return False, "SPY/QQQ مختلطان"
 
 
 def session_window_ok(dt=None) -> tuple[bool, str]:
@@ -1633,11 +1644,31 @@ def analyze_intraday(
     m15_state, m15_points = _m15_confirmation(m15, price)
     news_state, news_title, news_source = _classify_news(symbol)
     market_ok, market_state = market_context if market_context is not None else _market_alignment(fetch_intraday)
+
     chop = _chop_filter(today_5, price, vwap_last)
+
 
     session_high = float(today_5["High"].max())
     drop = (session_high - price) / session_high * 100 if session_high else 0
     dump = drop >= 2.5 and change_pct <= -1.2
+
+    # استثناء محدود للسهم الأقوى من السوق: لا يعمل مع سوق غير مؤكد/بيانات ناقصة،
+    # ولا يعتمد على الدرجة وحدها. يجب أن تكون الصورة اللحظية قوية قبل اختيار الدخول.
+    strong_stock_market_override = bool(
+        (not market_ok)
+        and market_state in {"SPY+QQQ ضعيفان", "SPY/QQQ مختلطان"}
+        and trend_up
+        and live_ok
+        and above_vwap
+        and above_open
+        and m15_state == "داعم"
+        and vol_session_ratio >= 1.25
+        and change_pct >= 1.0
+        and not dump
+        and not chop
+        and ((price - e20) / e20 * 100 if e20 else 999.0) <= 3.5
+    )
+    market_permission = market_ok or strong_stock_market_override
 
     h_win = h1.tail(20)
     level_high = float(h_win["High"].iloc[:-1].max()) if len(h_win) > 3 else session_high
@@ -1724,7 +1755,7 @@ def analyze_intraday(
             )
             liquidity_displacement = bool(
                 swept and reclaimed and displacement and trend_up and above_vwap and above_open
-                and m15_state != "معاكس" and market_ok and not failed
+                and m15_state != "معاكس" and market_permission and not failed
                 and mom > 0.08 and ext_tmp <= 3.5
             )
     except Exception:
@@ -1763,7 +1794,7 @@ def analyze_intraday(
             prior_move = (closes.iloc[-2] - closes.iloc[-4]) / max(closes.iloc[-4], 1e-9) * 100
             momentum_continuation = bool(
                 trend_up and above_vwap and above_open and not failed and not breakout_now
-                and m15_state != "معاكس" and market_ok
+                and m15_state != "معاكس" and market_permission
                 and rising and green_now and prior_move >= 0.35
                 and mom > 0.08 and vol_session_ratio >= 1.05
                 and body_now / range_now >= 0.45 and close_pos >= 0.65
@@ -1791,7 +1822,7 @@ def analyze_intraday(
                 compression and expansion and float(cur["Close"]) > float(cur["Open"])
                 and cur_pos >= 0.70 and vol_session_ratio >= 1.20
                 and above_vwap and above_open and trend_up
-                and m15_state != "معاكس" and market_ok and not failed
+                and m15_state != "معاكس" and market_permission and not failed
                 and cur_body / cur_range >= 0.45 and ext_tmp <= 4.0
             )
     except Exception:
@@ -1838,7 +1869,7 @@ def analyze_intraday(
                 and flag_range <= 2.0
                 and breakout_flag
                 and trend_up and above_vwap and above_open
-                and m15_state != "معاكس" and market_ok and not failed
+                and m15_state != "معاكس" and market_permission and not failed
                 and last_green and mom > 0.05
                 and vol_session_ratio >= 1.05
                 and ext_tmp <= 3.5
@@ -1864,7 +1895,7 @@ def analyze_intraday(
                 touches >= 2
                 and resistance_was_lost and reclaimed
                 and trend_up and above_vwap and above_open
-                and m15_state != "معاكس" and market_ok and not failed
+                and m15_state != "معاكس" and market_permission and not failed
                 and last_green and mom > 0.05
                 and vol_session_ratio >= 1.05
                 and ext_tmp <= 3.5
@@ -1894,7 +1925,7 @@ def analyze_intraday(
                 not_chasing = ext_tmp <= 3.5
                 opening_drive_pullback = bool(
                     trend_up and above_vwap and above_open
-                    and m15_state != "معاكس" and market_ok and not failed
+                    and m15_state != "معاكس" and market_permission and not failed
                     and drive_return >= 1.0
                     and controlled_pullback and reclaim_drive
                     and last_green and mom > 0.05
@@ -1922,7 +1953,7 @@ def analyze_intraday(
                 hod_reclaim = bool(
                     had_hod and pullback_below_hod and reclaimed_hod
                     and above_vwap and above_open and trend_up
-                    and m15_state != "معاكس" and market_ok and not failed
+                    and m15_state != "معاكس" and market_permission and not failed
                     and last_green and mom > 0.05
                     and vol_session_ratio >= 1.05
                     and ext_tmp <= 3.5
@@ -1942,7 +1973,7 @@ def analyze_intraday(
             orb_failed_reclaim = bool(
                 broke and failure and reclaim
                 and trend_up and above_vwap and above_open
-                and m15_state != "معاكس" and market_ok and not failed
+                and m15_state != "معاكس" and market_permission and not failed
                 and last_green and mom > 0.05
                 and vol_session_ratio >= 1.05
                 and ext_tmp <= 3.5
@@ -1973,7 +2004,7 @@ def analyze_intraday(
                 and 20.0 <= b_retrace <= 65.0
                 and c_break and price >= a_high * 0.999
                 and c_last_green and trend_up and above_vwap and above_open
-                and m15_state != "معاكس" and market_ok and not failed
+                and m15_state != "معاكس" and market_permission and not failed
                 and mom > 0.05 and vol_session_ratio >= 1.05
                 and ext_tmp <= 3.5
             )
@@ -2085,10 +2116,15 @@ def analyze_intraday(
         warnings.append("حجم الجلسة ضعيف نسبياً")
         score -= 6
 
-    if market_ok:
-        score += 3
-        factors.append("market")
-        reasons.append(market_state)
+    if market_permission:
+        if market_ok:
+            score += 3
+            factors.append("market")
+            reasons.append(market_state)
+        else:
+            # لا نعطي مكافأة سوق داعم للاستثناء؛ فقط نمنع انهيار الدرجة بسبب السوق.
+            factors.append("market_override")
+            reasons.append("السهم أقوى من السوق رغم ضعف/اختلاط SPY+QQQ")
     else:
         score -= 7
         warnings.append(market_state)
@@ -2296,6 +2332,15 @@ def analyze_intraday(
         score = min(score, 80.0)
 
     score_i = int(max(0, min(100, round(score))))
+
+    # في استثناء السوق الضعيف، الدرجة العالية وحدها لا تكفي.
+    # يشترط 97+ مع دخول غير مبكر وجميع شروط القوة اللحظية أعلاه.
+    if strong_stock_market_override:
+        strong_stock_market_override = bool(
+            score_i >= 97
+            and entry_type != "دخول مبكر"
+        )
+    market_permission = market_ok or strong_stock_market_override
     strong_for_grade = (
         score_i >= 95
         and strong_alignment
@@ -2314,7 +2359,7 @@ def analyze_intraday(
             and (breakout_ok or entry_type != "دخول مبكر")
             and (breakout_quality >= 60 or entry_type != "دخول مبكر")
             and m15_state != "معاكس"
-            and market_ok
+            and market_permission
         )
 
     quality_ok = (
@@ -2326,7 +2371,7 @@ def analyze_intraday(
         and not chop
         and news_momentum_ok
         and not (m15_state == "معاكس" and score_i < 92)
-        and (market_ok or score_i >= 95)
+        and market_permission
     )
 
     recent_low = float(today_5["Low"].tail(12).min())
