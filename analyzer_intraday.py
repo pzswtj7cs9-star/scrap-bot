@@ -1361,19 +1361,20 @@ def _breakout_quality(today_5: pd.DataFrame, level: float, price: float) -> tupl
         return False, 0.0
 
 
-MARKET_RETRY_ATTEMPTS = 3
-MARKET_RETRY_SLEEP_SECONDS = 0.20
+MARKET_RETRY_ATTEMPTS = 4
+MARKET_RETRY_SLEEP_SECONDS = 0.25
 
 
 def _market_alignment(fetch_intraday) -> tuple[bool, str]:
-    """SPY + QQQ: فلتر السوق مع Retry؛ فشل البيانات لا يُعامل كدعم."""
+    """SPY + QQQ: جلب مستقل مع Retry وتسجيل واضح؛ الاختلاط لا يرفض السهم."""
     import time
 
     states = []
     for sym in ("SPY", "QQQ"):
         state = None
-        for attempt in range(MARKET_RETRY_ATTEMPTS):
+        for attempt in range(1, MARKET_RETRY_ATTEMPTS + 1):
             try:
+                log.info("MARKET DATA | %s | attempt %d/%d", sym, attempt, MARKET_RETRY_ATTEMPTS)
                 d = fetch_intraday(sym, interval="5m", period="2d")
                 if d is None or len(d) < 20:
                     raise ValueError("market data unavailable/incomplete")
@@ -1384,22 +1385,40 @@ def _market_alignment(fetch_intraday) -> tuple[bool, str]:
                 p = float(cur["Close"].iloc[-1])
                 op = float(cur["Open"].iloc[0])
                 vw = float(_vwap(cur).iloc[-1])
-                state = p >= op and p >= vw
+                state = bool(p >= op and p >= vw)
+                log.info(
+                    "MARKET DATA | %s | success | bars=%d | close=%.4f | open=%.4f | vwap=%.4f | state=%s",
+                    sym, len(cur), p, op, vw, "داعم" if state else "ضعيف",
+                )
                 break
-            except Exception:
-                if attempt + 1 < MARKET_RETRY_ATTEMPTS:
+            except Exception as exc:
+                log.warning(
+                    "MARKET DATA | %s | failed attempt %d/%d | %s",
+                    sym, attempt, MARKET_RETRY_ATTEMPTS, str(exc),
+                )
+                if attempt < MARKET_RETRY_ATTEMPTS:
                     time.sleep(MARKET_RETRY_SLEEP_SECONDS)
         states.append(state)
 
     if states == [True, True]:
-        return True, "SPY+QQQ داعمان"
-    if states == [False, False]:
-        return False, "SPY+QQQ ضعيفان"
-    if all(x is None for x in states):
-        return False, "السوق غير مؤكد"
-    if any(x is None for x in states):
-        return False, "بيانات السوق غير مكتملة"
-    return False, "SPY/QQQ مختلطان"
+        result = (True, "SPY+QQQ داعمان")
+    elif states == [False, False]:
+        result = (False, "SPY+QQQ ضعيفان")
+    elif all(x is None for x in states):
+        result = (False, "السوق غير مؤكد")
+    elif any(x is None for x in states):
+        result = (False, "بيانات السوق غير مكتملة")
+    else:
+        # السوق المختلط ليس فشل بيانات وليس رفضًا تلقائيًا للسهم.
+        result = (True, "SPY/QQQ مختلطان")
+
+    log.info(
+        "MARKET RESULT | SPY=%s | QQQ=%s | ok=%s | state=%s",
+        "داعم" if states[0] is True else "ضعيف" if states[0] is False else "غير متوفر",
+        "داعم" if states[1] is True else "ضعيف" if states[1] is False else "غير متوفر",
+        result[0], result[1],
+    )
+    return result
 
 
 def session_window_ok(dt=None) -> tuple[bool, str]:

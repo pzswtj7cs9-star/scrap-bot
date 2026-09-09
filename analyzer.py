@@ -1375,51 +1375,96 @@ def _period_days(period: str, default: int = 5) -> int:
     return int(default)
 
 
+DAILY_MARKET_RETRY_ATTEMPTS = 4
+DAILY_MARKET_RETRY_DELAYS = (0.0, 0.5, 1.0, 1.5)
+
+
 def _market_alignment(fetch_intraday) -> tuple[bool, str]:
     """
-    Daily SPY/QQQ market gate.
-    - Missing/incomplete data is retried several times before being treated as unavailable.
-    - Mixed SPY/QQQ is NOT a rejection: the stock is still evaluated normally.
-    - Weak SPY+QQQ is NOT an automatic rejection: an exceptional stock may pass
-      through the daily strong-stock override later in analyze_daily().
+    Daily SPY/QQQ market gate with explicit per-attempt diagnostics.
+
+    The logging is diagnostic only; it does not change the daily trading rules:
+    - incomplete/unavailable data is retried before being treated as unavailable;
+    - mixed SPY/QQQ is allowed;
+    - weak SPY+QQQ remains subject to the existing daily strong-stock override.
     """
-    max_attempts = 4
-    retry_delays = (0.0, 0.5, 1.0, 1.5)
     states = []
 
     for sym in ("SPY", "QQQ"):
         state = None
-        for attempt in range(max_attempts):
+        for attempt in range(DAILY_MARKET_RETRY_ATTEMPTS):
+            attempt_no = attempt + 1
             try:
+                log.info(
+                    "DAILY MARKET FETCH | %s | attempt %d/%d | interval=1d | period=6mo",
+                    sym, attempt_no, DAILY_MARKET_RETRY_ATTEMPTS,
+                )
                 d = fetch_intraday(sym, interval="1d", period="6mo")
-                if d is not None and len(d) >= 50 and "Close" in d.columns:
-                    c = pd.to_numeric(d["Close"], errors="coerce").dropna()
-                    if len(c) >= 50:
-                        e20 = float(_ema(c, 20).iloc[-1])
-                        e50 = float(_ema(c, 50).iloc[-1])
-                        p = float(c.iloc[-1])
-                        if np.isfinite(e20) and np.isfinite(e50) and np.isfinite(p):
-                            state = bool(p >= e20 and e20 >= e50)
-                            break
-            except Exception as exc:
-                if attempt == max_attempts - 1:
-                    log.warning("Daily market data failed for %s after %d attempts: %s", sym, max_attempts, exc)
-            if attempt < max_attempts - 1:
-                delay = retry_delays[min(attempt + 1, len(retry_delays) - 1)]
-                if delay > 0:
-                    time_module.sleep(delay)
-        states.append(state)
 
-    # Data availability is the only market-data condition that hard-fails.
+                if d is None:
+                    log.warning("DAILY MARKET FETCH | %s | attempt %d/%d | data=None", sym, attempt_no, DAILY_MARKET_RETRY_ATTEMPTS)
+                    raise ValueError("market data is None")
+
+                if "Close" not in d.columns:
+                    log.warning(
+                        "DAILY MARKET FETCH | %s | attempt %d/%d | missing Close | columns=%s",
+                        sym, attempt_no, DAILY_MARKET_RETRY_ATTEMPTS, list(d.columns),
+                    )
+                    raise ValueError("Close column missing")
+
+                c = pd.to_numeric(d["Close"], errors="coerce").dropna()
+                log.info(
+                    "DAILY MARKET FETCH | %s | attempt %d/%d | rows=%d | valid_close=%d",
+                    sym, attempt_no, DAILY_MARKET_RETRY_ATTEMPTS, len(d), len(c),
+                )
+                if len(c) < 50:
+                    raise ValueError(f"insufficient daily closes: {len(c)} < 50")
+
+                e20 = float(_ema(c, 20).iloc[-1])
+                e50 = float(_ema(c, 50).iloc[-1])
+                p = float(c.iloc[-1])
+                if not (np.isfinite(e20) and np.isfinite(e50) and np.isfinite(p)):
+                    raise ValueError("non-finite market values")
+
+                state = bool(p >= e20 and e20 >= e50)
+                log.info(
+                    "DAILY MARKET RESULT | %s | attempt %d/%d | close=%.4f | ema20=%.4f | ema50=%.4f | state=%s",
+                    sym, attempt_no, DAILY_MARKET_RETRY_ATTEMPTS, p, e20, e50,
+                    "داعم" if state else "ضعيف",
+                )
+                break
+
+            except Exception as exc:
+                log.warning(
+                    "DAILY MARKET FETCH FAILED | %s | attempt %d/%d | %s",
+                    sym, attempt_no, DAILY_MARKET_RETRY_ATTEMPTS, exc,
+                )
+                if attempt < DAILY_MARKET_RETRY_ATTEMPTS - 1:
+                    delay = DAILY_MARKET_RETRY_DELAYS[min(attempt + 1, len(DAILY_MARKET_RETRY_DELAYS) - 1)]
+                    if delay > 0:
+                        time_module.sleep(delay)
+
+        states.append(state)
+        log.info(
+            "DAILY MARKET SYMBOL FINAL | %s | state=%s",
+            sym, "داعم" if state is True else "ضعيف" if state is False else "غير متاح",
+        )
+
     if any(x is None for x in states):
+        log.warning(
+            "DAILY MARKET FINAL | SPY=%s | QQQ=%s | ok=False | state=بيانات SPY/QQQ غير مكتملة بعد إعادة المحاولة",
+            states[0], states[1],
+        )
         return False, "بيانات SPY/QQQ غير مكتملة بعد إعادة المحاولة"
 
     if states[0] and states[1]:
+        log.info("DAILY MARKET FINAL | SPY=داعم | QQQ=داعم | ok=True | state=SPY+QQQ داعمان يوميًا")
         return True, "SPY+QQQ داعمان يوميًا"
     if (not states[0]) and (not states[1]):
+        log.info("DAILY MARKET FINAL | SPY=ضعيف | QQQ=ضعيف | ok=False | state=SPY+QQQ ضعيفان يوميًا")
         return False, "SPY+QQQ ضعيفان يوميًا"
 
-    # Mixed market is intentionally allowed.
+    log.info("DAILY MARKET FINAL | SPY=%s | QQQ=%s | ok=True | state=SPY/QQQ مختلطان يوميًا", states[0], states[1])
     return True, "SPY/QQQ مختلطان يوميًا"
 
 
