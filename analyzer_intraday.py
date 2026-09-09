@@ -1367,15 +1367,22 @@ def _breakout_quality(today_5: pd.DataFrame, level: float, price: float) -> tupl
 
 MARKET_RETRY_ATTEMPTS = 4
 MARKET_RETRY_SLEEP_SECONDS = 0.25
+# Relative-strength exception for weak/mixed markets. Keep this permissive
+# enough not to lose good names, but require the stock itself to be green
+# and clearly outperform the average of SPY/QQQ.
+RELATIVE_STRENGTH_MIN_STOCK_CHANGE_PCT = 0.75
+RELATIVE_STRENGTH_MIN_ADVANTAGE_PCT = 1.25
 
 
-def _market_alignment(fetch_intraday) -> tuple[bool, str]:
-    """SPY + QQQ: جلب مستقل مع Retry وتسجيل واضح؛ الاختلاط لا يرفض السهم."""
+def _market_alignment_details(fetch_intraday) -> tuple[tuple[bool, str], float | None, float | None]:
+    """SPY + QQQ: fetch independently with retry, returning state + daily changes."""
     import time
 
     states = []
+    changes = []
     for sym in ("SPY", "QQQ"):
         state = None
+        change_pct = None
         for attempt in range(1, MARKET_RETRY_ATTEMPTS + 1):
             try:
                 log.info("MARKET DATA | %s | attempt %d/%d", sym, attempt, MARKET_RETRY_ATTEMPTS)
@@ -1389,10 +1396,17 @@ def _market_alignment(fetch_intraday) -> tuple[bool, str]:
                 p = float(cur["Close"].iloc[-1])
                 op = float(cur["Open"].iloc[0])
                 vw = float(_vwap(cur).iloc[-1])
+                prev = d[d.index.date < day]
+                if prev.empty:
+                    raise ValueError("market previous close unavailable")
+                prev_close = float(prev["Close"].iloc[-1])
+                if prev_close <= 0:
+                    raise ValueError("market previous close invalid")
+                change_pct = (p - prev_close) / prev_close * 100.0
                 state = bool(p >= op and p >= vw)
                 log.info(
-                    "MARKET DATA | %s | success | bars=%d | close=%.4f | open=%.4f | vwap=%.4f | state=%s",
-                    sym, len(cur), p, op, vw, "داعم" if state else "ضعيف",
+                    "MARKET DATA | %s | success | bars=%d | close=%.4f | open=%.4f | vwap=%.4f | change=%+.2f%% | state=%s",
+                    sym, len(cur), p, op, vw, change_pct, "داعم" if state else "ضعيف",
                 )
                 break
             except Exception as exc:
@@ -1403,6 +1417,7 @@ def _market_alignment(fetch_intraday) -> tuple[bool, str]:
                 if attempt < MARKET_RETRY_ATTEMPTS:
                     time.sleep(MARKET_RETRY_SLEEP_SECONDS)
         states.append(state)
+        changes.append(change_pct)
 
     if states == [True, True]:
         result = (True, "SPY+QQQ داعمان")
@@ -1413,15 +1428,21 @@ def _market_alignment(fetch_intraday) -> tuple[bool, str]:
     elif any(x is None for x in states):
         result = (False, "بيانات السوق غير مكتملة")
     else:
-        # السوق المختلط ليس فشل بيانات وليس رفضًا تلقائيًا للسهم.
         result = (True, "SPY/QQQ مختلطان")
 
     log.info(
-        "MARKET RESULT | SPY=%s | QQQ=%s | ok=%s | state=%s",
+        "MARKET RESULT | SPY=%s (%s) | QQQ=%s (%s) | ok=%s | state=%s",
         "داعم" if states[0] is True else "ضعيف" if states[0] is False else "غير متوفر",
+        f"{changes[0]:+.2f}%" if changes[0] is not None else "n/a",
         "داعم" if states[1] is True else "ضعيف" if states[1] is False else "غير متوفر",
+        f"{changes[1]:+.2f}%" if changes[1] is not None else "n/a",
         result[0], result[1],
     )
+    return result, changes[0], changes[1]
+
+
+def _market_alignment(fetch_intraday) -> tuple[bool, str]:
+    result, _, _ = _market_alignment_details(fetch_intraday)
     return result
 
 
@@ -1594,6 +1615,7 @@ def analyze_intraday(
     name: str = "",
     market_context: tuple[bool, str] | None = None,
     preloaded: tuple[pd.DataFrame, pd.DataFrame] | None = None,
+    market_changes: tuple[float | None, float | None] | None = None,
 ) -> Optional[IntradaySignal]:
     from market_data import fetch_intraday
     from market_data import intraday_data_fresh
@@ -1678,18 +1700,26 @@ def analyze_intraday(
     drop = (session_high - price) / session_high * 100 if session_high else 0
     dump = drop >= 2.5 and change_pct <= -1.2
 
-    # استثناء محدود للسهم الأقوى من السوق: لا يعمل مع سوق غير مؤكد/بيانات ناقصة،
-    # ولا يعتمد على الدرجة وحدها. يجب أن تكون الصورة اللحظية قوية قبل اختيار الدخول.
+    spy_change = market_changes[0] if market_changes else None
+    qqq_change = market_changes[1] if market_changes else None
+    market_avg_change = (float(spy_change) + float(qqq_change)) / 2.0 if spy_change is not None and qqq_change is not None else None
+    relative_strength_advantage = (change_pct - market_avg_change) if market_avg_change is not None else None
+
+    # Limited weak-market exception: require actual relative strength.
+    # Mixed markets stay on the normal market path so opportunities are not over-filtered.
     strong_stock_market_override = bool(
         (not market_ok)
-        and market_state in {"SPY+QQQ ضعيفان", "SPY/QQQ مختلطان"}
+        and market_state == "SPY+QQQ ضعيفان"
+        and spy_change is not None
+        and qqq_change is not None
         and trend_up
         and live_ok
         and above_vwap
         and above_open
         and m15_state == "داعم"
         and vol_session_ratio >= 1.25
-        and change_pct >= 1.0
+        and change_pct >= RELATIVE_STRENGTH_MIN_STOCK_CHANGE_PCT
+        and relative_strength_advantage >= RELATIVE_STRENGTH_MIN_ADVANTAGE_PCT
         and not dump
         and not chop
         and ((price - e20) / e20 * 100 if e20 else 999.0) <= 3.5
@@ -2363,10 +2393,10 @@ def analyze_intraday(
     score_i = int(max(0, min(100, round(score))))
 
     # في استثناء السوق الضعيف، الدرجة العالية وحدها لا تكفي.
-    # يشترط 97+ مع دخول غير مبكر وجميع شروط القوة اللحظية أعلاه.
+    # يشترط 95+ مع دخول غير مبكر وجميع شروط القوة اللحظية أعلاه.
     if strong_stock_market_override:
         strong_stock_market_override = bool(
-            override_score >= 97.0
+            override_score >= 95.0
             and entry_type != "دخول مبكر"
         )
     market_permission = market_ok or strong_stock_market_override
@@ -2689,12 +2719,13 @@ def scan_intraday(
     scan_intraday.last_window = "ok"
 
     try:
-        market_context = _market_alignment(fetch_intraday)
+        market_context, spy_change, qqq_change = _market_alignment_details(fetch_intraday)
         if not market_context[0] and "ضعيفان" in market_context[1]:
             scan_intraday.last_window = "SPY+QQQ لحظيًا ضعيفان"
             min_score = max(min_score, 88)
     except Exception:
         market_context = (False, "السوق غير مؤكد")
+        spy_change = qqq_change = None
 
     workers = min(8, max(2, len(symbols)))
     stage1: list[tuple[float, str, pd.DataFrame, pd.DataFrame]] = []
@@ -2764,6 +2795,7 @@ def scan_intraday(
                 names.get(sym, sym),
                 market_context=market_context,
                 preloaded=(h1, m5),
+                market_changes=(spy_change, qqq_change),
             )
         except Exception:
             return None
