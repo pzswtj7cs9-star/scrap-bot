@@ -1358,6 +1358,23 @@ def _breakout_quality(today_d: pd.DataFrame, level: float, price: float) -> tupl
         return False, 0.0
 
 
+def _period_days(period: str, default: int = 5) -> int:
+    """Convert common history periods (e.g. 5y, 6mo, 30d) to calendar days."""
+    try:
+        raw = str(period).strip().lower()
+        if raw.endswith("y"):
+            return max(1, int(float(raw[:-1]) * 365.25))
+        if raw.endswith("mo"):
+            return max(1, int(float(raw[:-2]) * 30.5))
+        if raw.endswith("d"):
+            return max(1, int(float(raw[:-1])))
+        if raw.endswith("wk"):
+            return max(1, int(float(raw[:-2]) * 7))
+    except Exception:
+        pass
+    return int(default)
+
+
 def _market_alignment(fetch_intraday) -> tuple[bool, str]:
     """
     Daily SPY/QQQ market gate.
