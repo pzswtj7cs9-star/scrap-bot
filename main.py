@@ -70,6 +70,14 @@ logging.basicConfig(
 )
 log = logging.getLogger("halal-bot")
 
+# Runtime diagnostic: prove exactly which analyzer_intraday.py Render loads.
+import analyzer_intraday as _runtime_analyzer_intraday
+log.info(
+    "RUNTIME ANALYZER | file=%s | version=%s",
+    getattr(_runtime_analyzer_intraday, "__file__", "MISSING"),
+    getattr(_runtime_analyzer_intraday, "INTRADAY_ANALYZER_VERSION", "MISSING"),
+)
+
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 OWNER_CHAT_ID = os.getenv("OWNER_CHAT_ID", "").strip()
 MIN_SCORE = int(os.getenv("MIN_SCORE", "84"))
