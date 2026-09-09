@@ -28,6 +28,10 @@ from stocks import MAX_AUTO_PRICE
 
 log = logging.getLogger(__name__)
 
+# Deployment marker: proves which analyzer_intraday build Render actually loaded.
+INTRADAY_ANALYZER_VERSION = "MARKET_LOGGED_4R_BULK"
+log.info("INTRADAY ANALYZER VERSION | %s", INTRADAY_ANALYZER_VERSION)
+
 SKIP_OPEN_MIN = 20
 SKIP_CLOSE_MIN = 20
 INTRADAY_MIN_SCORE = 82
