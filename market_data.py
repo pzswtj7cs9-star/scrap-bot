@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import logging
 import os
+import threading
+import time as _time
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
@@ -24,6 +26,49 @@ _LAST_ALPACA_FEED = "iex"
 
 _LAST_SOURCE = "none"
 _LAST_ERROR = ""
+
+# Central Alpaca request pacing shared by all threads/jobs in this process.
+# The goal is to prevent bursty parallel scans from triggering HTTP 429.
+APCA_MIN_REQUEST_INTERVAL = float(os.getenv("APCA_MIN_REQUEST_INTERVAL", "0.35"))
+APCA_429_RETRIES = int(os.getenv("APCA_429_RETRIES", "3"))
+_APCA_RATE_LOCK = threading.Lock()
+_APCA_NEXT_REQUEST_AT = 0.0
+
+
+def _alpaca_get(url: str, *, params: dict, timeout: float) -> requests.Response:
+    """Rate-limited GET with bounded 429 backoff for every Alpaca call."""
+    global _APCA_NEXT_REQUEST_AT
+    last_exc = None
+    for attempt in range(APCA_429_RETRIES + 1):
+        with _APCA_RATE_LOCK:
+            now = _time.monotonic()
+            wait = _APCA_NEXT_REQUEST_AT - now
+            if wait > 0:
+                _time.sleep(wait)
+            _APCA_NEXT_REQUEST_AT = _time.monotonic() + max(0.0, APCA_MIN_REQUEST_INTERVAL)
+            try:
+                r = requests.get(url, headers=_alpaca_headers(), params=params, timeout=timeout)
+            except Exception as exc:
+                last_exc = exc
+                continue
+
+        if r.status_code != 429:
+            return r
+
+        if attempt >= APCA_429_RETRIES:
+            return r
+
+        retry_after = r.headers.get("Retry-After")
+        try:
+            delay = float(retry_after) if retry_after else min(8.0, 1.0 * (2 ** attempt))
+        except Exception:
+            delay = min(8.0, 1.0 * (2 ** attempt))
+        log.warning("Alpaca 429: انتظار %.1fs ثم إعادة المحاولة (%d/%d)", delay, attempt + 1, APCA_429_RETRIES)
+        _time.sleep(delay)
+
+    if last_exc:
+        raise last_exc
+    raise RuntimeError("Alpaca request failed")
 
 
 def alpaca_configured() -> bool:
@@ -91,7 +136,7 @@ def _alpaca_request_bars(symbol: str, timeframe: str, start: datetime, end: date
         "feed": feed,
     }
     url = f"{DATA_URL}/v2/stocks/{symbol.upper()}/bars"
-    r = requests.get(url, headers=_alpaca_headers(), params=params, timeout=10)
+    r = _alpaca_get(url, params=params, timeout=10)
     if r.status_code >= 400:
         raise RuntimeError(f"Alpaca {r.status_code}: {r.text[:180]}")
     data = r.json() or {}
@@ -99,7 +144,7 @@ def _alpaca_request_bars(symbol: str, timeframe: str, start: datetime, end: date
     next_token = data.get("next_page_token")
     while next_token and len(bars) < limit:
         params["page_token"] = next_token
-        r = requests.get(url, headers=_alpaca_headers(), params=params, timeout=10)
+        r = _alpaca_get(url, params=params, timeout=10)
         if r.status_code >= 400:
             break
         data = r.json() or {}
@@ -191,7 +236,7 @@ def fetch_latest_quote(symbol: str, feed: Optional[str] = None) -> dict:
     use_feed = feed or (APCA_FEED if APCA_FEED in {"iex", "sip", "delayed_sip"} else _LAST_ALPACA_FEED)
     url = f"{DATA_URL}/v2/stocks/{symbol.upper()}/quotes/latest"
     params = {"feed": use_feed}
-    r = requests.get(url, headers=_alpaca_headers(), params=params, timeout=5)
+    r = _alpaca_get(url, params=params, timeout=5)
     if r.status_code >= 400:
         raise RuntimeError(f"Alpaca quote {r.status_code}: {r.text[:160]}")
     data = r.json() or {}
@@ -286,7 +331,7 @@ def fetch_alpaca_bars_multi(
             "feed": APCA_FEED if APCA_FEED in {"iex", "sip", "delayed_sip"} else "iex",
         }
         url = f"{DATA_URL}/v2/stocks/bars"
-        r = requests.get(url, headers=_alpaca_headers(), params=params, timeout=15)
+        r = _alpaca_get(url, params=params, timeout=15)
         if r.status_code >= 400:
             raise RuntimeError(f"Alpaca multi {r.status_code}: {r.text[:180]}")
         data = r.json() or {}
@@ -294,7 +339,7 @@ def fetch_alpaca_bars_multi(
         next_token = data.get("next_page_token")
         while next_token:
             params["page_token"] = next_token
-            r = requests.get(url, headers=_alpaca_headers(), params=params, timeout=15)
+            r = _alpaca_get(url, params=params, timeout=15)
             if r.status_code >= 400:
                 raise RuntimeError(f"Alpaca multi page {r.status_code}: {r.text[:180]}")
             page = r.json() or {}

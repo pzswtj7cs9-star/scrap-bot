@@ -2587,12 +2587,18 @@ def get_learning_alert() -> dict | None:
 
 
 
-def _prefilter_intraday(symbol: str) -> tuple[float, pd.DataFrame, pd.DataFrame] | None:
-    """Stage 1: cheap H1+5m filter. Returns reusable bars for Stage 2."""
+def _prefilter_intraday(
+    symbol: str,
+    preloaded: tuple[pd.DataFrame, pd.DataFrame] | None = None,
+) -> tuple[float, pd.DataFrame, pd.DataFrame] | None:
+    """Stage 1: cheap H1+5m filter. Uses batch-loaded bars when available."""
     try:
         from market_data import fetch_intraday, intraday_data_fresh
-        h1 = fetch_intraday(symbol, interval="60m", period="10d")
-        m5 = fetch_intraday(symbol, interval="5m", period="5d")
+        if preloaded is not None:
+            h1, m5 = preloaded
+        else:
+            h1 = fetch_intraday(symbol, interval="60m", period="10d")
+            m5 = fetch_intraday(symbol, interval="5m", period="5d")
         ok_h1, _ = intraday_data_fresh(h1, "60m", 90)
         ok_m5, _ = intraday_data_fresh(m5, "5m", 12)
         if h1 is None or m5 is None or len(h1) < 40 or len(m5) < 30 or not ok_h1 or not ok_m5:
@@ -2672,9 +2678,41 @@ def scan_intraday(
 
     log.info("INTRADAY SCAN: %d symbols loaded", len(symbols))
 
+    # Stage 1 bulk load: two multi-symbol requests (H1 + 5m) instead of
+    # hundreds of per-symbol requests. If bulk loading fails, fall back to
+    # the existing per-symbol path, which is protected by market_data rate limiting.
+    bulk_h1: dict[str, pd.DataFrame] = {}
+    bulk_m5: dict[str, pd.DataFrame] = {}
+    try:
+        from market_data import fetch_alpaca_bars_multi, alpaca_configured
+        from datetime import datetime, timedelta, timezone
+        if alpaca_configured():
+            end = datetime.now(timezone.utc)
+            bulk_h1 = fetch_alpaca_bars_multi(
+                symbols, "1Hour", end - timedelta(days=13), end=end, chunk_size=50
+            )
+            bulk_m5 = fetch_alpaca_bars_multi(
+                symbols, "5Min", end - timedelta(days=8), end=end, chunk_size=50
+            )
+            log.info(
+                "STAGE 1 BULK: H1=%d symbols, 5m=%d symbols",
+                len(bulk_h1), len(bulk_m5),
+            )
+    except Exception as exc:
+        log.warning("STAGE 1 bulk load failed; fallback to per-symbol: %s", exc)
+        bulk_h1, bulk_m5 = {}, {}
+
     # Stage 1 — H1 + 5m only for the full universe.
     with ThreadPoolExecutor(max_workers=workers) as pool:
-        futures = {pool.submit(_prefilter_intraday, sym): sym for sym in symbols}
+        futures = {
+            pool.submit(
+                _prefilter_intraday,
+                sym,
+                (bulk_h1.get(sym), bulk_m5.get(sym))
+                if sym in bulk_h1 and sym in bulk_m5 else None,
+            ): sym
+            for sym in symbols
+        }
         for fut in as_completed(futures):
             sym = futures[fut]
             try:
