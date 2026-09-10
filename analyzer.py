@@ -2728,6 +2728,7 @@ def scan_daily(
     finalists=stage1[:max(PREFILTER_MAX_CANDIDATES, limit*5)]
     log.info("STAGE 2 DAILY: top %d", len(finalists))
     results=[]
+    stage2_scores = []
     # Diagnostics only: these counters do NOT change any selection rule.
     # Each finalist is counted at the first rejection gate it fails so /scan
     # reports exactly where Stage 2 candidates disappear.
@@ -2760,6 +2761,7 @@ def scan_daily(
             if not sig:
                 stage2_rejects["no_signal"] += 1
                 continue
+            stage2_scores.append((str(getattr(sig, "symbol", "?")), float(getattr(sig, "score", 0) or 0)))
             if sig.score < min_score:
                 stage2_rejects["score"] += 1
                 continue
@@ -2792,6 +2794,28 @@ def scan_daily(
                 log.warning("DAILY LIQUIDITY CHECK FAILED | %s | %s", sig.symbol, str(exc))
                 continue
             results.append(sig)
+
+    # Score distribution diagnostics only. These values are observational and
+    # do not alter any selection rule. They show whether the zero-qualified
+    # result is caused by scores being far below the threshold or merely just
+    # below it.
+    scores = [score for _, score in stage2_scores]
+    if scores:
+        avg_score = sum(scores) / len(scores)
+        max_score = max(scores)
+        ge_min = sum(1 for score in scores if score >= float(min_score))
+        b85_87 = sum(1 for score in scores if 85 <= score < 88)
+        b80_84 = sum(1 for score in scores if 80 <= score < 85)
+        lt80 = sum(1 for score in scores if score < 80)
+        top10 = sorted(stage2_scores, key=lambda x: (-x[1], x[0]))[:10]
+        top10_text = ", ".join(f"{sym}:{score:.1f}" for sym, score in top10)
+        log.info(
+            "STAGE 2 DAILY SCORE DISTRIBUTION: analyzed=%d | max=%.1f | avg=%.1f | >=%d=%d | 85-87=%d | 80-84=%d | <80=%d | top10=%s",
+            len(scores), max_score, avg_score, int(min_score), ge_min,
+            b85_87, b80_84, lt80, top10_text,
+        )
+    else:
+        log.info("STAGE 2 DAILY SCORE DISTRIBUTION: analyzed=0 | no completed signals")
 
     log.info(
         "STAGE 2 DAILY RESULT: finalists=%d | qualified=%d | rejects=%s",
