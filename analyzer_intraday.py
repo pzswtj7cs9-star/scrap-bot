@@ -29,7 +29,7 @@ from stocks import MAX_AUTO_PRICE
 log = logging.getLogger(__name__)
 
 # Deployment marker: proves which analyzer_intraday build Render actually loaded.
-INTRADAY_ANALYZER_VERSION = "DIAGNOSTIC_NUMERIC_V3"
+INTRADAY_ANALYZER_VERSION = "REGIME_ADAPTIVE_DIAGNOSTIC_V4"
 log.info("INTRADAY ANALYZER VERSION | %s", INTRADAY_ANALYZER_VERSION)
 
 SKIP_OPEN_MIN = 20
@@ -153,6 +153,9 @@ class IntradaySignal:
     news_source: str = ""
     breakout_quality: float = 0.0
     market_state: str = "السوق غير مؤكد"
+    market_condition: str = "غير مؤكد"
+    market_relative_strength: float = 0.0
+    market_avg_change: float = 0.0
     chop: bool = False
     market_regime: str = "neutral"
     interaction_keys: list | None = None
@@ -1368,6 +1371,49 @@ def _breakout_quality(today_5: pd.DataFrame, level: float, price: float) -> tupl
 
 MARKET_RETRY_ATTEMPTS = 4
 MARKET_RETRY_SLEEP_SECONDS = 0.25
+MARKET_RELATIVE_CACHE_TTL_SECONDS = 300
+_MARKET_RELATIVE_CACHE: tuple[float, float, float] | None = None
+
+
+def _market_regime_from_state(market_state: str) -> str:
+    state = str(market_state or "")
+    if "داعمان" in state:
+        return "قوي"
+    if "ضعيفان" in state:
+        return "ضعيف"
+    if "مختلطان" in state:
+        return "مختلط"
+    return "غير مؤكد"
+
+
+def _market_relative_returns(fetch_intraday) -> tuple[float, float, float]:
+    import time
+    global _MARKET_RELATIVE_CACHE
+    now = time.time()
+    if _MARKET_RELATIVE_CACHE and now - _MARKET_RELATIVE_CACHE[0] < MARKET_RELATIVE_CACHE_TTL_SECONDS:
+        spy, qqq = _MARKET_RELATIVE_CACHE[1], _MARKET_RELATIVE_CACHE[2]
+        return spy, qqq, (spy + qqq) / 2.0
+    vals: dict[str, float] = {}
+    for sym in ("SPY", "QQQ"):
+        try:
+            d = fetch_intraday(sym, interval="5m", period="3d")
+            if d is None or len(d) < 6:
+                vals[sym] = 0.0
+                continue
+            day = d.index[-1].date()
+            cur = d[d.index.date == day]
+            prev = d[d.index.date < day]
+            if cur.empty or prev.empty:
+                vals[sym] = 0.0
+                continue
+            prev_close = float(prev["Close"].iloc[-1])
+            last = float(cur["Close"].iloc[-1])
+            vals[sym] = (last - prev_close) / prev_close * 100 if prev_close > 0 else 0.0
+        except Exception:
+            vals[sym] = 0.0
+    spy, qqq = float(vals.get("SPY", 0.0)), float(vals.get("QQQ", 0.0))
+    _MARKET_RELATIVE_CACHE = (now, spy, qqq)
+    return spy, qqq, (spy + qqq) / 2.0
 
 
 def _market_alignment(fetch_intraday) -> tuple[bool, str]:
@@ -1671,31 +1717,13 @@ def analyze_intraday(
     m15_state, m15_points = _m15_confirmation(m15, price)
     news_state, news_title, news_source = _classify_news(symbol)
     market_ok, market_state = market_context if market_context is not None else _market_alignment(fetch_intraday)
+    market_condition = _market_regime_from_state(market_state)
 
     chop = _chop_filter(today_5, price, vwap_last)
-
 
     session_high = float(today_5["High"].max())
     drop = (session_high - price) / session_high * 100 if session_high else 0
     dump = drop >= 2.5 and change_pct <= -1.2
-
-    # استثناء محدود للسهم الأقوى من السوق: لا يعمل مع سوق غير مؤكد/بيانات ناقصة،
-    # ولا يعتمد على الدرجة وحدها. يجب أن تكون الصورة اللحظية قوية قبل اختيار الدخول.
-    strong_stock_market_override = bool(
-        (not market_ok)
-        and market_state in {"SPY+QQQ ضعيفان", "SPY/QQQ مختلطان"}
-        and trend_up
-        and live_ok
-        and above_vwap
-        and above_open
-        and m15_state == "داعم"
-        and vol_session_ratio >= 1.25
-        and change_pct >= 1.0
-        and not dump
-        and not chop
-        and ((price - e20) / e20 * 100 if e20 else 999.0) <= 3.5
-    )
-    market_permission = market_ok or strong_stock_market_override
 
     h_win = h1.tail(20)
     level_high = float(h_win["High"].iloc[:-1].max()) if len(h_win) > 3 else session_high
@@ -1707,6 +1735,24 @@ def analyze_intraday(
     )
     near_level = abs(price - level_high) / max(price, 1e-9) * 100 <= 0.7
     ext_tmp = (price - e20) / e20 * 100 if e20 else 0.0
+
+    market_rel_spy = market_rel_qqq = market_rel_avg = 0.0
+    stock_relative_strength = 0.0
+    relative_strength_ok = False
+    if market_condition == "ضعيف":
+        market_rel_spy, market_rel_qqq, market_rel_avg = _market_relative_returns(fetch_intraday)
+        stock_relative_strength = change_pct - market_rel_avg
+        relative_strength_ok = bool(
+            change_pct >= 0.75 and stock_relative_strength >= 1.25
+        )
+
+    # نظام السوق هو الذي يحدد بوابة الدخول: قوي/مختلط/ضعيف.
+    mixed_market_ok = bool(
+        market_condition == "مختلط"
+        and trend_up and live_ok and above_vwap and above_open
+        and m15_state == "داعم" and vol_session_ratio >= 1.0
+        and not dump and not chop and ext_tmp <= 4.0
+    )
 
     failed = (
         float(today_5["High"].max()) >= level_high * 1.001
@@ -2363,14 +2409,35 @@ def analyze_intraday(
 
     score_i = int(max(0, min(100, round(score))))
 
-    # في استثناء السوق الضعيف، الدرجة العالية وحدها لا تكفي.
-    # يشترط 97+ مع دخول غير مبكر وجميع شروط القوة اللحظية أعلاه.
-    if strong_stock_market_override:
+    # بعد اكتمال الدرجة نطبق شروط نظام السوق الفعلي.
+    if market_condition == "ضعيف":
         strong_stock_market_override = bool(
-            override_score >= 97.0
+            relative_strength_ok
+            and strong_alignment
+            and vol_session_ratio >= 1.25
+            and not chop
+            and ext_tmp <= 3.5
+            and override_score >= 92.0
             and entry_type != "دخول مبكر"
         )
-    market_permission = market_ok or strong_stock_market_override
+    else:
+        strong_stock_market_override = False
+
+    if market_condition == "مختلط":
+        mixed_market_ok = bool(
+            score_i >= 85
+            and trend_up and live_ok and above_vwap and above_open
+            and m15_state == "داعم" and vol_session_ratio >= 1.0
+            and not dump and not chop and ext_tmp <= 4.0
+        )
+    else:
+        mixed_market_ok = False
+
+    market_permission = bool(
+        market_condition == "قوي"
+        or mixed_market_ok
+        or strong_stock_market_override
+    )
     strong_for_grade = (
         score_i >= 95
         and strong_alignment
@@ -2530,6 +2597,15 @@ def analyze_intraday(
         diagnostic_reasons.append("live_ok=False")
     if not market_permission:
         diagnostic_reasons.append("market_block")
+    if market_condition == "مختلط" and not mixed_market_ok:
+        diagnostic_reasons.append("mixed_conditions")
+    if market_condition == "ضعيف":
+        if not relative_strength_ok:
+            diagnostic_reasons.append("weak_relative_strength")
+        if override_score < 92.0:
+            diagnostic_reasons.append("weak_score<92")
+        if entry_type == "دخول مبكر":
+            diagnostic_reasons.append("weak_early_entry")
     if "تحت" in vwap_note:
         diagnostic_reasons.append("below_vwap")
     if m15_state == "معاكس" and score_i < 92:
@@ -2593,6 +2669,9 @@ def analyze_intraday(
         news_source=news_source,
         breakout_quality=round(breakout_quality, 1),
         market_state=market_state,
+        market_condition=market_condition,
+        market_relative_strength=round(stock_relative_strength, 2),
+        market_avg_change=round(market_rel_avg, 2),
         chop=chop,
         market_regime=market_regime,
         interaction_keys=interaction_keys,
@@ -2619,7 +2698,10 @@ def _intraday_diagnostic_metrics(sig: IntradaySignal, min_score: int = INTRADAY_
     tp1_dist = ((tp1 - price) / price * 100.0) if price > 0 else 0.0
     stop_risk = ((price - stop) / price * 100.0) if price > 0 and stop > 0 else 0.0
     return (
-        f"score={float(sig.score):.0f}/{min_score} "
+        f"regime={getattr(sig, 'market_condition', 'غير مؤكد')} "
+        f"| RS={float(getattr(sig, 'market_relative_strength', 0.0) or 0.0):+.2f}% "
+        f"| MKT={float(getattr(sig, 'market_avg_change', 0.0) or 0.0):+.2f}% "
+        f"| score={float(sig.score):.0f}/{min_score} "
         f"| vol={float(getattr(sig, 'volume_ratio', 0.0) or 0.0):.2f}x/{min_vol:.2f}x "
         f"| ext={float(getattr(sig, 'ext_sma20', 0.0) or 0.0):.2f}%/4.50% "
         f"| ATR={float(getattr(sig, 'atr_pct', 0.0) or 0.0):.2f}%/6.50% "
@@ -2756,9 +2838,16 @@ def scan_intraday(
         # and every Stage-2 signal failed market_permission.
         from market_data import fetch_intraday
         market_context = _market_alignment(fetch_intraday)
-        if not market_context[0] and "ضعيفان" in market_context[1]:
+        market_regime = _market_regime_from_state(market_context[1])
+        if market_regime == "ضعيف":
             scan_intraday.last_window = "SPY+QQQ لحظيًا ضعيفان"
             min_score = max(min_score, 88)
+        elif market_regime == "مختلط":
+            min_score = max(min_score, 85)
+        log.info(
+            "INTRADAY MARKET REGIME | regime=%s | state=%s | min_score=%d",
+            market_regime, market_context[1], min_score,
+        )
     except Exception as exc:
         log.warning("INTRADAY MARKET CONTEXT FAILED | %s", str(exc))
         market_context = (False, "السوق غير مؤكد")

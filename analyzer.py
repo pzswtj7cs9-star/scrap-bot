@@ -148,6 +148,9 @@ class DailySignal:
     news_source: str = ""
     breakout_quality: float = 0.0
     market_state: str = "السوق غير مؤكد"
+    market_condition: str = "غير مؤكد"
+    market_relative_strength: float = 0.0
+    market_avg_change: float = 0.0
     chop: bool = False
     market_regime: str = "neutral"
     interaction_keys: list | None = None
@@ -1469,6 +1472,23 @@ def _market_alignment(fetch_intraday) -> tuple[bool, str]:
     return True, "SPY/QQQ مختلطان يوميًا"
 
 
+def _daily_market_condition(market_state: str) -> str:
+    """Map the benchmark state to the daily policy regime.
+
+    This is deliberately separate from the internal adaptive ``market_regime``
+    used for learning so the execution gate always reflects the actual
+    SPY/QQQ condition detected before the scan.
+    """
+    state = str(market_state or "")
+    if "داعمان" in state:
+        return "قوي"
+    if "ضعيفان" in state:
+        return "ضعيف"
+    if "مختلطان" in state:
+        return "مختلط"
+    return "غير مؤكد"
+
+
 def session_window_ok(dt=None) -> tuple[bool, str]:
     """Daily engine: market must be a real US trading session; no intraday first/last-20 restriction."""
     dt = dt or now_ny()
@@ -1718,17 +1738,21 @@ def analyze_daily(
     h4_state, h4_points = _m15_confirmation(h4, price)
     news_state, news_title, news_source = _classify_news(symbol)
     market_ok, market_state = market_context if market_context is not None else _market_alignment(fetch_intraday)
+    market_condition = _daily_market_condition(market_state)
+    log.info(
+        "DAILY MARKET REGIME | condition=%s | state=%s | market_ok=%s",
+        market_condition, market_state, market_ok,
+    )
+
     spy_daily_pct = qqq_daily_pct = None
-    if market_state == "SPY+QQQ ضعيفان يوميًا":
+    if market_condition == "ضعيف":
         spy_daily_pct, qqq_daily_pct = _daily_market_relative_returns(fetch_intraday)
     market_avg_pct = ((spy_daily_pct + qqq_daily_pct) / 2.0) if spy_daily_pct is not None and qqq_daily_pct is not None else None
     relative_strength_pct = (change_pct - market_avg_pct) if market_avg_pct is not None else None
 
-    # Weak-market exception: require real relative strength, not just a green
-    # candle. The stock must be >= +0.75% and outperform the SPY/QQQ average
-    # by >= 1.25 percentage points.
+    # Weak market: allow only stocks showing genuine relative strength.
     relative_strength_ok = bool(
-        market_state == "SPY+QQQ ضعيفان يوميًا"
+        market_condition == "ضعيف"
         and change_pct >= 0.75
         and relative_strength_pct is not None
         and relative_strength_pct >= 1.25
@@ -2355,10 +2379,32 @@ def analyze_daily(
         and ext <= 7.0
     )
 
+    # Market-aware daily execution policy. The market regime is detected first,
+    # then the stock must satisfy the rules for that regime before it can be
+    # emitted. This prevents mixed/weak markets from using the normal strong-
+    # market gate just because market_ok happened to be True.
+    strong_market_ok = bool(
+        market_condition == "قوي"
+        and market_ok
+    )
+
+    mixed_market_ok = bool(
+        market_condition == "مختلط"
+        and market_ok
+        and trend_up
+        and live_ok
+        and above_vwap
+        and above_open
+        and h4_state != "معاكس"
+        and vol_ratio >= 1.0
+        and not dump
+        and not chop
+        and ext <= 6.0
+    )
+
     # Daily strong-stock override: weak market can be bypassed only when the
-    # stock itself is exceptionally aligned. Mixed SPY/QQQ already passes the
-    # normal market gate and therefore does not need an override. Missing market
-    # data can never trigger this override.
+    # stock itself is exceptionally aligned and materially outperforms SPY/QQQ.
+    # Missing/unknown market data can never trigger this override.
     policy = _load_adaptive_policy()
     limits = policy.get("entry_limits", {})
     if entry_type == "دخول مبكر":
@@ -2403,13 +2449,29 @@ def analyze_daily(
     # still recomputed after TP/stop checks below, so market_block is allowed
     # only when it is the sole remaining quality problem.
     strong_stock_market_candidate = bool(
-        (not market_ok)
-        and market_state == "SPY+QQQ ضعيفان يوميًا"
+        market_condition == "ضعيف"
+        and not market_ok
         and score_i >= 92
         and strong_alignment
         and relative_strength_ok
+        and vol_ratio >= 1.25
+        and ext <= 5.0
+        and not chop
     )
     strong_stock_market_override = strong_stock_market_candidate
+
+    market_permission = bool(
+        strong_market_ok
+        or mixed_market_ok
+        or strong_stock_market_override
+    )
+
+    log.info(
+        "DAILY MARKET GATE | %s | condition=%s | permission=%s | score=%d | RS=%s | market_avg=%s",
+        symbol, market_condition, market_permission, score_i,
+        f"{relative_strength_pct:.2f}%" if relative_strength_pct is not None else "n/a",
+        f"{market_avg_pct:.2f}%" if market_avg_pct is not None else "n/a",
+    )
 
     strong_for_grade = (
         score_i >= 95
@@ -2441,7 +2503,7 @@ def analyze_daily(
         and not chop
         and news_momentum_ok
         and not (h4_state == "معاكس" and score_i < 92)
-        and (market_ok or strong_stock_market_candidate)
+        and market_permission
     )
 
     recent_low = float(today_d["Low"].tail(12).min())
@@ -2563,9 +2625,9 @@ def analyze_daily(
         strong_stock_market_candidate
         and not dump
         and not failed
-        and ext <= 8.0
+        and ext <= 5.0
         and atr_pct <= 8.0
-        and vol_ratio >= float(policy.get("min_volume_ratio", 0.85))
+        and vol_ratio >= max(1.25, float(policy.get("min_volume_ratio", 0.85)))
         and not chop
         and news_momentum_ok
         and not (h4_state == "معاكس" and score_i < 92)
@@ -2573,6 +2635,11 @@ def analyze_daily(
         and tp1 > price
         and tp1_distance_pct >= 0.8
         and reward_r >= float(policy.get("min_tp1_r", 1.2))
+    )
+    market_permission = bool(
+        strong_market_ok
+        or mixed_market_ok
+        or strong_stock_market_override
     )
     if strong_stock_market_override:
         quality_ok = True
@@ -2601,8 +2668,17 @@ def analyze_daily(
         quality_reasons.append("news_momentum")
     if h4_state == "معاكس" and score_i < 92:
         quality_reasons.append("h4_contrary")
-    if not market_ok and not strong_stock_market_override:
+    if not market_permission:
         quality_reasons.append("market_block")
+        if market_condition == "مختلط":
+            quality_reasons.append("mixed_conditions")
+        elif market_condition == "ضعيف":
+            if not relative_strength_ok:
+                quality_reasons.append("weak_relative_strength")
+            if score_i < 92:
+                quality_reasons.append("weak_score<92")
+        elif market_condition == "غير مؤكد":
+            quality_reasons.append("market_unknown")
     if "وقف هيكلي واسع جدًا" in warnings:
         quality_reasons.append("wide_stop")
     if tp1 <= price:
@@ -2650,6 +2726,9 @@ def analyze_daily(
         news_source=news_source,
         breakout_quality=round(breakout_quality, 1),
         market_state=market_state,
+        market_condition=market_condition,
+        market_relative_strength=round(relative_strength_pct or 0.0, 2),
+        market_avg_change=round(market_avg_pct or 0.0, 2),
         chop=chop,
         market_regime=market_regime,
         interaction_keys=interaction_keys,
@@ -2787,8 +2866,21 @@ def scan_daily(
     try:
         from market_data import fetch_intraday
         market_context = _market_alignment(fetch_intraday)
-        if not market_context[0] and "ضعيفان" in market_context[1]:
-            min_score = max(min_score, 88)
+        market_condition = _daily_market_condition(market_context[1])
+        if market_condition == "قوي":
+            min_score = max(min_score, 82)
+        elif market_condition == "مختلط":
+            min_score = max(min_score, 86)
+        elif market_condition == "ضعيف":
+            min_score = max(min_score, 92)
+        else:
+            # Unknown/incomplete benchmark data must not be treated as a
+            # supportive market. The per-symbol gate will reject it as well.
+            min_score = max(min_score, 92)
+        log.info(
+            "DAILY MARKET REGIME POLICY | condition=%s | state=%s | min_score=%d",
+            market_condition, market_context[1], min_score,
+        )
     except Exception as exc:
         log.warning("Daily market context unavailable after retries: %s", exc)
         market_context = (False, "بيانات SPY/QQQ غير متاحة")
