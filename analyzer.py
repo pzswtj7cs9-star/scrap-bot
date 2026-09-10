@@ -2728,19 +2728,50 @@ def scan_daily(
     finalists=stage1[:max(PREFILTER_MAX_CANDIDATES, limit*5)]
     log.info("STAGE 2 DAILY: top %d", len(finalists))
     results=[]
+    # Diagnostics only: these counters do NOT change any selection rule.
+    # Each finalist is counted at the first rejection gate it fails so /scan
+    # reports exactly where Stage 2 candidates disappear.
+    stage2_rejects = {
+        "exception": 0,
+        "no_signal": 0,
+        "score": 0,
+        "live_ok": 0,
+        "quality": 0,
+        "negative_news": 0,
+        "liquidity": 0,
+        "stale_or_no_quote": 0,
+    }
     def one(item):
         _,sym,weekly,daily=item
         try:
             return analyze_daily(sym,names.get(sym,sym),True,market_context,(weekly,daily))
-        except Exception:
+        except Exception as exc:
+            log.warning("DAILY STAGE 2 EXCEPTION | %s | %s", sym, str(exc))
             return None
     with ThreadPoolExecutor(max_workers=workers) as pool:
         futures=[pool.submit(one,x) for x in finalists]
         for fut in as_completed(futures):
-            sig=fut.result()
-            if not sig: continue
-            if sig.score < min_score or not sig.live_ok or not sig.quality_ok: continue
-            if sig.news_state == "negative": continue
+            try:
+                sig=fut.result()
+            except Exception as exc:
+                stage2_rejects["exception"] += 1
+                log.warning("DAILY STAGE 2 FUTURE EXCEPTION | %s", str(exc))
+                continue
+            if not sig:
+                stage2_rejects["no_signal"] += 1
+                continue
+            if sig.score < min_score:
+                stage2_rejects["score"] += 1
+                continue
+            if not sig.live_ok:
+                stage2_rejects["live_ok"] += 1
+                continue
+            if not sig.quality_ok:
+                stage2_rejects["quality"] += 1
+                continue
+            if sig.news_state == "negative":
+                stage2_rejects["negative_news"] += 1
+                continue
             # Validate current bid/ask only for the Stage-2 finalists.
             # This keeps the full-universe scan fast while preventing Daily V2
             # from reporting a false "liquidity suitable" result.
@@ -2751,12 +2782,23 @@ def scan_daily(
                 sig.dollar_volume_3m = round(float(liq.get("dollar_volume", 0) or 0), 0)
                 sig.liquidity_ok = bool(liq.get("ok", False))
                 if not sig.liquidity_ok:
+                    stage2_rejects["liquidity"] += 1
                     continue
                 if liq.get("quote_source") == "none" or float(liq.get("quote_age_min", 999) or 999) > 2.0:
+                    stage2_rejects["stale_or_no_quote"] += 1
                     continue
-            except Exception:
+            except Exception as exc:
+                stage2_rejects["liquidity"] += 1
+                log.warning("DAILY LIQUIDITY CHECK FAILED | %s | %s", sig.symbol, str(exc))
                 continue
             results.append(sig)
+
+    log.info(
+        "STAGE 2 DAILY RESULT: finalists=%d | qualified=%d | rejects=%s",
+        len(finalists),
+        len(results),
+        stage2_rejects,
+    )
     rank={et:i for i,et in enumerate(ENTRY_TYPES)}
     results.sort(key=lambda x:(
         -(float(x.score)+1.5*min(float(getattr(x,'reward_r',0) or 0),3.0)
