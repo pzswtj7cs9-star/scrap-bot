@@ -155,6 +155,7 @@ class DailySignal:
     expected_slippage_pct: float = 0.0
     dollar_volume_3m: float = 0.0
     liquidity_ok: bool = True
+    quality_reasons: list[str] | None = None
 
 
 
@@ -2511,6 +2512,36 @@ def analyze_daily(
     else:
         warnings.append("لم توجد مقاومة قريبة مناسبة؛ TP1 احتياطي")
 
+    # Diagnostics only: explain exactly why a signal failed the final quality gate.
+    # This list is observational and does not change quality_ok or any selection rule.
+    quality_reasons = []
+    if dump:
+        quality_reasons.append("dump")
+    if failed:
+        quality_reasons.append("failed_breakout")
+    if ext > 8.0:
+        quality_reasons.append(f"extension>{8.0:.0f}%")
+    if atr_pct > 8.0:
+        quality_reasons.append(f"atr>{8.0:.0f}%")
+    if vol_ratio < float(policy.get("min_volume_ratio", 0.85)):
+        quality_reasons.append("volume")
+    if chop:
+        quality_reasons.append("chop")
+    if not news_momentum_ok:
+        quality_reasons.append("news_momentum")
+    if h4_state == "معاكس" and score_i < 92:
+        quality_reasons.append("h4_contrary")
+    if not market_ok and not strong_stock_market_override:
+        quality_reasons.append("market_block")
+    if "وقف هيكلي واسع جدًا" in warnings:
+        quality_reasons.append("wide_stop")
+    if tp1 <= price:
+        quality_reasons.append("invalid_tp1")
+    if tp1_distance_pct < 0.8:
+        quality_reasons.append("tp1_too_close")
+    if reward_r < float(policy.get("min_tp1_r", 1.2)):
+        quality_reasons.append("weak_tp1_r")
+
     return DailySignal(
         symbol=symbol,
         name=name or symbol,
@@ -2556,6 +2587,7 @@ def analyze_daily(
         expected_slippage_pct=round(float(liquidity.get("slippage_pct", 0) or 0), 3),
         dollar_volume_3m=round(float(liquidity.get("dollar_volume", 0) or 0), 0),
         liquidity_ok=liquidity_ok,
+        quality_reasons=quality_reasons,
     )
 
 
@@ -2770,6 +2802,17 @@ def scan_daily(
                 continue
             if not sig.quality_ok:
                 stage2_rejects["quality"] += 1
+                qreasons = getattr(sig, "quality_reasons", None) or []
+                log.info(
+                    "DAILY QUALITY REJECT | %s | score=%s | reasons=%s | ext=%.2f%% | atr=%.2f%% | vol=%.2fx | h4=%s | market=%s | tp1R=%.2f",
+                    sig.symbol, sig.score, qreasons or ["unspecified"],
+                    float(getattr(sig, "ext_sma20", 0) or 0),
+                    float(getattr(sig, "atr_pct", 0) or 0),
+                    float(getattr(sig, "volume_ratio", 0) or 0),
+                    getattr(sig, "h4_state", "?"),
+                    getattr(sig, "market_state", "?"),
+                    float(getattr(sig, "reward_r", 0) or 0),
+                )
                 continue
             if sig.news_state == "negative":
                 stage2_rejects["negative_news"] += 1
