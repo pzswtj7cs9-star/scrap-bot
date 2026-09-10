@@ -29,7 +29,7 @@ from stocks import MAX_AUTO_PRICE
 log = logging.getLogger(__name__)
 
 # Deployment marker: proves which analyzer_intraday build Render actually loaded.
-INTRADAY_ANALYZER_VERSION = "MARKET_LOGGED_4R_BULK_RS_FIX_V1"
+INTRADAY_ANALYZER_VERSION = "DIAGNOSTIC_NUMERIC_V3"
 log.info("INTRADAY ANALYZER VERSION | %s", INTRADAY_ANALYZER_VERSION)
 
 SKIP_OPEN_MIN = 20
@@ -160,6 +160,7 @@ class IntradaySignal:
     expected_slippage_pct: float = 0.0
     dollar_volume_3m: float = 0.0
     liquidity_ok: bool = True
+    diagnostic_reasons: list[str] | None = None
 
 
 def _read_learning_records() -> list[dict]:
@@ -2520,6 +2521,40 @@ def analyze_intraday(
     else:
         warnings.append("لم توجد مقاومة قريبة مناسبة؛ TP1 احتياطي")
 
+    # تشخيص فقط — لا يغيّر أي شرط تداول. يوضح بالضبط لماذا لم يتجاوز
+    # المرشح Stage 2، مع فصل أسباب الجودة/السوق/الدرجة/التأكيد.
+    diagnostic_reasons: list[str] = []
+    if score_i < INTRADAY_MIN_SCORE:
+        diagnostic_reasons.append(f"score<{INTRADAY_MIN_SCORE}")
+    if not live_ok:
+        diagnostic_reasons.append("live_ok=False")
+    if not market_permission:
+        diagnostic_reasons.append("market_block")
+    if "تحت" in vwap_note:
+        diagnostic_reasons.append("below_vwap")
+    if m15_state == "معاكس" and score_i < 92:
+        diagnostic_reasons.append("m15_contrary")
+    if news_state == "negative":
+        diagnostic_reasons.append("negative_news")
+    if dump:
+        diagnostic_reasons.append("dump")
+    if failed:
+        diagnostic_reasons.append("failed_breakout")
+    if ext > 4.5:
+        diagnostic_reasons.append("extension>4.5%")
+    if atr_pct > 6.5:
+        diagnostic_reasons.append("atr>6.5%")
+    if vol_session_ratio < float(policy.get("min_volume_ratio", 0.85)):
+        diagnostic_reasons.append("volume<policy")
+    if chop:
+        diagnostic_reasons.append("chop")
+    if tp1_distance_pct < 0.8:
+        diagnostic_reasons.append("tp1_distance<0.8%")
+    if reward_r < float(policy.get("min_tp1_r", 1.2)):
+        diagnostic_reasons.append("tp1_r<1.20")
+    if risk > price * 0.045:
+        diagnostic_reasons.append("wide_stop>4.5%")
+
     return IntradaySignal(
         symbol=symbol,
         name=name or symbol,
@@ -2565,6 +2600,32 @@ def analyze_intraday(
         expected_slippage_pct=round(float(liquidity.get("slippage_pct", 0) or 0), 3),
         dollar_volume_3m=round(float(liquidity.get("dollar_volume", 0) or 0), 0),
         liquidity_ok=liquidity_ok,
+        diagnostic_reasons=diagnostic_reasons,
+    )
+
+
+
+def _intraday_diagnostic_metrics(sig: IntradaySignal, min_score: int = INTRADAY_MIN_SCORE) -> str:
+    """Numeric diagnostic only; never changes trading decisions."""
+    try:
+        policy = _load_adaptive_policy()
+    except Exception:
+        policy = {}
+    min_vol = float(policy.get("min_volume_ratio", 0.85) or 0.85)
+    min_r = float(policy.get("min_tp1_r", 1.20) or 1.20)
+    price = float(getattr(sig, "price", 0.0) or 0.0)
+    tp1 = float(getattr(sig, "tp1", 0.0) or 0.0)
+    stop = float(getattr(sig, "stop_loss", 0.0) or 0.0)
+    tp1_dist = ((tp1 - price) / price * 100.0) if price > 0 else 0.0
+    stop_risk = ((price - stop) / price * 100.0) if price > 0 and stop > 0 else 0.0
+    return (
+        f"score={float(sig.score):.0f}/{min_score} "
+        f"| vol={float(getattr(sig, 'volume_ratio', 0.0) or 0.0):.2f}x/{min_vol:.2f}x "
+        f"| ext={float(getattr(sig, 'ext_sma20', 0.0) or 0.0):.2f}%/4.50% "
+        f"| ATR={float(getattr(sig, 'atr_pct', 0.0) or 0.0):.2f}%/6.50% "
+        f"| TP1dist={tp1_dist:.2f}%/0.80% "
+        f"| TP1R={float(getattr(sig, 'reward_r', 0.0) or 0.0):.2f}R/{min_r:.2f}R "
+        f"| risk={stop_risk:.2f}%/4.50%"
     )
 
 
@@ -2764,13 +2825,15 @@ def scan_intraday(
     results: list[IntradaySignal] = []
     rejection_counts = {
         "no_signal": 0,
-        "score_live_quality": 0,
+        "score": 0,
+        "live_ok": 0,
+        "quality": 0,
         "below_vwap": 0,
         "m15_contrary": 0,
         "negative_news": 0,
         "liquidity": 0,
     }
-    stage2_scores: list[float] = []
+    rejection_samples: list[str] = []
     def _one_stage2(item):
         _, sym, h1, m5 = item
         try:
@@ -2790,21 +2853,45 @@ def scan_intraday(
             if not sig:
                 rejection_counts["no_signal"] += 1
                 continue
-            try:
-                stage2_scores.append(float(sig.score))
-            except Exception:
-                pass
-            if sig.score < min_score or not sig.live_ok or not sig.quality_ok:
-                rejection_counts["score_live_quality"] += 1
+            # تشخيص أول سبب فعلي للرفض، مع الاحتفاظ بأسباب الإشارة كلها داخل
+            # diagnostic_reasons حتى نعرف هل المشكلة درجة أم جودة أم سوق...
+            reasons = list(getattr(sig, "diagnostic_reasons", []) or [])
+
+            if sig.score < min_score:
+                rejection_counts["score"] += 1
+                rejection_samples.append(
+                    f"{sig.symbol}: score={sig.score}<{min_score} reasons={reasons} | {_intraday_diagnostic_metrics(sig, min_score)}"
+                )
+                continue
+            if not sig.live_ok:
+                rejection_counts["live_ok"] += 1
+                rejection_samples.append(
+                    f"{sig.symbol}: live_ok=False reasons={reasons} | {_intraday_diagnostic_metrics(sig, min_score)}"
+                )
+                continue
+            if not sig.quality_ok:
+                rejection_counts["quality"] += 1
+                rejection_samples.append(
+                    f"{sig.symbol}: quality=False reasons={reasons} | {_intraday_diagnostic_metrics(sig, min_score)}"
+                )
                 continue
             if "تحت" in sig.vwap_day_note:
                 rejection_counts["below_vwap"] += 1
+                rejection_samples.append(
+                    f"{sig.symbol}: below_vwap reasons={reasons} | {_intraday_diagnostic_metrics(sig, min_score)}"
+                )
                 continue
             if sig.m15_state == "معاكس" and sig.score < 92:
                 rejection_counts["m15_contrary"] += 1
+                rejection_samples.append(
+                    f"{sig.symbol}: m15_contrary score={sig.score} reasons={reasons} | {_intraday_diagnostic_metrics(sig, min_score)}"
+                )
                 continue
             if sig.news_state == "negative":
                 rejection_counts["negative_news"] += 1
+                rejection_samples.append(
+                    f"{sig.symbol}: negative_news reasons={reasons} | {_intraday_diagnostic_metrics(sig, min_score)}"
+                )
                 continue
             liq = _quote_liquidity(sig.symbol, sig.price)
             sig.spread_pct = round(float(liq.get("spread_pct", 0) or 0), 3)
@@ -2815,36 +2902,30 @@ def scan_intraday(
                 sig.warnings.append(f"Spread مرتفع {sig.spread_pct:.2f}%")
             if not sig.liquidity_ok:
                 rejection_counts["liquidity"] += 1
+                rejection_samples.append(
+                    f"{sig.symbol}: liquidity=False spread={sig.spread_pct:.3f}% slippage={sig.expected_slippage_pct:.3f}% | {_intraday_diagnostic_metrics(sig, min_score)}"
+                )
                 continue
             if liq.get("quote_source") == "none" or float(liq.get("quote_age_min", 999) or 999) > 2.0:
                 rejection_counts["liquidity"] += 1
+                rejection_samples.append(
+                    f"{sig.symbol}: stale_or_no_quote source={liq.get('quote_source')} age={float(liq.get('quote_age_min', 999) or 999):.2f}m | {_intraday_diagnostic_metrics(sig, min_score)}"
+                )
                 continue
             results.append(sig)
+            log.info(
+                "INTRADAY QUALIFIED METRICS | %s | %s",
+                sig.symbol,
+                _intraday_diagnostic_metrics(sig, min_score),
+            )
 
     log.info(
         "STAGE 2: %d deep candidates completed; %d qualified signals | rejects=%s",
         len(finalists), len(results), rejection_counts,
     )
-
-    # Score distribution diagnostic only — does not change any trading rule.
-    if stage2_scores:
-        ordered_scores = sorted(stage2_scores, reverse=True)
-        analyzed_n = len(ordered_scores)
-        max_score = max(ordered_scores)
-        avg_score = sum(ordered_scores) / analyzed_n
-        ge_min = sum(1 for x in ordered_scores if x >= float(min_score))
-        b80_81 = sum(1 for x in ordered_scores if 80.0 <= x < 82.0)
-        b75_79 = sum(1 for x in ordered_scores if 75.0 <= x < 80.0)
-        b70_74 = sum(1 for x in ordered_scores if 70.0 <= x < 75.0)
-        lt70 = sum(1 for x in ordered_scores if x < 70.0)
-        log.info(
-            "INTRADAY SCORE DISTRIBUTION: analyzed=%d | max=%.1f | avg=%.1f | >=%d=%d | 80-81=%d | 75-79=%d | 70-74=%d | <70=%d | top10=%s",
-            analyzed_n, max_score, avg_score, min_score, ge_min,
-            b80_81, b75_79, b70_74, lt70,
-            [round(x, 1) for x in ordered_scores[:10]],
-        )
-    else:
-        log.info("INTRADAY SCORE DISTRIBUTION: analyzed=0 | no scores returned")
+    if rejection_samples:
+        for sample in rejection_samples[:20]:
+            log.info("INTRADAY REJECT DETAIL | %s", sample)
 
     rank = {et: i for i, et in enumerate(ENTRY_TYPES)}
     results.sort(key=lambda x: (
