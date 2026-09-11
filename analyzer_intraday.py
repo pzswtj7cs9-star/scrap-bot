@@ -29,7 +29,7 @@ from stocks import MAX_AUTO_PRICE
 log = logging.getLogger(__name__)
 
 # Deployment marker: proves which analyzer_intraday build Render actually loaded.
-INTRADAY_ANALYZER_VERSION = "REGIME_ADAPTIVE_DIAGNOSTIC_V4"
+INTRADAY_ANALYZER_VERSION = "REGIME_ADAPTIVE_DIAGNOSTIC_V4_FIXED_MARKET_GATE"
 log.info("INTRADAY ANALYZER VERSION | %s", INTRADAY_ANALYZER_VERSION)
 
 SKIP_OPEN_MIN = 20
@@ -1754,9 +1754,14 @@ def analyze_intraday(
         and not dump and not chop and ext_tmp <= 4.0
     )
 
-    # بوابة السوق التمهيدية: يجب تعريفها قبل اكتشاف أنواع الدخول التي تعتمد عليها.
-    # الاستثناء القوي في السوق الضعيف لا يمكن حسمه هنا لأنه يحتاج score النهائي؛
-    # لذلك يبقى False مؤقتاً ويعاد حسابه بعد اكتمال الدرجة.
+    # بوابة اكتشاف الإشارات: تسمح ببناء/تقييم setup في الأنظمة الثلاثة.
+    # لا تعني القبول النهائي؛ السوق المختلط/الضعيف سيُحسم لاحقاً بعد اكتمال
+    # الدرجة وشروط الجودة والاستثناء الخاص بالسهم القوي.
+    setup_market_permission = market_condition in {"قوي", "مختلط", "ضعيف"}
+
+    # بوابة السوق التمهيدية للـScore: السوق القوي مسموح مباشرة، والمختلط فقط
+    # إذا اجتاز شروطه التمهيدية. السوق الضعيف لا يأخذ مكافأة السوق قبل حسم
+    # استثناء السهم القوي بعد اكتمال الدرجة.
     market_permission = bool(
         market_condition == "قوي"
         or mixed_market_ok
@@ -1836,7 +1841,7 @@ def analyze_intraday(
             )
             liquidity_displacement = bool(
                 swept and reclaimed and displacement and trend_up and above_vwap and above_open
-                and m15_state != "معاكس" and market_permission and not failed
+                and m15_state != "معاكس" and setup_market_permission and not failed
                 and mom > 0.08 and ext_tmp <= 3.5
             )
     except Exception:
@@ -1875,7 +1880,7 @@ def analyze_intraday(
             prior_move = (closes.iloc[-2] - closes.iloc[-4]) / max(closes.iloc[-4], 1e-9) * 100
             momentum_continuation = bool(
                 trend_up and above_vwap and above_open and not failed and not breakout_now
-                and m15_state != "معاكس" and market_permission
+                and m15_state != "معاكس" and setup_market_permission
                 and rising and green_now and prior_move >= 0.35
                 and mom > 0.08 and vol_session_ratio >= 1.05
                 and body_now / range_now >= 0.45 and close_pos >= 0.65
@@ -1903,7 +1908,7 @@ def analyze_intraday(
                 compression and expansion and float(cur["Close"]) > float(cur["Open"])
                 and cur_pos >= 0.70 and vol_session_ratio >= 1.20
                 and above_vwap and above_open and trend_up
-                and m15_state != "معاكس" and market_permission and not failed
+                and m15_state != "معاكس" and setup_market_permission and not failed
                 and cur_body / cur_range >= 0.45 and ext_tmp <= 4.0
             )
     except Exception:
@@ -1950,7 +1955,7 @@ def analyze_intraday(
                 and flag_range <= 2.0
                 and breakout_flag
                 and trend_up and above_vwap and above_open
-                and m15_state != "معاكس" and market_permission and not failed
+                and m15_state != "معاكس" and setup_market_permission and not failed
                 and last_green and mom > 0.05
                 and vol_session_ratio >= 1.05
                 and ext_tmp <= 3.5
@@ -1976,7 +1981,7 @@ def analyze_intraday(
                 touches >= 2
                 and resistance_was_lost and reclaimed
                 and trend_up and above_vwap and above_open
-                and m15_state != "معاكس" and market_permission and not failed
+                and m15_state != "معاكس" and setup_market_permission and not failed
                 and last_green and mom > 0.05
                 and vol_session_ratio >= 1.05
                 and ext_tmp <= 3.5
@@ -2006,7 +2011,7 @@ def analyze_intraday(
                 not_chasing = ext_tmp <= 3.5
                 opening_drive_pullback = bool(
                     trend_up and above_vwap and above_open
-                    and m15_state != "معاكس" and market_permission and not failed
+                    and m15_state != "معاكس" and setup_market_permission and not failed
                     and drive_return >= 1.0
                     and controlled_pullback and reclaim_drive
                     and last_green and mom > 0.05
@@ -2034,7 +2039,7 @@ def analyze_intraday(
                 hod_reclaim = bool(
                     had_hod and pullback_below_hod and reclaimed_hod
                     and above_vwap and above_open and trend_up
-                    and m15_state != "معاكس" and market_permission and not failed
+                    and m15_state != "معاكس" and setup_market_permission and not failed
                     and last_green and mom > 0.05
                     and vol_session_ratio >= 1.05
                     and ext_tmp <= 3.5
@@ -2054,7 +2059,7 @@ def analyze_intraday(
             orb_failed_reclaim = bool(
                 broke and failure and reclaim
                 and trend_up and above_vwap and above_open
-                and m15_state != "معاكس" and market_permission and not failed
+                and m15_state != "معاكس" and setup_market_permission and not failed
                 and last_green and mom > 0.05
                 and vol_session_ratio >= 1.05
                 and ext_tmp <= 3.5
@@ -2085,7 +2090,7 @@ def analyze_intraday(
                 and 20.0 <= b_retrace <= 65.0
                 and c_break and price >= a_high * 0.999
                 and c_last_green and trend_up and above_vwap and above_open
-                and m15_state != "معاكس" and market_permission and not failed
+                and m15_state != "معاكس" and setup_market_permission and not failed
                 and mom > 0.05 and vol_session_ratio >= 1.05
                 and ext_tmp <= 3.5
             )
