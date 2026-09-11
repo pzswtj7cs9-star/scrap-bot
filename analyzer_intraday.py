@@ -29,7 +29,7 @@ from stocks import MAX_AUTO_PRICE
 log = logging.getLogger(__name__)
 
 # Deployment marker: proves which analyzer_intraday build Render actually loaded.
-INTRADAY_ANALYZER_VERSION = "REGIME_ADAPTIVE_DIAGNOSTIC_V4_FIXED_MARKET_GATE"
+INTRADAY_ANALYZER_VERSION = "REGIME_ADAPTIVE_PROFESSIONAL_MARKET_REGIME_V5"
 log.info("INTRADAY ANALYZER VERSION | %s", INTRADAY_ANALYZER_VERSION)
 
 SKIP_OPEN_MIN = 20
@@ -68,6 +68,11 @@ REGIME_WEIGHT_MIN = 0.85
 REGIME_WEIGHT_MAX = 1.15
 REGIME_MIN_EDGE = 0.04
 REGIME_MIN_COVERAGE = 0.45
+
+# New dedicated market state: both SPY/QQQ are above session open but below VWAP.
+# It is intentionally separate from mixed/weak and starts with a neutral learning weight.
+POSITIVE_BELOW_VWAP_MAX_OPEN_GAP_PCT = 0.30
+POSITIVE_BELOW_VWAP_MIN_SCORE = 85
 
 # Adaptive Exit Engine: learns TP/SL behavior from MFE/MAE and time-to-result.
 # It starts shadow-only and can activate automatically after OOS validation.
@@ -224,6 +229,7 @@ def _default_adaptive_policy() -> dict:
             regime: {et: 1.0 for et in ENTRY_TYPES}
             for regime in (
                 "chop", "trend_clean", "trend_mixed", "market_weak",
+                "market_positive_below_vwap",
                 "news_momentum", "high_volatility", "neutral"
             )
         },
@@ -236,6 +242,7 @@ def _default_adaptive_policy() -> dict:
             }
             for regime in (
                 "chop", "trend_clean", "trend_mixed", "market_weak",
+                "market_positive_below_vwap",
                 "news_momentum", "high_volatility", "neutral"
             )
         },
@@ -428,11 +435,14 @@ def _classify_regime(
     market_ok: bool,
     atr_pct: float,
     news_state: str,
+    market_condition: str = "غير مؤكد",
 ) -> str:
     if news_state == "positive_strong":
         return "news_momentum"
     if chop:
         return "chop"
+    if market_condition == "إيجابي_تحت_VWAP":
+        return "market_positive_below_vwap"
     if not market_ok:
         return "market_weak"
     if trend_up and m15_state == "داعم" and atr_pct <= 4.5:
@@ -1379,6 +1389,8 @@ def _market_regime_from_state(market_state: str) -> str:
     state = str(market_state or "")
     if "داعمان" in state:
         return "قوي"
+    if "إيجابيان تحت VWAP" in state:
+        return "إيجابي_تحت_VWAP"
     if "ضعيفان" in state:
         return "ضعيف"
     if "مختلطان" in state:
@@ -1436,10 +1448,15 @@ def _market_alignment(fetch_intraday) -> tuple[bool, str]:
                 p = float(cur["Close"].iloc[-1])
                 op = float(cur["Open"].iloc[0])
                 vw = float(_vwap(cur).iloc[-1])
-                state = bool(p >= op and p >= vw)
+                if p >= op and p >= vw:
+                    state = "داعم"
+                elif p >= op and p < vw and p >= op * (1.0 - POSITIVE_BELOW_VWAP_MAX_OPEN_GAP_PCT / 100.0):
+                    state = "إيجابي_تحت_VWAP"
+                else:
+                    state = "ضعيف"
                 log.info(
                     "MARKET DATA | %s | success | bars=%d | close=%.4f | open=%.4f | vwap=%.4f | state=%s",
-                    sym, len(cur), p, op, vw, "داعم" if state else "ضعيف",
+                    sym, len(cur), p, op, vw, state,
                 )
                 break
             except Exception as exc:
@@ -1451,22 +1468,24 @@ def _market_alignment(fetch_intraday) -> tuple[bool, str]:
                     time.sleep(MARKET_RETRY_SLEEP_SECONDS)
         states.append(state)
 
-    if states == [True, True]:
+    if states == ["داعم", "داعم"]:
         result = (True, "SPY+QQQ داعمان")
-    elif states == [False, False]:
+    elif states == ["إيجابي_تحت_VWAP", "إيجابي_تحت_VWAP"]:
+        result = (True, "SPY+QQQ إيجابيان تحت VWAP")
+    elif states == ["ضعيف", "ضعيف"]:
         result = (False, "SPY+QQQ ضعيفان")
     elif all(x is None for x in states):
         result = (False, "السوق غير مؤكد")
     elif any(x is None for x in states):
         result = (False, "بيانات السوق غير مكتملة")
     else:
-        # السوق المختلط ليس فشل بيانات وليس رفضًا تلقائيًا للسهم.
+        # أي مزيج بين داعم/إيجابي تحت VWAP/ضعيف يبقى سوقًا مختلطًا.
         result = (True, "SPY/QQQ مختلطان")
 
     log.info(
         "MARKET RESULT | SPY=%s | QQQ=%s | ok=%s | state=%s",
-        "داعم" if states[0] is True else "ضعيف" if states[0] is False else "غير متوفر",
-        "داعم" if states[1] is True else "ضعيف" if states[1] is False else "غير متوفر",
+        states[0] if states[0] is not None else "غير متوفر",
+        states[1] if states[1] is not None else "غير متوفر",
         result[0], result[1],
     )
     return result
@@ -1757,14 +1776,28 @@ def analyze_intraday(
     # بوابة اكتشاف الإشارات: تسمح ببناء/تقييم setup في الأنظمة الثلاثة.
     # لا تعني القبول النهائي؛ السوق المختلط/الضعيف سيُحسم لاحقاً بعد اكتمال
     # الدرجة وشروط الجودة والاستثناء الخاص بالسهم القوي.
-    setup_market_permission = market_condition in {"قوي", "مختلط", "ضعيف"}
+    setup_market_permission = market_condition in {"قوي", "مختلط", "إيجابي_تحت_VWAP", "ضعيف"}
 
     # بوابة السوق التمهيدية للـScore: السوق القوي مسموح مباشرة، والمختلط فقط
     # إذا اجتاز شروطه التمهيدية. السوق الضعيف لا يأخذ مكافأة السوق قبل حسم
     # استثناء السهم القوي بعد اكتمال الدرجة.
+    positive_below_vwap_ok = bool(
+        market_condition == "إيجابي_تحت_VWAP"
+        and trend_up
+        and live_ok
+        and above_vwap
+        and above_open
+        and m15_state != "معاكس"
+        and vol_session_ratio >= 0.90
+        and not dump
+        and not chop
+        and ext_tmp <= 4.5
+    )
+
     market_permission = bool(
         market_condition == "قوي"
         or mixed_market_ok
+        or positive_below_vwap_ok
     )
 
     failed = (
@@ -2354,7 +2387,7 @@ def analyze_intraday(
     atr = float(_atr(h1, 14).iloc[-1] or price * 0.01)
     atr_pct = atr / price * 100
     market_regime = _classify_regime(
-        trend_up, m15_state, chop, market_ok, atr_pct, news_state
+        trend_up, m15_state, chop, market_ok, atr_pct, news_state, market_condition
     )
     interaction_keys = _interaction_keys(
         entry_type, market_regime, m15_state, vol_session_ratio, 0.0
@@ -2446,9 +2479,21 @@ def analyze_intraday(
     else:
         mixed_market_ok = False
 
+    if market_condition == "إيجابي_تحت_VWAP":
+        positive_below_vwap_ok = bool(
+            score_i >= POSITIVE_BELOW_VWAP_MIN_SCORE
+            and trend_up and live_ok and above_vwap and above_open
+            and m15_state != "معاكس"
+            and vol_session_ratio >= 0.90
+            and not dump and not chop and ext_tmp <= 4.5
+        )
+    else:
+        positive_below_vwap_ok = False
+
     market_permission = bool(
         market_condition == "قوي"
         or mixed_market_ok
+        or positive_below_vwap_ok
         or strong_stock_market_override
     )
     strong_for_grade = (
@@ -2612,6 +2657,8 @@ def analyze_intraday(
         diagnostic_reasons.append("market_block")
     if market_condition == "مختلط" and not mixed_market_ok:
         diagnostic_reasons.append("mixed_conditions")
+    if market_condition == "إيجابي_تحت_VWAP" and not positive_below_vwap_ok:
+        diagnostic_reasons.append("positive_below_vwap_conditions")
     if market_condition == "ضعيف":
         if not relative_strength_ok:
             diagnostic_reasons.append("weak_relative_strength")
@@ -2855,6 +2902,9 @@ def scan_intraday(
         if market_regime == "ضعيف":
             scan_intraday.last_window = "SPY+QQQ لحظيًا ضعيفان"
             min_score = max(min_score, 88)
+        elif market_regime == "إيجابي_تحت_VWAP":
+            scan_intraday.last_window = "SPY+QQQ إيجابيان تحت VWAP"
+            min_score = max(min_score, POSITIVE_BELOW_VWAP_MIN_SCORE)
         elif market_regime == "مختلط":
             min_score = max(min_score, 85)
         log.info(
