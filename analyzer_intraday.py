@@ -2773,32 +2773,42 @@ def _intraday_diagnostic_metrics(sig: IntradaySignal, min_score: int = INTRADAY_
 
 def format_intraday_ar(sig: IntradaySignal, min_score: int = INTRADAY_MIN_SCORE) -> str:
     arrow = "▲" if sig.change_pct >= 0 else "▼"
-    tp_source = "مقاومة/قمة سابقة" if sig.resistance_tp1 else "احتياطي"
+    market_map = {
+        "قوي": "🟢 قوي",
+        "إيجابي_تحت_VWAP": "🟡 إيجابي",
+        "مختلط": "🟠 مختلط",
+        "ضعيف": "🔴 ضعيف",
+        "غير مؤكد": "⚪️ غير مؤكد",
+    }
+    market_condition = str(getattr(sig, "market_condition", "") or "")
+    market_label = market_map.get(market_condition)
+    if market_label is None:
+        state = str(getattr(sig, "market_state", "") or "")
+        if "داعمان" in state:
+            market_label = "🟢 قوي"
+        elif "إيجابيان" in state:
+            market_label = "🟡 إيجابي"
+        elif "مختلطان" in state:
+            market_label = "🟠 مختلط"
+        elif "ضعيفان" in state:
+            market_label = "🔴 ضعيف"
+        else:
+            market_label = "⚪️ غير مؤكد"
+
     lines = [
         f"⚡ لحظي | {sig.symbol} | {sig.score}/100 | {sig.grade} | ساعة+15د+5د",
-        f"{sig.entry_emoji} نوع الدخول: {sig.entry_type}",
+        f"{market_label} | نظام السوق",
+        f"{sig.entry_emoji} الدخول: {sig.entry_type}",
         f"{sig.name}",
         "—————————————",
         f"السعر: {(getattr(sig, 'alert_entry_price', 0.0) or sig.price):.2f} $  ({arrow} {sig.change_pct:+.2f}%)",
         f"شراء: {sig.buy_low:.2f} — {sig.buy_high:.2f}",
-        f"وقف: {sig.stop_loss:.2f} ({sig.sl_method}) | مخاطرة {sig.risk_pct:.2f}%",
-        f"TP1: {sig.tp1:.2f} | TP2: {sig.tp2:.2f} | TP3: {sig.tp3:.2f}",
-        f"مصدر TP1: {tp_source} | العائد إلى TP1: {sig.reward_r:.2f}R",
-        "—————————————",
-        f"{sig.vwap_day_note} | افتتاح: {'فوق' if sig.above_open else 'تحت'} | حجم: {sig.volume_ratio:.2f}x",
-        f"15د: {sig.m15_state} | السوق: {sig.market_state} | تعلم: {sig.learning_adjustment:+.1f}",
-        f"الأخبار: {sig.news_state} | جودة الاختراق: {sig.breakout_quality:.0f}/100",
-        f"Spread: {sig.spread_pct:.2f}% | انزلاق متوقع: {sig.expected_slippage_pct:.2f}% | السيولة: {'مناسبة' if sig.liquidity_ok else 'غير مناسبة'}",
+        f"وقف: {sig.stop_loss:.2f} | مخاطرة: {sig.risk_pct:.2f}%",
+        f"TP1: {sig.tp1:.2f} | {sig.reward_r:.2f}R",
+        f"TP2: {sig.tp2:.2f}",
+        f"TP3: {sig.tp3:.2f}",
     ]
-    if sig.reasons:
-        lines.append("لماذا: " + " | ".join(sig.reasons[:3]))
-    if sig.warnings:
-        lines.append("مخاطر: " + " | ".join(sig.warnings[:3]))
-    if sig.score < min_score or not sig.live_ok or not sig.quality_ok:
-        lines.append(f"تحت شرط الإرسال اللحظي ({min_score}+ / تأكيد / جودة)")
-    lines.append("تحليل لحظي تعليمي — ليست توصية. يفضّل الخروج قبل الإغلاق.")
     return "\n".join(lines)
-
 
 
 def get_learning_alert() -> dict | None:

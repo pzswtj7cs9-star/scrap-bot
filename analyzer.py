@@ -1381,16 +1381,17 @@ def _period_days(period: str, default: int = 5) -> int:
 
 DAILY_MARKET_RETRY_ATTEMPTS = 4
 DAILY_MARKET_RETRY_DELAYS = (0.0, 0.5, 1.0, 1.5)
+DAILY_POSITIVE_EMA50_BUFFER_PCT = 0.50
 
 
 def _market_alignment(fetch_intraday) -> tuple[bool, str]:
     """
-    Daily SPY/QQQ market gate with explicit per-attempt diagnostics.
-
-    The logging is diagnostic only; it does not change the daily trading rules:
-    - incomplete/unavailable data is retried before being treated as unavailable;
-    - mixed SPY/QQQ is allowed;
-    - weak SPY+QQQ remains subject to the existing daily strong-stock override.
+    Daily SPY/QQQ market regime:
+      قوي    = كلاهما فوق EMA20 و EMA20 >= EMA50
+      إيجابي = كلاهما فوق EMA50، لكن ليسا قويين بالكامل
+      مختلط  = أحدهما قوي/إيجابي والآخر ضعيف
+      ضعيف   = كلاهما ضعيف
+      غير مؤكد = بيانات غير مكتملة
     """
     states = []
 
@@ -1406,35 +1407,33 @@ def _market_alignment(fetch_intraday) -> tuple[bool, str]:
                 d = fetch_intraday(sym, interval="1d", period="6mo")
 
                 if d is None:
-                    log.warning("DAILY MARKET FETCH | %s | attempt %d/%d | data=None", sym, attempt_no, DAILY_MARKET_RETRY_ATTEMPTS)
                     raise ValueError("market data is None")
-
                 if "Close" not in d.columns:
-                    log.warning(
-                        "DAILY MARKET FETCH | %s | attempt %d/%d | missing Close | columns=%s",
-                        sym, attempt_no, DAILY_MARKET_RETRY_ATTEMPTS, list(d.columns),
-                    )
                     raise ValueError("Close column missing")
 
                 c = pd.to_numeric(d["Close"], errors="coerce").dropna()
-                log.info(
-                    "DAILY MARKET FETCH | %s | attempt %d/%d | rows=%d | valid_close=%d",
-                    sym, attempt_no, DAILY_MARKET_RETRY_ATTEMPTS, len(d), len(c),
-                )
                 if len(c) < 50:
                     raise ValueError(f"insufficient daily closes: {len(c)} < 50")
 
                 e20 = float(_ema(c, 20).iloc[-1])
                 e50 = float(_ema(c, 50).iloc[-1])
                 p = float(c.iloc[-1])
+
                 if not (np.isfinite(e20) and np.isfinite(e50) and np.isfinite(p)):
                     raise ValueError("non-finite market values")
 
-                state = bool(p >= e20 and e20 >= e50)
+                strong = bool(p >= e20 and e20 >= e50)
+                positive = bool(
+                    not strong
+                    and p >= e50 * (1.0 - DAILY_POSITIVE_EMA50_BUFFER_PCT / 100.0)
+                )
+
+                state = "داعم" if strong else "إيجابي" if positive else "ضعيف"
+
                 log.info(
                     "DAILY MARKET RESULT | %s | attempt %d/%d | close=%.4f | ema20=%.4f | ema50=%.4f | state=%s",
-                    sym, attempt_no, DAILY_MARKET_RETRY_ATTEMPTS, p, e20, e50,
-                    "داعم" if state else "ضعيف",
+                    sym, attempt_no, DAILY_MARKET_RETRY_ATTEMPTS,
+                    p, e20, e50, state,
                 )
                 break
 
@@ -1444,33 +1443,41 @@ def _market_alignment(fetch_intraday) -> tuple[bool, str]:
                     sym, attempt_no, DAILY_MARKET_RETRY_ATTEMPTS, exc,
                 )
                 if attempt < DAILY_MARKET_RETRY_ATTEMPTS - 1:
-                    delay = DAILY_MARKET_RETRY_DELAYS[min(attempt + 1, len(DAILY_MARKET_RETRY_DELAYS) - 1)]
+                    delay = DAILY_MARKET_RETRY_DELAYS[
+                        min(attempt + 1, len(DAILY_MARKET_RETRY_DELAYS) - 1)
+                    ]
                     if delay > 0:
                         time_module.sleep(delay)
 
         states.append(state)
         log.info(
             "DAILY MARKET SYMBOL FINAL | %s | state=%s",
-            sym, "داعم" if state is True else "ضعيف" if state is False else "غير متاح",
+            sym, state or "غير متاح",
         )
 
     if any(x is None for x in states):
-        log.warning(
-            "DAILY MARKET FINAL | SPY=%s | QQQ=%s | ok=False | state=بيانات SPY/QQQ غير مكتملة بعد إعادة المحاولة",
-            states[0], states[1],
-        )
         return False, "بيانات SPY/QQQ غير مكتملة بعد إعادة المحاولة"
 
-    if states[0] and states[1]:
+    if states[0] == "داعم" and states[1] == "داعم":
         log.info("DAILY MARKET FINAL | SPY=داعم | QQQ=داعم | ok=True | state=SPY+QQQ داعمان يوميًا")
         return True, "SPY+QQQ داعمان يوميًا"
-    if (not states[0]) and (not states[1]):
+
+    if states[0] in {"داعم", "إيجابي"} and states[1] in {"داعم", "إيجابي"}:
+        log.info(
+            "DAILY MARKET FINAL | SPY=%s | QQQ=%s | ok=True | state=SPY+QQQ إيجابيان يوميًا",
+            states[0], states[1],
+        )
+        return True, "SPY+QQQ إيجابيان يوميًا"
+
+    if states[0] == "ضعيف" and states[1] == "ضعيف":
         log.info("DAILY MARKET FINAL | SPY=ضعيف | QQQ=ضعيف | ok=False | state=SPY+QQQ ضعيفان يوميًا")
         return False, "SPY+QQQ ضعيفان يوميًا"
 
-    log.info("DAILY MARKET FINAL | SPY=%s | QQQ=%s | ok=True | state=SPY/QQQ مختلطان يوميًا", states[0], states[1])
+    log.info(
+        "DAILY MARKET FINAL | SPY=%s | QQQ=%s | ok=True | state=SPY/QQQ مختلطان يوميًا",
+        states[0], states[1],
+    )
     return True, "SPY/QQQ مختلطان يوميًا"
-
 
 def _daily_market_condition(market_state: str) -> str:
     """Map the benchmark state to the daily policy regime.
@@ -1482,6 +1489,8 @@ def _daily_market_condition(market_state: str) -> str:
     state = str(market_state or "")
     if "داعمان" in state:
         return "قوي"
+    if "إيجابيان" in state:
+        return "إيجابي_تحت_VWAP"
     if "ضعيفان" in state:
         return "ضعيف"
     if "مختلطان" in state:
@@ -2388,6 +2397,20 @@ def analyze_daily(
         and market_ok
     )
 
+    positive_market_ok = bool(
+        market_condition == "إيجابي_تحت_VWAP"
+        and market_ok
+        and trend_up
+        and live_ok
+        and above_vwap
+        and above_open
+        and h4_state != "معاكس"
+        and vol_ratio >= 0.95
+        and not dump
+        and not chop
+        and ext <= 5.5
+    )
+
     mixed_market_ok = bool(
         market_condition == "مختلط"
         and market_ok
@@ -2462,6 +2485,7 @@ def analyze_daily(
 
     market_permission = bool(
         strong_market_ok
+        or positive_market_ok
         or mixed_market_ok
         or strong_stock_market_override
     )
@@ -2638,6 +2662,7 @@ def analyze_daily(
     )
     market_permission = bool(
         strong_market_ok
+        or positive_market_ok
         or mixed_market_ok
         or strong_stock_market_override
     )
@@ -2742,32 +2767,42 @@ def analyze_daily(
 
 def format_daily_ar(sig: DailySignal, min_score: int = DAILY_MIN_SCORE) -> str:
     arrow = "▲" if sig.change_pct >= 0 else "▼"
-    tp_source = "مقاومة/قمة سابقة" if sig.resistance_tp1 else "احتياطي"
+    market_map = {
+        "قوي": "🟢 قوي",
+        "إيجابي_تحت_VWAP": "🟡 إيجابي",
+        "مختلط": "🟠 مختلط",
+        "ضعيف": "🔴 ضعيف",
+        "غير مؤكد": "⚪️ غير مؤكد",
+    }
+    market_condition = str(getattr(sig, "market_condition", "") or "")
+    market_label = market_map.get(market_condition)
+    if market_label is None:
+        state = str(getattr(sig, "market_state", "") or "")
+        if "داعمان" in state:
+            market_label = "🟢 قوي"
+        elif "إيجابيان" in state:
+            market_label = "🟡 إيجابي"
+        elif "مختلطان" in state:
+            market_label = "🟠 مختلط"
+        elif "ضعيفان" in state:
+            market_label = "🔴 ضعيف"
+        else:
+            market_label = "⚪️ غير مؤكد"
+
     lines = [
         f"⚡ يومي | {sig.symbol} | {sig.score}/100 | {sig.grade} | ساعة+4س+يومي",
-        f"{sig.entry_emoji} نوع الدخول: {sig.entry_type}",
+        f"{market_label} | نظام السوق",
+        f"{sig.entry_emoji} الدخول: {sig.entry_type}",
         f"{sig.name}",
         "—————————————",
         f"السعر: {sig.price:.2f} $  ({arrow} {sig.change_pct:+.2f}%)",
         f"شراء: {sig.buy_low:.2f} — {sig.buy_high:.2f}",
-        f"وقف: {sig.stop_loss:.2f} ({sig.sl_method}) | مخاطرة {sig.risk_pct:.2f}%",
-        f"TP1: {sig.tp1:.2f} | TP2: {sig.tp2:.2f} | TP3: {sig.tp3:.2f}",
-        f"مصدر TP1: {tp_source} | العائد إلى TP1: {sig.reward_r:.2f}R",
-        "—————————————",
-        f"{sig.vwap_note} | افتتاح: {'فوق' if sig.above_open else 'تحت'} | حجم: {sig.volume_ratio:.2f}x",
-        f"4س: {sig.h4_state} | السوق: {sig.market_state} | تعلم: {sig.learning_adjustment:+.1f}",
-        f"الأخبار: {sig.news_state} | جودة الاختراق: {sig.breakout_quality:.0f}/100",
-        f"Spread: {sig.spread_pct:.2f}% | انزلاق متوقع: {sig.expected_slippage_pct:.2f}% | السيولة: {'مناسبة' if sig.liquidity_ok else 'غير مناسبة'}",
+        f"وقف: {sig.stop_loss:.2f} | مخاطرة: {sig.risk_pct:.2f}%",
+        f"TP1: {sig.tp1:.2f} | {sig.reward_r:.2f}R",
+        f"TP2: {sig.tp2:.2f}",
+        f"TP3: {sig.tp3:.2f}",
     ]
-    if sig.reasons:
-        lines.append("لماذا: " + " | ".join(sig.reasons[:3]))
-    if sig.warnings:
-        lines.append("مخاطر: " + " | ".join(sig.warnings[:3]))
-    if sig.score < min_score or not sig.live_ok or not sig.quality_ok:
-        lines.append(f"تحت شرط الإرسال اليومي ({min_score}+ / تأكيد / جودة)")
-    lines.append("تحليل يومي تعليمي — ليست توصية. يفضّل الخروج قبل الإغلاق.")
     return "\n".join(lines)
-
 
 
 def get_learning_alert() -> dict | None:
@@ -2869,6 +2904,8 @@ def scan_daily(
         market_condition = _daily_market_condition(market_context[1])
         if market_condition == "قوي":
             min_score = max(min_score, 82)
+        elif market_condition == "إيجابي_تحت_VWAP":
+            min_score = max(min_score, 85)
         elif market_condition == "مختلط":
             min_score = max(min_score, 86)
         elif market_condition == "ضعيف":
