@@ -232,7 +232,10 @@ class PerformanceLog:
             row["mae_pct"] = round(min(float(row.get("mae_pct") or 0), (min_low - entry) / entry * 100), 2)
 
             def _evt(kind: str, price: float, close_trade: bool) -> dict[str, Any]:
-                pnl = round((price - entry) / entry * 100, 2)
+                # للتعلم: عند ضرب الوقف نعتمد وقف الإشارة الأصلي، لا سعر التأكيد
+                # المتأخر. سعر التأكيد يبقى محفوظاً للشفافية والتدقيق فقط.
+                outcome_price = stop if kind == "stop" else price
+                pnl = round((outcome_price - entry) / entry * 100, 2)
                 try:
                     opened_at = datetime.fromisoformat(row["opened_at"])
                     row["time_to_result_min"] = round((_now() - opened_at).total_seconds() / 60.0, 1)
@@ -263,7 +266,7 @@ class PerformanceLog:
                                 row.get("learning_id"),
                                 symbol,
                                 kind,
-                                exit_price=price,
+                                exit_price=outcome_price,
                                 note="تعلم لحظي: إغلاق كامل عند TP1" if kind == "tp1" else "",
                             )
                             try:
@@ -281,6 +284,8 @@ class PerformanceLog:
                     "kind": kind,
                     "price": round(price, 4),
                     "entry": entry,
+                    "stop_loss": round(float(row.get("stop_loss") or 0), 4),
+                    "confirmation_price": round(price, 4) if kind == "stop" else None,
                     "pnl_pct": pnl,
                     "closed": close_trade,
                     "timeframe": tf,
@@ -367,7 +372,15 @@ class PerformanceLog:
         mode_ar = "لحظي" if mode == "intraday" else "سوينغ/يومي"
         if kind == "stop":
             title = f"🛑 ضرب الوقف — {sym} | {mode_ar}"
-            body = f"تم لمس وقف الخسارة عند {price:.2f} $"
+            stop_loss = ev.get("stop_loss") or price
+            confirmation_price = ev.get("confirmation_price") or price
+            if abs(float(confirmation_price) - float(stop_loss)) >= 0.005:
+                body = (
+                    f"الوقف المحدد: {float(stop_loss):.2f} $\n"
+                    f"سعر التأكيد: {float(confirmation_price):.2f} $"
+                )
+            else:
+                body = f"تم تأكيد ضرب الوقف عند {float(stop_loss):.2f} $"
         elif kind == "tp1":
             title = f"🎯 الهدف 1 — {sym} | {mode_ar}"
             body = f"وصل الهدف الأول عند {price:.2f} $"
