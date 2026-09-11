@@ -1754,6 +1754,14 @@ def analyze_intraday(
         and not dump and not chop and ext_tmp <= 4.0
     )
 
+    # بوابة السوق التمهيدية: يجب تعريفها قبل اكتشاف أنواع الدخول التي تعتمد عليها.
+    # الاستثناء القوي في السوق الضعيف لا يمكن حسمه هنا لأنه يحتاج score النهائي؛
+    # لذلك يبقى False مؤقتاً ويعاد حسابه بعد اكتمال الدرجة.
+    market_permission = bool(
+        market_condition == "قوي"
+        or mixed_market_ok
+    )
+
     failed = (
         float(today_5["High"].max()) >= level_high * 1.001
         and price < level_high * 0.997
