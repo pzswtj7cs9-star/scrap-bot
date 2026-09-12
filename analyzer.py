@@ -1255,6 +1255,82 @@ def record_daily_outcome(
     target["status"] = "completed"
 
 
+
+def _build_4h_from_60m(df: pd.DataFrame) -> pd.DataFrame | None:
+    """حوّل شموع 60 دقيقة إلى شموع 4 ساعات فعلية من جلسة التداول النظامية.
+    يتم تكوين كل شمعة 4س من أربع شموع 60د متتالية في نفس يوم التداول،
+    مع تجاهل المجموعة الجزئية الأخيرة إذا لم تكتمل 4 شموع.
+    """
+    try:
+        if df is None or df.empty:
+            return None
+
+        x = df.copy()
+        x = x.sort_index()
+
+        # توحيد أسماء الأعمدة إذا كانت MultiIndex.
+        if isinstance(x.columns, pd.MultiIndex):
+            x.columns = [c[0] if isinstance(c, tuple) else c for c in x.columns]
+
+        needed = ["Open", "High", "Low", "Close"]
+        if any(c not in x.columns for c in needed):
+            return None
+
+        # نحتاج فقط لشموع الجلسة النظامية؛ نستبعد أي pre/post-market
+        # إن كانت موجودة في المصدر.
+        if getattr(x.index, "tz", None) is not None:
+            local_idx = x.index.tz_convert("America/New_York")
+        else:
+            local_idx = x.index
+
+        session_mask = (
+            (local_idx.time >= pd.Timestamp("09:30").time()) &
+            (local_idx.time < pd.Timestamp("16:00").time())
+        )
+        x = x.loc[session_mask].copy()
+        if x.empty:
+            return None
+
+        if getattr(x.index, "tz", None) is not None:
+            session_day = x.index.tz_convert("America/New_York").date
+        else:
+            session_day = x.index.date
+
+        # أربع شموع 60د متتالية = شمعة 4 ساعات.
+        x["_session_day"] = session_day
+        x["_bar_no"] = x.groupby("_session_day").cumcount()
+        x["_group"] = x["_bar_no"] // 4
+
+        agg = {
+            "Open": "first",
+            "High": "max",
+            "Low": "min",
+            "Close": "last",
+        }
+        if "Volume" in x.columns:
+            agg["Volume"] = "sum"
+
+        g = x.groupby(["_session_day", "_group"], sort=True)
+        counts = g["Close"].count()
+        valid_groups = counts[counts >= 4].index
+
+        y = g.agg(agg).loc[valid_groups]
+        if y.empty:
+            return None
+
+        # استخدم نهاية آخر ساعة داخل كل مجموعة كزمن الشمعة 4س.
+        end_times = x.groupby(["_session_day", "_group"], sort=True).apply(
+            lambda z: z.index[-1]
+        ).loc[valid_groups]
+        y.index = pd.DatetimeIndex(end_times.values)
+
+        y = y.sort_index()
+        y = y[~y.index.duplicated(keep="last")]
+        return y
+    except Exception:
+        return None
+
+
 def _m15_confirmation(h4: pd.DataFrame, price: float) -> tuple[str, int]:
     """تأكيد ناعم 4 ساعات: نفس فكرة 15د في اللحظي، لكن على بنية 4س."""
     try:
@@ -1708,10 +1784,17 @@ def analyze_daily(
     today_d = daily.tail(120).copy()
     last_day = daily.index[-1].date()
     try:
-        h4 = fetch_intraday(symbol, interval="60m", period="60d")
-        ok_h4, _ = intraday_data_fresh(h4, "60m", 240)
+        h4_60m = fetch_intraday(symbol, interval="60m", period="60d")
+        ok_h4, _ = intraday_data_fresh(h4_60m, "60m", 240)
         if not ok_h4:
             h4 = None
+        else:
+            # مهم: المصدر يعطينا 60د؛ نحوله فعليًا إلى 4س قبل
+            # تمريره إلى _m15_confirmation، حتى لا تُحسب مؤشرات
+            # "4H" على شموع 60د.
+            h4 = _build_4h_from_60m(h4_60m)
+            if h4 is None or len(h4) < 30:
+                h4 = None
     except Exception:
         h4 = None
 
