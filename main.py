@@ -951,9 +951,8 @@ async def live_scan_intraday_job(context: ContextTypes.DEFAULT_TYPE) -> None:
         if not fresh:
             return
 
-        # تفضيل: اختراق مؤكد ثم إعادة اختبار ثم دخول مبكر
-        rank = {"اختراق مؤكد": 0, "إعادة اختبار": 1, "دخول مبكر": 2}
-        fresh.sort(key=lambda s: (rank.get(getattr(s, "entry_type", ""), 9), -s.score))
+        # scan_intraday رتّب جميع الاستراتيجيات الـ16 بالفعل؛ نحافظ على ترتيبه
+        # ولا نفرض أولوية يدوية على 3 استراتيجيات فقط هنا.
         sig = fresh[0]
         # لا نسجل الإشارة كـ"مُرسلة" قبل نجاح Telegram فعلياً.
         # نأخذ سعرًا لحظيًا واحدًا وقت الإرسال لسعر الدخول والحساب والتعلّم،

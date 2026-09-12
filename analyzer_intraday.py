@@ -56,6 +56,9 @@ ENTRY_TYPES = (
     "استعادة بعد فشل ORB", "استمرار ABC", "سحب سيولة مع Displacement",
 )
 PREFILTER_MAX_CANDIDATES = 50
+# Stage-1 strategy-aware routing: reserve a small lane for every one of the 16 strategies.
+PREFILTER_STRATEGY_TOP_K = 4
+PREFILTER_STRATEGY_CAP = 100
 ADAPTIVE_MIN_EDGE = 0.04
 ADAPTIVE_MIN_COVERAGE = 0.45
 ADAPTIVE_ROLLBACK_DROP = 0.06
@@ -137,7 +140,7 @@ class IntradaySignal:
     reasons: list[str]
     warnings: list[str]
     mode: str = "intraday"
-    entry_type: str = "دخول مبكر"
+    entry_type: str = ""
     entry_emoji: str = "🟢"
     structure_zone: str = "محايدة"
     quality_ok: bool = True
@@ -169,6 +172,10 @@ class IntradaySignal:
     dollar_volume_3m: float = 0.0
     liquidity_ok: bool = True
     diagnostic_reasons: list[str] | None = None
+    # جميع الاستراتيجيات المطابقة فعليًا، وليس الاستراتيجية الأساسية فقط.
+    matched_entry_types: list[str] | None = None
+    # تقييم قوة كل استراتيجية مطابقة لاختيار الأقوى بدل أولوية الاسم فقط.
+    strategy_scores: dict[str, float] | None = None
 
 
 def _read_learning_records() -> list[dict]:
@@ -357,7 +364,11 @@ def _strategy_stats(rows: list[dict]) -> dict:
     """إحصاءات منفصلة لكل واحدة من استراتيجيات الدخول الـ16."""
     stats = {}
     for et in ENTRY_TYPES:
-        subset = [r for r in rows if str(r.get("entry_type") or "") == et]
+        subset = [
+            r for r in rows
+            if et in (r.get("matched_entry_types") or [])
+            or str(r.get("entry_type") or "") == et
+        ]
         wins = sum(1 for r in subset if r.get("status") == "tp1")
         stats[et] = {
             "samples": len(subset),
@@ -386,7 +397,7 @@ def _build_candidate_policy(completed: list[dict], current: dict) -> dict | None
             candidate["weights"][factor] = max(1.0 - ADAPTIVE_MAX_CHANGE, w - 0.05)
 
     for et in ENTRY_TYPES:
-        subset = [r for r in recent if r.get("entry_type") == et]
+        subset = [r for r in recent if et in (r.get("matched_entry_types") or []) or r.get("entry_type") == et]
         if len(subset) < 6:
             continue
         r = _rate(subset)
@@ -593,7 +604,8 @@ def _build_regime_candidate(policy: dict, train: list[dict]) -> dict:
         for et in ENTRY_TYPES:
             subset = [
                 r for r in regime_rows
-                if str(r.get("entry_type") or "") == et
+                if et in (r.get("matched_entry_types") or [])
+                or str(r.get("entry_type") or "") == et
             ]
             if len(subset) < REGIME_MIN_SAMPLES:
                 continue
@@ -717,7 +729,8 @@ def _build_exit_candidate(policy: dict, train: list[dict]) -> dict:
         for et in ENTRY_TYPES:
             subset = [
                 r for r in regime_rows
-                if str(r.get("entry_type") or "") == et
+                if et in (r.get("matched_entry_types") or [])
+                or str(r.get("entry_type") or "") == et
             ]
             if len(subset) < EXIT_MIN_SAMPLES:
                 continue
@@ -873,7 +886,7 @@ def adaptive_retrain_if_ready(force_monthly: bool = False) -> dict:
 
     # نوع الدخول
     for et in ("دخول مبكر", "إعادة اختبار", "ارتداد VWAP", "ارتداد EMA20", "سحب سيولة", "سحب سيولة مع Displacement", "ضغط ثم انفجار", "استمرار الزخم", "اختراق نطاق الافتتاح", "اختراق مؤكد", "علم صاعد", "استعادة مستوى", "دخول بعد Opening Drive", "استعادة قمة اليوم", "استعادة بعد فشل ORB", "استمرار ABC"):
-        subset = [r for r in train if r.get("entry_type") == et]
+        subset = [r for r in train if et in (r.get("matched_entry_types") or []) or r.get("entry_type") == et]
         if len(subset) < 6:
             continue
         rate = _rate(subset)
@@ -1144,6 +1157,8 @@ def register_intraday_signal(sig: IntradaySignal) -> str:
             "score": int(sig.score),
             "grade": sig.grade,
             "entry_type": sig.entry_type,
+            "matched_entry_types": list(sig.matched_entry_types or []),
+            "strategy_scores": dict(sig.strategy_scores or {}),
             "factors": list(sig.factor_keys or []),
             "m15_state": sig.m15_state,
             "volume_ratio": float(sig.volume_ratio),
@@ -1223,6 +1238,8 @@ def record_intraday_outcome(
             "score": target.get("score"),
             "grade": target.get("grade"),
             "entry_type": target.get("entry_type"),
+            "matched_entry_types": target.get("matched_entry_types") or [],
+            "strategy_scores": target.get("strategy_scores") or {},
             "factors": target.get("factors") or [],
             "m15_state": target.get("m15_state", "محايد"),
             "volume_ratio": target.get("volume_ratio", 0),
@@ -2149,46 +2166,136 @@ def analyze_intraday(
 
     breakout_ok, breakout_quality = _breakout_quality(today_5, level_high, price)
     orb_breakout_ok, orb_quality = _breakout_quality(today_5, orb_high, price) if orb_high > 0 else (False, 0.0)
+    # كل استراتيجية لها بوابة مستقلة. لا نستخدم "دخول مبكر" كـ fallback.
+    matched_entry_types: list[str] = []
+    if retest:
+        matched_entry_types.append("إعادة اختبار")
+    if orb_breakout and orb_breakout_ok:
+        matched_entry_types.append("اختراق نطاق الافتتاح")
+        breakout_quality = max(breakout_quality, orb_quality)
+    if breakout_now and breakout_ok and vol_session_ratio >= 1.0:
+        matched_entry_types.append("اختراق مؤكد")
+    if liquidity_displacement:
+        matched_entry_types.append("سحب سيولة مع Displacement")
+    if liquidity_sweep:
+        matched_entry_types.append("سحب سيولة")
+    if compression_expansion:
+        matched_entry_types.append("ضغط ثم انفجار")
+    if momentum_continuation:
+        matched_entry_types.append("استمرار الزخم")
+    if bull_flag:
+        matched_entry_types.append("علم صاعد")
+    if resistance_reclaim:
+        matched_entry_types.append("استعادة مستوى")
+    if orb_failed_reclaim:
+        matched_entry_types.append("استعادة بعد فشل ORB")
+    if abc_continuation:
+        matched_entry_types.append("استمرار ABC")
+    if opening_drive_pullback:
+        matched_entry_types.append("دخول بعد Opening Drive")
+    if hod_reclaim:
+        matched_entry_types.append("استعادة قمة اليوم")
+    if vwap_bounce:
+        matched_entry_types.append("ارتداد VWAP")
+    if ema_pullback:
+        matched_entry_types.append("ارتداد EMA20")
+    if early:
+        matched_entry_types.append("دخول مبكر")
+
     # Failed breakout is a rejection/filter condition, not an entry strategy.
-    # If there is no separate recovery setup below, the candidate is discarded.
-    if failed and not (retest or liquidity_displacement or liquidity_sweep or orb_failed_reclaim or abc_continuation or opening_drive_pullback or hod_reclaim or vwap_bounce or ema_pullback or orb_breakout or breakout_now or compression_expansion or momentum_continuation or bull_flag or resistance_reclaim):
+    # إذا لم تطابق أي استراتيجية حقيقية، لا نخترع اسمًا؛ المرشح يُرفض.
+    if failed and not matched_entry_types:
+        return None
+    if not matched_entry_types:
         return None
 
-    if retest:
-        entry_type, entry_emoji = "إعادة اختبار", "🟡"
-    elif orb_breakout and orb_breakout_ok:
-        breakout_quality = max(breakout_quality, orb_quality)
-        entry_type, entry_emoji = "اختراق نطاق الافتتاح", "🟢"
-    elif breakout_now and breakout_ok and vol_session_ratio >= 1.0:
-        entry_type, entry_emoji = "اختراق مؤكد", "🟢"
-    elif liquidity_displacement:
-        entry_type, entry_emoji = "سحب سيولة مع Displacement", "🟢"
-    elif liquidity_sweep:
-        entry_type, entry_emoji = "سحب سيولة", "🟢"
-    elif compression_expansion:
-        entry_type, entry_emoji = "ضغط ثم انفجار", "🟢"
-    elif momentum_continuation:
-        entry_type, entry_emoji = "استمرار الزخم", "🟢"
-    elif bull_flag:
-        entry_type, entry_emoji = "علم صاعد", "🟢"
-    elif resistance_reclaim:
-        entry_type, entry_emoji = "استعادة مستوى", "🟢"
-    elif orb_failed_reclaim:
-        entry_type, entry_emoji = "استعادة بعد فشل ORB", "🟢"
-    elif abc_continuation:
-        entry_type, entry_emoji = "استمرار ABC", "🟢"
-    elif opening_drive_pullback:
-        entry_type, entry_emoji = "دخول بعد Opening Drive", "🟢"
-    elif hod_reclaim:
-        entry_type, entry_emoji = "استعادة قمة اليوم", "🟢"
-    elif vwap_bounce:
-        entry_type, entry_emoji = "ارتداد VWAP", "🟢"
-    elif ema_pullback:
-        entry_type, entry_emoji = "ارتداد EMA20", "🟢"
-    elif early or (above_vwap and trend_up and ext_tmp <= 2.5):
-        entry_type, entry_emoji = "دخول مبكر", "🟢"
-    else:
-        entry_type, entry_emoji = "دخول مبكر", "🟢"
+    # قوة الاستراتيجية: كل تطابق يحصل على تقييم مستقل من جودة setup الحالية.
+    # هذا التقييم لا يستبدل Score النهائي؛ وظيفته اختيار أقوى استراتيجية
+    # عندما تتطابق عدة استراتيجيات على السهم نفسه.
+    strategy_scores: dict[str, float] = {}
+    policy_for_strategy = _load_adaptive_policy()
+    strategy_stats = policy_for_strategy.get("strategy_stats", {})
+
+    def _strategy_strength(name: str) -> float:
+        q = 70.0
+        if name == "اختراق مؤكد":
+            q += min(18.0, float(breakout_quality) * 0.18)
+            q += 5.0 if vol_session_ratio >= 1.5 else 2.0
+        elif name == "اختراق نطاق الافتتاح":
+            q += min(18.0, float(orb_quality) * 0.18)
+            q += 4.0 if above_vwap else 0.0
+        elif name == "إعادة اختبار":
+            q += 8.0 if prior_break else 0.0
+            q += 7.0 if near_level else 0.0
+            q += 5.0 if above_vwap else 0.0
+        elif name == "ارتداد VWAP":
+            q += 10.0 if vwap_touch else 0.0
+            q += 7.0 if trend_up else 0.0
+            q += min(6.0, max(0.0, float(vol_session_ratio) - 1.0) * 6.0)
+        elif name == "ارتداد EMA20":
+            q += 10.0 if ema_touch else 0.0
+            q += 7.0 if trend_up else 0.0
+            q += 5.0 if m15_state == "داعم" else 0.0
+        elif name == "سحب سيولة مع Displacement":
+            q += 12.0 if trend_up else 0.0
+            q += 8.0 if vol_session_ratio >= 1.25 else 0.0
+            q += 5.0 if above_vwap else 0.0
+        elif name == "سحب سيولة":
+            q += 10.0 if above_vwap else 0.0
+            q += 8.0 if vol_session_ratio >= 1.25 else 0.0
+        elif name == "ضغط ثم انفجار":
+            q += 10.0 if vol_session_ratio >= 1.2 else 0.0
+            q += 8.0 if trend_up else 0.0
+            q += 5.0 if above_vwap else 0.0
+        elif name == "استمرار الزخم":
+            q += 10.0 if trend_up else 0.0
+            q += 8.0 if vol_session_ratio >= 1.2 else 0.0
+            q += 6.0 if mom > 0.10 else 0.0
+        elif name == "علم صاعد":
+            q += 10.0 if trend_up else 0.0
+            q += 8.0 if vol_session_ratio >= 1.2 else 0.0
+            q += 5.0 if above_vwap else 0.0
+        elif name == "استعادة مستوى":
+            q += 8.0 if key_level_near else 0.0
+            q += 8.0 if above_vwap else 0.0
+            q += 5.0 if trend_up else 0.0
+        elif name == "استعادة بعد فشل ORB":
+            q += 10.0 if orb_high > 0 else 0.0
+            q += 8.0 if above_vwap else 0.0
+            q += 5.0 if trend_up else 0.0
+        elif name == "استمرار ABC":
+            q += 10.0 if trend_up else 0.0
+            q += 8.0 if above_vwap else 0.0
+            q += 5.0 if vol_session_ratio >= 1.2 else 0.0
+        elif name == "دخول بعد Opening Drive":
+            q += 10.0 if trend_up else 0.0
+            q += 8.0 if above_vwap else 0.0
+            q += 5.0 if vol_session_ratio >= 1.2 else 0.0
+        elif name == "استعادة قمة اليوم":
+            q += 10.0 if trend_up else 0.0
+            q += 8.0 if above_vwap else 0.0
+            q += 5.0 if vol_session_ratio >= 1.2 else 0.0
+        elif name == "دخول مبكر":
+            q += 8.0 if trend_up else 0.0
+            q += 7.0 if above_vwap else 0.0
+            q += 5.0 if ext_tmp <= 1.5 else 0.0
+
+        # تعلم تاريخي صغير كمكافأة كسر التعادل، وليس كبديل عن شروط الاستراتيجية.
+        stat = strategy_stats.get(name, {}) if isinstance(strategy_stats, dict) else {}
+        samples = int(stat.get("samples", 0) or 0)
+        win_rate = float(stat.get("win_rate", 0.0) or 0.0)
+        if samples >= 8:
+            q += max(-4.0, min(4.0, (win_rate - 0.50) * 8.0))
+        return round(max(0.0, min(100.0, q)), 2)
+
+    strategy_scores = {et: _strategy_strength(et) for et in matched_entry_types}
+    # الأقوى أولاً؛ عند التعادل نستخدم ترتيب ENTRY_TYPES فقط لكسر التعادل.
+    entry_order = {et: i for i, et in enumerate(ENTRY_TYPES)}
+    entry_type = max(
+        matched_entry_types,
+        key=lambda et: (strategy_scores.get(et, 0.0), -entry_order.get(et, 999)),
+    )
+    entry_emoji = "🟡" if entry_type == "إعادة اختبار" else "🟢"
 
     reasons: list[str] = []
     warnings: list[str] = []
@@ -2740,6 +2847,8 @@ def analyze_intraday(
         dollar_volume_3m=round(float(liquidity.get("dollar_volume", 0) or 0), 0),
         liquidity_ok=liquidity_ok,
         diagnostic_reasons=diagnostic_reasons,
+        matched_entry_types=matched_entry_types,
+        strategy_scores=strategy_scores,
     )
 
 
@@ -2826,8 +2935,13 @@ def get_learning_alert() -> dict | None:
 def _prefilter_intraday(
     symbol: str,
     preloaded: tuple[pd.DataFrame, pd.DataFrame] | None = None,
-) -> tuple[float, pd.DataFrame, pd.DataFrame] | None:
-    """Stage 1: cheap H1+5m filter. Uses batch-loaded bars when available."""
+) -> tuple[float, dict[str, float], pd.DataFrame, pd.DataFrame] | None:
+    """Stage 1: cheap H1+5m routing with a lane for each of the 16 strategies.
+
+    Stage 1 never declares a trade strategy. It only estimates which strategies
+    deserve Stage-2 inspection using data already available here. The exact
+    strategy gates remain in analyze_intraday(), where 15m/full setup data exists.
+    """
     try:
         from market_data import fetch_intraday, intraday_data_fresh
         if preloaded is not None:
@@ -2869,22 +2983,77 @@ def _prefilter_intraday(
         avg_hist = float(hist["Volume"].mean()) if not hist.empty else float(m5["Volume"].tail(60).mean() or 1)
         vol_ratio = avg_today / avg_hist if avg_hist else 1.0
 
-        # Score is only a routing score; Stage 2 makes the actual trade decision.
-        route_score = 0.0
-        route_score += 3.0 if trend else 0.0
-        route_score += 2.0 if above_vwap else 0.0
-        route_score += 1.5 if above_open else 0.0
+        # Cheap structural proxies. These are ROUTING signals only; Stage 2 is authoritative.
+        prev_high = float(hist["High"].max()) if not hist.empty else price
+        prev_low = float(hist["Low"].min()) if not hist.empty else price
+        day_high = float(today["High"].max())
+        day_low = float(today["Low"].min())
+        recent = today.tail(min(12, len(today)))
+        recent_high = float(recent["High"].max())
+        recent_low = float(recent["Low"].min())
+        recent_range_pct = (recent_high - recent_low) / max(price, 1e-9) * 100
+        prior_range = today.iloc[:-6] if len(today) > 12 else today.iloc[:-3]
+        prior_high = float(prior_range["High"].max()) if not prior_range.empty else day_high
+        prior_low = float(prior_range["Low"].min()) if not prior_range.empty else day_low
+        first_or = today.head(min(6, len(today)))
+        orb_high = float(first_or["High"].max()) if not first_or.empty else price
+        orb_low = float(first_or["Low"].min()) if not first_or.empty else price
+        last_low = float(today["Low"].iloc[-1])
+        last_high = float(today["High"].iloc[-1])
+        last_open = float(today["Open"].iloc[-1])
+        last_close = float(today["Close"].iloc[-1])
+        last_range_pct = abs(last_high - last_low) / max(last_close, 1e-9) * 100
+        near_vwap = abs(price - vwap) / max(vwap, 1e-9) * 100 <= 0.8
+        near_ema20 = abs(price - e20) / max(e20, 1e-9) * 100 <= 1.0
+        near_prev_high = abs(price - prev_high) / max(price, 1e-9) * 100 <= 1.2
+        near_orb = abs(price - orb_high) / max(price, 1e-9) * 100 <= 1.2
+        strong_volume = vol_ratio >= 1.15
+        strong_momentum = mom >= 0.35
+        pullback = last_close >= last_open and (last_low <= price * 0.997 or near_vwap or near_ema20)
+        displacement = strong_volume and last_range_pct >= 0.8 and last_close > last_open
+        sweep_low = last_low < min(prior_low, orb_low) * 1.001 and last_close > last_open
+        compression = recent_range_pct <= 2.5 and (strong_momentum or strong_volume)
+        prior_push = (price - float(today["Close"].iloc[max(0, len(today)-18)])) / max(price, 1e-9) * 100 if len(today) >= 6 else 0.0
+        bull_flag_proxy = prior_push >= 1.0 and recent_range_pct <= 2.5 and above_vwap
+        opening_drive = len(today) >= 8 and float(first_or["Close"].iloc[-1]) > float(first_or["Open"].iloc[0]) and pullback
+        hod_reclaim = price >= recent_high * 0.998 and strong_volume
+        resistance_reclaim = price >= prev_high * 0.998 or near_prev_high
+        abc_proxy = trend and above_vwap and pullback and strong_momentum
+
+        # Every strategy gets a routing score. No score here can create a signal.
+        route_by_strategy = {
+            "اختراق مؤكد": (8 if price >= prev_high * 0.998 else 0) + (3 if strong_volume else 0) + (2 if last_green else 0),
+            "إعادة اختبار": (5 if near_prev_high else 0) + (3 if pullback else 0) + (2 if above_vwap else 0),
+            "دخول مبكر": (4 if above_vwap else 0) + (3 if above_open else 0) + (2 if trend else 0) + (1 if not strong_momentum else 0),
+            "ارتداد VWAP": (6 if near_vwap else 0) + (3 if last_green else 0) + (2 if trend else 0),
+            "ارتداد EMA20": (6 if near_ema20 else 0) + (3 if trend else 0) + (2 if last_green else 0),
+            "سحب سيولة": (7 if sweep_low else 0) + (3 if above_vwap else 0) + (2 if strong_volume else 0),
+            "اختراق نطاق الافتتاح": (7 if price >= orb_high * 0.998 else 0) + (3 if strong_volume else 0) + (2 if above_vwap else 0),
+            "استمرار الزخم": (5 if strong_momentum else 0) + (3 if trend else 0) + (2 if strong_volume else 0),
+            "ضغط ثم انفجار": (6 if compression else 0) + (3 if strong_volume else 0) + (2 if last_green else 0),
+            "علم صاعد": (6 if bull_flag_proxy else 0) + (3 if trend else 0) + (2 if above_vwap else 0),
+            "استعادة مستوى": (6 if resistance_reclaim else 0) + (3 if above_vwap else 0) + (2 if last_green else 0),
+            "دخول بعد Opening Drive": (6 if opening_drive else 0) + (3 if trend else 0) + (2 if pullback else 0),
+            "استعادة قمة اليوم": (6 if hod_reclaim else 0) + (3 if strong_volume else 0) + (2 if trend else 0),
+            "استعادة بعد فشل ORB": (6 if near_orb else 0) + (3 if pullback else 0) + (2 if above_vwap else 0),
+            "استمرار ABC": (6 if abc_proxy else 0) + (3 if trend else 0) + (2 if strong_volume else 0),
+            "سحب سيولة مع Displacement": (7 if sweep_low and displacement else 0) + (3 if trend else 0) + (2 if above_vwap else 0),
+        }
+
+        # General route score remains useful for overall ranking.
+        route_score = max(route_by_strategy.values()) + (2.0 if trend else 0.0)
+        route_score += 1.5 if above_vwap else 0.0
+        route_score += 1.0 if above_open else 0.0
         route_score += min(2.0, max(0.0, mom))
         route_score += min(2.0, max(0.0, vol_ratio - 0.75) * 2.0)
         route_score -= max(0.0, vwap_dist - 3.0) * 0.5
         route_score -= 1.0 if r5 >= 82 else 0.0
 
-        # Keep reasonably strong/near-VWAP names, then Stage 2 decides.
-        if not trend and not above_vwap and mom <= 0:
-            return None
+        # Only hard-fail unusable data/liquidity. Do NOT discard a valid setup
+        # merely because it is not a generic trend/VWAP/momentum candidate.
         if vol_ratio < 0.65:
             return None
-        return route_score, h1, m5
+        return route_score, route_by_strategy, h1, m5
     except Exception:
         return None
 
@@ -2926,7 +3095,7 @@ def scan_intraday(
         market_context = (False, "السوق غير مؤكد")
 
     workers = min(8, max(2, len(symbols)))
-    stage1: list[tuple[float, str, pd.DataFrame, pd.DataFrame]] = []
+    stage1: list[tuple[float, dict[str, float], str, pd.DataFrame, pd.DataFrame]] = []
 
     log.info("INTRADAY SCAN: %d symbols loaded", len(symbols))
 
@@ -2980,8 +3149,26 @@ def scan_intraday(
         "STAGE 1: %d/%d completed; %d candidates passed prefilter",
         len(stage1), len(symbols), len(stage1),
     )
-    finalists = stage1[:max(PREFILTER_MAX_CANDIDATES, limit * 5)]
-    log.info("STAGE 2: top %d candidates selected for deep analysis", len(finalists))
+    # Strategy-aware routing: keep the strongest overall names AND reserve a
+    # small candidate lane for every strategy. This prevents a generic Stage-1
+    # score from starving a valid setup type before analyze_intraday() sees it.
+    base_n = max(PREFILTER_MAX_CANDIDATES, limit * 5)
+    selected: dict[str, tuple] = {sym: item for item in stage1[:base_n] for sym in [item[2]]}
+    for et in ENTRY_TYPES:
+        ranked_for_strategy = sorted(
+            stage1, key=lambda item: float(item[1].get(et, 0.0)), reverse=True
+        )
+        for item in ranked_for_strategy[:PREFILTER_STRATEGY_TOP_K]:
+            selected[item[2]] = item
+    finalists = sorted(
+        selected.values(),
+        key=lambda item: (float(item[0]), max(item[1].values()) if item[1] else 0.0),
+        reverse=True,
+    )[:max(base_n, min(PREFILTER_STRATEGY_CAP, base_n + len(ENTRY_TYPES) * PREFILTER_STRATEGY_TOP_K))]
+    log.info(
+        "STAGE 2: top %d candidates selected; strategy-aware routing reserved lanes for %d strategies",
+        len(finalists), len(ENTRY_TYPES),
+    )
 
     # Stage 2 — only finalists receive 15m + full setup/confluence/news analysis.
     results: list[IntradaySignal] = []
@@ -2997,7 +3184,7 @@ def scan_intraday(
     }
     rejection_samples: list[str] = []
     def _one_stage2(item):
-        _, sym, h1, m5 = item
+        _, _, sym, h1, m5 = item
         try:
             return analyze_intraday(
                 sym,
