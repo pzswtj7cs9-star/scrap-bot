@@ -646,6 +646,7 @@ class PerformanceLog:
             lines.append(f"🎯 TP1: {stats['tp1']} | 🎯 TP2: {stats['tp2']} | 🎯 TP3: {stats['tp3']}")
             lines.append(f"🛑 وقف: {stats['stop']} | ⚪ إغلاق عادي: {stats['normal']}")
         lines += [
+            f"📂 مفتوحة: {stats['open']}",
             f"📈 نسبة النجاح: {stats['win_rate']:.1f}%",
             f"📊 متوسط النتيجة: {stats['avg']:+.2f}%",
             f"📉 أقصى تراجع: -{stats['max_dd']:.2f}%",
