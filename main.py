@@ -185,7 +185,17 @@ def load_reports() -> dict:
             return json.loads(REPORTS_FILE.read_text())
         except Exception:
             pass
-    return {"daily_sent_on": "", "weekly_sent_on": ""}
+    return {
+        "daily_sent_on": "",
+        "weekly_sent_on": "",
+        "daily_swing_performance_sent_on": "",
+        "daily_intraday_performance_sent_on": "",
+        "weekly_swing_performance_sent_on": "",
+        "weekly_intraday_performance_sent_on": "",
+        "monthly_swing_performance_sent_on": "",
+        "monthly_intraday_performance_sent_on": "",
+        "monthly_learning_sent_on": "",
+    }
 
 
 def save_reports(data: dict) -> None:
@@ -1015,15 +1025,45 @@ def build_daily_close_text() -> str:
 
 
 async def daily_close_job(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """إرسال ملخصي اليومي واللحظي بعد الإغلاق؛ العرض فقط ولا يغيّر التعلم."""
     if not SUBSCRIBERS or not is_post_close_window():
         return
     reports = load_reports()
     day = now_ny().strftime("%Y-%m-%d")
-    if reports.get("daily_sent_on") == day:
+
+    if reports.get("daily_swing_performance_sent_on") != day:
+        text = await asyncio.to_thread(PERF.daily_report, day)
+        await broadcast(context.bot, text)
+        reports["daily_swing_performance_sent_on"] = day
+
+    if reports.get("daily_intraday_performance_sent_on") != day:
+        text = await asyncio.to_thread(PERF_INTRA.daily_intraday_report, day)
+        await broadcast(context.bot, text)
+        reports["daily_intraday_performance_sent_on"] = day
+
+    save_reports(reports)
+
+
+async def monthly_performance_job(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """إرسال ملخص الشهر السابق لليومي واللحظي يوم 1 بعد الإغلاق."""
+    if not SUBSCRIBERS or not is_post_close_window():
         return
-    text = await asyncio.to_thread(build_daily_close_text)
-    await broadcast(context.bot, text)
-    reports["daily_sent_on"] = day
+    now = now_ny()
+    if now.day != 1:
+        return
+    reports = load_reports()
+    month_key = now.strftime("%Y-%m")
+
+    if reports.get("monthly_swing_performance_sent_on") != month_key:
+        text = await asyncio.to_thread(PERF.monthly_swing_report)
+        await broadcast(context.bot, text)
+        reports["monthly_swing_performance_sent_on"] = month_key
+
+    if reports.get("monthly_intraday_performance_sent_on") != month_key:
+        text = await asyncio.to_thread(PERF_INTRA.monthly_report)
+        await broadcast(context.bot, text)
+        reports["monthly_intraday_performance_sent_on"] = month_key
+
     save_reports(reports)
 
 
@@ -1118,15 +1158,22 @@ async def monthly_learning_job(context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def weekly_report_job(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """إرسال ملخص الأسبوع لليومي واللحظي بعد إغلاق الجمعة."""
     if not SUBSCRIBERS or not is_friday_post_close():
         return
     reports = load_reports()
     week_key = now_ny().strftime("%Y-%W")
-    if reports.get("weekly_sent_on") == week_key:
-        return
-    text = await asyncio.to_thread(PERF.weekly_report)
-    await broadcast(context.bot, text)
-    reports["weekly_sent_on"] = week_key
+
+    if reports.get("weekly_swing_performance_sent_on") != week_key:
+        text = await asyncio.to_thread(PERF.weekly_swing_report)
+        await broadcast(context.bot, text)
+        reports["weekly_swing_performance_sent_on"] = week_key
+
+    if reports.get("weekly_intraday_performance_sent_on") != week_key:
+        text = await asyncio.to_thread(PERF_INTRA.weekly_report)
+        await broadcast(context.bot, text)
+        reports["weekly_intraday_performance_sent_on"] = week_key
+
     save_reports(reports)
 
 
@@ -1192,6 +1239,7 @@ def build_app() -> Application:
         app.job_queue.run_repeating(perf_update_job, interval=180, first=90, name="perf")
         app.job_queue.run_repeating(daily_close_job, interval=300, first=40, name="daily-close")
         app.job_queue.run_repeating(weekly_report_job, interval=300, first=50, name="weekly")
+        app.job_queue.run_repeating(monthly_performance_job, interval=300, first=60, name="monthly-performance")
         app.job_queue.run_daily(
             monthly_learning_job,
             time=dt_time(17, 15, tzinfo=ZoneInfo("America/New_York")),

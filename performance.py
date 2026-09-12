@@ -600,56 +600,138 @@ class PerformanceLog:
         lines.append("ملاحظة: التقييم تقريبي على بيانات يومية وليس تنفيذاً حقيقياً.")
         return "\n".join(lines)
 
-    def weekly_report(self) -> str:
+    @staticmethod
+    def _period_stats(rows: list[dict[str, Any]], mode: str | None = None) -> dict[str, Any]:
+        """إحصاءات مختصرة للفترة. mode=None يسمح للسجل المنفصل بتحديد نوعه تلقائيًا."""
+        if mode:
+            selected = [
+                r for r in rows
+                if (r.get("mode") or ("intraday" if "intraday" in str(r.get("source") or "") else "swing")) == mode
+            ]
+        else:
+            selected = list(rows)
+        closed = [r for r in selected if r.get("status") == "closed"]
+        results = {str(r.get("result") or "").lower() for r in closed}
+        tp1_n = sum(1 for r in closed if str(r.get("result") or "").lower() == "tp1")
+        tp2_n = sum(1 for r in closed if str(r.get("result") or "").lower() == "tp2")
+        tp3_n = sum(1 for r in closed if str(r.get("result") or "").lower() == "tp3")
+        stop_n = sum(1 for r in closed if str(r.get("result") or "").lower() == "stop")
+        normal_n = sum(1 for r in closed if str(r.get("result") or "").lower() not in {"tp1", "tp2", "tp3", "stop"})
+        wins = sum(1 for r in closed if float(r.get("pnl_pct") or 0) > 0)
+        win_rate = wins / len(closed) * 100 if closed else 0.0
+        avg = sum(float(r.get("pnl_pct") or 0) for r in closed) / len(closed) if closed else 0.0
+
+        ordered = sorted(closed, key=lambda r: str(r.get("exit_at") or r.get("opened_at") or ""))
+        equity = 0.0
+        peak = 0.0
+        max_dd = 0.0
+        for r in ordered:
+            equity += float(r.get("pnl_pct") or 0)
+            peak = max(peak, equity)
+            max_dd = max(max_dd, peak - equity)
+
+        return {
+            "signals": len(selected), "tp1": tp1_n, "tp2": tp2_n, "tp3": tp3_n,
+            "stop": stop_n, "normal": normal_n, "closed": len(closed),
+            "open": sum(1 for r in selected if r.get("status") == "open"),
+            "win_rate": win_rate, "avg": avg, "max_dd": max_dd,
+        }
+
+    @staticmethod
+    def _period_report_text(title: str, stats: dict[str, Any], intraday: bool = False) -> str:
+        lines = [title, f"🔔 الإشارات: {stats['signals']}"]
+        if intraday:
+            lines.append(f"🎯 TP1: {stats['tp1']} | 🛑 وقف: {stats['stop']} | ⚪ إغلاق عادي: {stats['normal']}")
+        else:
+            lines.append(f"🎯 TP1: {stats['tp1']} | 🎯 TP2: {stats['tp2']} | 🎯 TP3: {stats['tp3']}")
+            lines.append(f"🛑 وقف: {stats['stop']} | ⚪ إغلاق عادي: {stats['normal']}")
+        lines += [
+            f"📈 نسبة النجاح: {stats['win_rate']:.1f}%",
+            f"📊 متوسط النتيجة: {stats['avg']:+.2f}%",
+            f"📉 أقصى تراجع: -{stats['max_dd']:.2f}%",
+            "",
+            "تحليل تعليمي — ليست توصية استثمارية.",
+        ]
+        return "\n".join(lines)
+
+    @staticmethod
+    def _period_dates(period: str) -> tuple[Any, Any]:
+        now = _now().date()
+        if period == "day":
+            return now, now
+        if period == "week":
+            monday = now - timedelta(days=now.weekday())
+            return monday, monday + timedelta(days=6)
+        first = now.replace(day=1)
+        prev_last = first - timedelta(days=1)
+        return prev_last.replace(day=1), prev_last
+
+    def _report_for_period(self, period: str, title: str, mode: str) -> str:
         self.update_open_outcomes()
         rows = self._load()
-        now = _now()
-        week_ago = now - timedelta(days=7)
-        week = []
+        start_date, end_date = self._period_dates(period)
+        selected = []
         for r in rows:
             try:
-                opened = datetime.fromisoformat(r["opened_at"])
+                opened = datetime.fromisoformat(str(r.get("opened_at", "")))
                 if opened.tzinfo is None:
                     opened = opened.replace(tzinfo=NY)
-                if opened >= week_ago:
-                    week.append(r)
+                d = opened.astimezone(NY).date()
+                row_mode = r.get("mode") or ("intraday" if "intraday" in str(r.get("source") or "") else "swing")
+                if start_date <= d <= end_date and row_mode == mode:
+                    selected.append(r)
             except Exception:
                 continue
-        if not week:
-            return "📊 التقرير الأسبوعي\nلا توجد إشارات خلال آخر 7 أيام."
+        stats = self._period_stats(selected)
+        return self._period_report_text(title, stats, intraday=(mode == "intraday"))
 
-        closed = [r for r in week if r.get("status") == "closed"]
-        opened_n = len(week)
-        wins = [r for r in closed if (r.get("pnl_pct") or 0) > 0]
-        losses = [r for r in closed if (r.get("pnl_pct") or 0) <= 0]
-        avg = sum((r.get("pnl_pct") or 0) for r in closed) / len(closed) if closed else 0
-        win_rate = len(wins) / len(closed) * 100 if closed else 0
-        best = max(closed, key=lambda x: x.get("pnl_pct") or -999) if closed else None
-        worst = min(closed, key=lambda x: x.get("pnl_pct") or 999) if closed else None
+    def daily_report(self, day: str | None = None) -> str:
+        """ملخص اليومي/السوينغ لليوم المحدد."""
+        if day:
+            self.update_open_outcomes()
+            rows = self._load()
+            selected = []
+            for r in rows:
+                try:
+                    opened = datetime.fromisoformat(str(r.get("opened_at", "")))
+                    if opened.tzinfo is None: opened = opened.replace(tzinfo=NY)
+                    d = opened.astimezone(NY).date().isoformat()
+                    row_mode = r.get("mode") or ("intraday" if "intraday" in str(r.get("source") or "") else "swing")
+                    if d == day and row_mode == "swing": selected.append(r)
+                except Exception: continue
+            return self._period_report_text("🌆 ملخص اليومي — اليوم", self._period_stats(selected), intraday=False)
+        return self._report_for_period("day", "🌆 ملخص اليومي — اليوم", "swing")
 
-        lines = [
-            "📊 التقرير الأسبوعي (7 أيام)",
-            f"إشارات جديدة: {opened_n} | أُغلقت: {len(closed)} | ما زالت مفتوحة: {opened_n - len(closed)}",
-        ]
-        if closed:
-            lines += [
-                f"نسبة الربح: {win_rate:.1f}%",
-                f"متوسط النتيجة: {avg:+.2f}%",
-            ]
-            if best:
-                lines.append(f"أفضل: {best['symbol']} {best.get('pnl_pct'):+.2f}% ({best.get('result')})")
-            if worst:
-                lines.append(f"أضعف: {worst['symbol']} {worst.get('pnl_pct'):+.2f}% ({worst.get('result')})")
-        lines.append("")
-        lines.append("تفصيل الأسبوع:")
-        for r in week[-10:]:
-            st = r.get("result") or r.get("status")
-            pnl = r.get("pnl_pct")
-            pnl_s = f"{pnl:+.2f}%" if pnl is not None else "—"
-            lines.append(f"• {r['symbol']} | {st} | {pnl_s} | {r.get('score')}/100")
-        lines.append("")
-        lines.append("تقييم تقريبي — ليست نتائج حساب حقيقي.")
-        return "\n".join(lines)
+    def weekly_swing_report(self) -> str:
+        return self._report_for_period("week", "📊 ملخص اليومي — الأسبوع", "swing")
+
+    def monthly_swing_report(self) -> str:
+        return self._report_for_period("month", "📅 ملخص اليومي — الشهر", "swing")
+
+    def daily_intraday_report(self, day: str | None = None) -> str:
+        """ملخص اللحظي لليوم المحدد."""
+        if day:
+            self.update_open_outcomes()
+            rows = self._load()
+            selected = []
+            for r in rows:
+                try:
+                    opened = datetime.fromisoformat(str(r.get("opened_at", "")))
+                    if opened.tzinfo is None: opened = opened.replace(tzinfo=NY)
+                    d = opened.astimezone(NY).date().isoformat()
+                    row_mode = r.get("mode") or ("intraday" if "intraday" in str(r.get("source") or "") else "swing")
+                    if d == day and row_mode == "intraday": selected.append(r)
+                except Exception: continue
+            return self._period_report_text("⚡ ملخص اللحظي — اليوم", self._period_stats(selected), intraday=True)
+        return self._report_for_period("day", "⚡ ملخص اللحظي — اليوم", "intraday")
+
+    def weekly_report(self) -> str:
+        """ملخص اللحظي للأسبوع الحالي."""
+        return self._report_for_period("week", "📊 ملخص اللحظي — الأسبوع", "intraday")
+
+    def monthly_report(self) -> str:
+        """ملخص اللحظي للشهر السابق؛ مناسب للإرسال يوم 1 بعد الإغلاق."""
+        return self._report_for_period("month", "📅 ملخص اللحظي — الشهر", "intraday")
 
     def today_closed_and_open(self, day: str) -> tuple[list, list]:
         rows = self._load()
