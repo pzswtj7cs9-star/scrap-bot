@@ -85,6 +85,14 @@ EXIT_MIN_COVERAGE = 0.45
 # conditional patterns without changing the core trading rules.
 REASON_MIN_SAMPLES = 12
 REASON_ACTIVE_MIN_SAMPLES = 30
+# احتياطات التعلم الاحترافية
+MONTHLY_MIN_SAMPLES = 100
+STRATEGY_MIN_SAMPLES = 30
+REGIME_STRATEGY_MIN_SAMPLES = 20
+KILL_SWITCH_LOOKBACK = 30
+KILL_SWITCH_MIN_DROP = 0.10
+SIGNAL_DEDUP_MINUTES = 180
+
 REASON_EDGE = 0.08
 REASON_WEIGHT_STEP = 0.03
 REASON_WEIGHT_MIN = 0.85
@@ -248,7 +256,19 @@ def _default_adaptive_policy() -> dict:
             "active": False,
             "generation": 0,
         },
+        # Legacy learning knowledge is preserved inside the approved Adaptive
+        # policy. It is no longer a second live-learning engine.
+        "legacy_factor_bias": {},
+        "legacy_strategy_bias": {},
         "history": [],
+        "kill_switch": False,
+        "kill_switch_reason": "",
+        "kill_switch_at": None,
+        "last_monthly_sample_count": 0,
+        "last_monthly_period": "",
+        "monthly_cycle_base_samples": 0,
+        "monthly_cycle_total": 0,
+        "monthly_cycle_initialized": False,
     }
 
 
@@ -262,6 +282,11 @@ def _load_adaptive_policy() -> dict:
             return default
         for k, v in default.items():
             data.setdefault(k, v)
+        # Older policy migration: start the first cumulative monthly cycle
+        # from the existing Adaptive sample cursor, without deleting history.
+        data.setdefault("monthly_cycle_base_samples", int(data.get("samples_at_update", 0) or 0))
+        data.setdefault("monthly_cycle_total", 0)
+        data.setdefault("monthly_cycle_initialized", False)
         data.setdefault("weights", {})
         for k, v in default["weights"].items():
             data["weights"].setdefault(k, v)
@@ -289,6 +314,13 @@ def _load_adaptive_policy() -> dict:
         data["reason_policy"].setdefault("weights", {})
         data["reason_policy"].setdefault("active", False)
         data["reason_policy"].setdefault("generation", 0)
+        data.setdefault("legacy_factor_bias", {})
+        data.setdefault("legacy_strategy_bias", {})
+        data.setdefault("kill_switch", False)
+        data.setdefault("kill_switch_reason", "")
+        data.setdefault("kill_switch_at", None)
+        data.setdefault("last_monthly_sample_count", 0)
+        data.setdefault("last_monthly_period", "")
         return data
     except Exception:
         return default
@@ -309,11 +341,15 @@ def _adaptive_score_adjustment(
     """Adaptive adjustment plus self-learned regime/strategy multiplier."""
     try:
         p = _load_adaptive_policy()
-        vals = [
-            float(p.get("weights", {}).get(f, 1.0))
-            for f in factors
-            if f in p.get("weights", {})
-        ]
+        if p.get("kill_switch"):
+            return 0.0
+        vals = []
+        if p.get("approved"):
+            vals = [
+                float(p.get("weights", {}).get(f, 1.0))
+                for f in factors
+                if f in p.get("weights", {})
+            ]
         adjustment = (sum(vals) / len(vals) - 1.0) * 8.0 if vals else 0.0
 
         if p.get("regime_active") and entry_type:
@@ -336,6 +372,16 @@ def _adaptive_score_adjustment(
                 ]
                 if vals:
                     adjustment += max(-1.0, min(1.0, (sum(vals) / len(vals) - 1.0) * 4.0))
+
+        # Preserve the useful semantics of the original _learning_adjustment:
+        # factor edge vs overall baseline + primary-strategy edge. These values
+        # are learned in shadow/OOS and only affect live scoring after approval.
+        if p.get("approved"):
+            fb = p.get("legacy_factor_bias", {}) or {}
+            fvals = [float(fb[f]) for f in factors if f in fb]
+            if fvals:
+                adjustment += sum(fvals) / len(fvals)
+            adjustment += float((p.get("legacy_strategy_bias", {}) or {}).get(entry_type, 0.0))
 
         return max(-5.0, min(5.0, adjustment))
     except Exception:
@@ -382,7 +428,7 @@ def _build_candidate_policy(completed: list[dict], current: dict) -> dict | None
 
     for et in ENTRY_TYPES:
         subset = [r for r in recent if str(r.get("entry_type") or "") == et]
-        if len(subset) < 6:
+        if len(subset) < STRATEGY_MIN_SAMPLES:
             continue
         r = _rate(subset)
         lim = int(candidate["entry_limits"].get(et, 94))
@@ -494,6 +540,15 @@ def _shadow_score_row(row: dict, policy: dict) -> bool:
     for k in interactions:
         score += 1.5 * float(policy.get("interaction_weights", {}).get(k, 1.0))
     et = row.get("entry_type")
+
+    # Legacy learning semantics, consolidated into the single Adaptive policy.
+    if policy.get("approved"):
+        fb = policy.get("legacy_factor_bias", {}) or {}
+        fvals = [float(fb[f]) for f in factors if f in fb]
+        if fvals:
+            score += sum(fvals) / len(fvals)
+        score += float((policy.get("legacy_strategy_bias", {}) or {}).get(et, 0.0))
+
     limit = float(policy.get("entry_limits", {}).get(et, 94))
     vol = float(row.get("volume_ratio", 1.0) or 1.0)
     if vol < float(policy.get("min_volume_ratio", .85)):
@@ -585,9 +640,9 @@ def _build_regime_candidate(policy: dict, train: list[dict]) -> dict:
         for et in ENTRY_TYPES:
             subset = [
                 r for r in regime_rows
-                if et in (r.get("matched_entry_types") or [r.get("entry_type")])
+                if str(r.get("entry_type") or "") == et
             ]
-            if len(subset) < REGIME_MIN_SAMPLES:
+            if len(subset) < REGIME_STRATEGY_MIN_SAMPLES:
                 continue
 
             rate = _rate(subset)
@@ -709,9 +764,9 @@ def _build_exit_candidate(policy: dict, train: list[dict]) -> dict:
         for et in ENTRY_TYPES:
             subset = [
                 r for r in regime_rows
-                if et in (r.get("matched_entry_types") or [r.get("entry_type")])
+                if str(r.get("entry_type") or "") == et
             ]
-            if len(subset) < EXIT_MIN_SAMPLES:
+            if len(subset) < REGIME_STRATEGY_MIN_SAMPLES:
                 continue
 
             # Convert excursion percentages into R using the original risk.
@@ -780,6 +835,8 @@ def _apply_adaptive_exit(sig_price: float, structural_stop: float, regime: str,
     Stop remains anchored to the structural stop and stays inside the global
     0.60%–4.50% risk band.
     """
+    if policy.get("kill_switch"):
+        return float(structural_stop), float(sig_price), 1.20
     entry = float(sig_price)
     stop = float(structural_stop)
     risk = max(entry - stop, entry * 0.006)
@@ -806,10 +863,104 @@ def _apply_adaptive_exit(sig_price: float, structural_stop: float, regime: str,
     return new_stop, tp1, max(EXIT_TP_MIN_R, min(EXIT_TP_MAX_R, tp1_r))
 
 
+def _adaptive_kill_switch_state(completed: list[dict], policy: dict) -> tuple[bool, str]:
+    """حماية تكيفية: تعطل طبقات التعلم فقط عند تدهور واضح، ولا توقف المحرك الأساسي."""
+    if len(completed) < KILL_SWITCH_LOOKBACK:
+        return False, ""
+    recent = completed[-KILL_SWITCH_LOOKBACK:]
+    recent_rate = _rate(recent)
+    hist = completed[:-KILL_SWITCH_LOOKBACK]
+    if len(hist) >= 30:
+        baseline = _rate(hist[-60:])
+    else:
+        baseline = float(policy.get("validation_old_rate", recent_rate) or recent_rate)
+    drop = baseline - recent_rate
+    if drop >= KILL_SWITCH_MIN_DROP:
+        return True, f"تراجع معدل النجاح {drop*100:.1f}% عن خط الأساس"
+    return False, ""
+
+
+def _monthly_completed_rows(completed: list[dict], period: str | None = None) -> list[dict]:
+    """الصفقات المكتملة في شهر التقويم الحالي/المحدد فقط."""
+    period = period or _monthly_period_key()
+    rows = []
+    for r in completed:
+        stamp = str(r.get("closed_at") or r.get("created_at") or "")
+        try:
+            dt = datetime.fromisoformat(stamp.replace("Z", "+00:00"))
+            if dt.strftime("%Y-%m") == period:
+                rows.append(r)
+        except Exception:
+            continue
+    return rows
+
+
+def _monthly_period_key() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m")
+
+
+def _signal_duplicate_recent(sig, records: list[dict]) -> bool:
+    """يمنع إعادة نفس الهيكل لنفس السهم خلال نافذة زمنية محددة."""
+    now = datetime.now(timezone.utc)
+    symbol = str(getattr(sig, "symbol", ""))
+    entry_type = str(getattr(sig, "entry_type", ""))
+    regime = str(getattr(sig, "market_regime", "neutral"))
+    for r in reversed(records):
+        if r.get("record_type") != "signal" or r.get("symbol") != symbol:
+            continue
+        if str(r.get("entry_type") or "") != entry_type or str(r.get("market_regime") or "neutral") != regime:
+            continue
+        if r.get("status") not in {"pending", "completed"}:
+            continue
+        try:
+            created = datetime.fromisoformat(str(r.get("created_at")).replace("Z", "+00:00"))
+            if (now - created).total_seconds() <= SIGNAL_DEDUP_MINUTES * 60:
+                return True
+        except Exception:
+            continue
+    return False
+
+
 def adaptive_retrain_if_ready(force_monthly: bool = False) -> dict:
     """يشغّل دورة التعلم الذاتي ويصدر نتيجة قابلة للإرسال إلى Telegram."""
     completed = _recent_learning_rows()
     policy = _load_adaptive_policy()
+
+    if force_monthly:
+        period = _monthly_period_key()
+        # Calendar-month limit + cumulative 100-trade gate.
+        # Example: 40 trades in one month + 60 in the next = 100.
+        if policy.get("last_monthly_period") == period:
+            return {"status": "unchanged_month", "samples": len(completed), "period": period, "monthly_cycle_total": int(policy.get("monthly_cycle_total", 0) or 0)}
+        if not policy.get("monthly_cycle_initialized", False):
+            # First run after introducing the cumulative gate: start the cycle
+            # from the existing learning history so no prior completed sample
+            # is silently discarded.
+            policy["monthly_cycle_base_samples"] = 0
+            policy["monthly_cycle_initialized"] = True
+        base = int(policy.get("monthly_cycle_base_samples", 0) or 0)
+        if base > len(completed):
+            base = len(completed)
+        cycle_total = max(0, len(completed) - base)
+        policy["monthly_cycle_total"] = cycle_total
+        if cycle_total < MONTHLY_MIN_SAMPLES:
+            policy["last_monthly_sample_count"] = cycle_total
+            # Do not mark the calendar month as processed; samples carry into
+            # the next month until the cumulative 100-trade gate is reached.
+            _save_adaptive_policy(policy)
+            return {"status": "waiting_monthly_samples", "samples": len(completed), "required": MONTHLY_MIN_SAMPLES, "period": period, "monthly_cycle_total": cycle_total}
+
+    kill, kill_reason = _adaptive_kill_switch_state(completed, policy)
+    if kill:
+        policy["kill_switch"] = True
+        policy["kill_switch_reason"] = kill_reason
+        policy["kill_switch_at"] = datetime.now(timezone.utc).isoformat()
+        _save_adaptive_policy(policy)
+        return {"status": "kill_switch", "samples": len(completed), "reason": kill_reason}
+    elif policy.get("kill_switch"):
+        policy["kill_switch"] = False
+        policy["kill_switch_reason"] = ""
+        _save_adaptive_policy(policy)
 
     if len(completed) < ADAPTIVE_MIN_SAMPLES:
         return {"status": "waiting", "samples": len(completed)}
@@ -829,6 +980,29 @@ def adaptive_retrain_if_ready(force_monthly: bool = False) -> dict:
         return {"status": "waiting_oos", "samples": len(completed)}
     baseline_rate = _rate(train)
     candidate = json.loads(json.dumps(policy))
+
+    # Consolidate the original learning engine into Adaptive without losing its
+    # information: same factor-vs-overall and primary-strategy-vs-overall idea,
+    # but trained only on the in-sample partition and activated only after OOS.
+    legacy_factor_bias = {}
+    all_train_factors = sorted({f for r in train for f in (r.get("factors") or [])})
+    for factor in all_train_factors:
+        subset = [r for r in train if factor in (r.get("factors") or [])]
+        if len(subset) >= 5:
+            legacy_factor_bias[factor] = max(
+                -LEARNING_MAX_ADJUSTMENT,
+                min(LEARNING_MAX_ADJUSTMENT, (_rate(subset) - baseline_rate) * 10.0),
+            )
+    legacy_strategy_bias = {}
+    for et in ENTRY_TYPES:
+        subset = [r for r in train if str(r.get("entry_type") or "") == et]
+        if len(subset) >= STRATEGY_MIN_SAMPLES:
+            legacy_strategy_bias[et] = max(
+                -LEARNING_MAX_ADJUSTMENT,
+                min(LEARNING_MAX_ADJUSTMENT, (_rate(subset) - baseline_rate) * 6.0),
+            )
+    candidate["legacy_factor_bias"] = legacy_factor_bias
+    candidate["legacy_strategy_bias"] = legacy_strategy_bias
     candidate.setdefault("interaction_weights", {})
     # Always refresh per-strategy statistics so all 16 setups are observable.
     candidate["strategy_stats"] = _strategy_stats(completed)
@@ -869,7 +1043,7 @@ def adaptive_retrain_if_ready(force_monthly: bool = False) -> dict:
             r for r in train
             if str(r.get("entry_type") or "") == et
         ]
-        if len(subset) < 6:
+        if len(subset) < STRATEGY_MIN_SAMPLES:
             continue
         rate = _rate(subset)
         lim = int(candidate["entry_limits"].get(et, 94))
@@ -977,6 +1151,12 @@ def adaptive_retrain_if_ready(force_monthly: bool = False) -> dict:
 
     if approved:
         candidate["approved"] = True
+        if force_monthly:
+            candidate["last_monthly_period"] = _monthly_period_key()
+            candidate["last_monthly_sample_count"] = cycle_total
+            candidate["monthly_cycle_base_samples"] = len(completed)
+            candidate["monthly_cycle_total"] = 0
+            candidate["monthly_cycle_initialized"] = True
         candidate["validation_new_rate"] = candidate_rate
         candidate["validation_old_rate"] = current_rate
 
@@ -1027,48 +1207,27 @@ def adaptive_retrain_if_ready(force_monthly: bool = False) -> dict:
             f"✅ تم اعتماد الجيل رقم {candidate['generation']}"
         )
     else:
-        # The regime layer can graduate independently if it passes its own OOS gate.
-        if regime_improved or exit_improved or reason_improved:
-            policy["generation"] = int(policy.get("generation", 0)) + 1
-            if regime_improved:
-                policy["regime_weights"] = candidate.get("regime_weights", policy.get("regime_weights", {}))
-                policy["regime_active"] = True
-                policy["regime_activation_generation"] = policy["generation"]
-            if exit_improved:
-                policy["exit_policy"] = candidate.get("exit_policy", policy.get("exit_policy", {}))
-                policy["exit_active"] = True
-                policy["exit_activation_generation"] = policy["generation"]
-            if reason_improved:
-                policy["reason_policy"] = candidate.get(
-                    "reason_policy", policy.get("reason_policy", {})
-                )
-                policy["reason_policy"]["active"] = True
-                policy["reason_policy"]["generation"] = policy["generation"]
-            policy["samples_at_update"] = len(completed)
-            policy["history"] = (policy.get("history", []) + [result])[-20:]
-            _save_adaptive_policy(policy)
-            result["status"] = "regime_or_exit_approved"
-            result["message"] = (
-                f"🧠 Adaptive Learning\n"
-                f"تم تحليل {len(completed)} صفقة\n"
-                f"Regime: {'مفعل' if regime_improved else 'بدون تغيير'} | "
-                f"Exit: {'مفعل' if exit_improved else 'بدون تغيير'}\n"
-                f"الجيل {policy['generation']}"
-            )
-        else:
-            policy["samples_at_update"] = len(completed)
-            policy["history"] = (policy.get("history", []) + [result])[-20:]
-            _save_adaptive_policy(policy)
-
-            result["status"] = "rejected"
+        # Strict all-or-nothing monthly approval: no adaptive sub-layer graduates
+        # independently when the candidate as a whole fails its OOS gate.
+        policy["samples_at_update"] = len(completed)
+        if force_monthly:
+            policy["last_monthly_period"] = _monthly_period_key()
+            policy["last_monthly_sample_count"] = cycle_total
+            # Consume this cumulative review cycle even if the candidate is
+            # rejected; the previous approved policy remains active.
+            policy["monthly_cycle_base_samples"] = len(completed)
+            policy["monthly_cycle_total"] = 0
+            policy["monthly_cycle_initialized"] = True
+        policy["history"] = (policy.get("history", []) + [result])[-20:]
+        _save_adaptive_policy(policy)
+        result["status"] = "rejected"
         result["message"] = (
             f"🧠 مراجعة التعلم الذاتي\n"
             f"تم تحليل {len(completed)} صفقة\n"
             f"الحالي: {current_rate*100:.1f}% | الجديد: {candidate_rate*100:.1f}%\n"
-            f"❌ لم يتم اعتماد التعديل — السياسة الحالية بقيت كما هي"
+            f"❌ لم يتم اعتماد أي تعديل — السياسة الحالية بقيت كما هي"
         )
 
-    # Rollback فعلي: لا يتم إلا إذا كان لدينا أفضل جيل وتراجع الأداء بقوة.
     rollback = _rollback_if_needed()
     result["rollback"] = rollback.get("status")
     if rollback.get("status") == "rollback":
@@ -1159,6 +1318,22 @@ def register_daily_signal(sig: DailySignal) -> str:
             ),
             "outcome_reason": _classify_trade_reason({**sig.__dict__, "status": ""}),
             "interactions": list(getattr(sig, "interaction_keys", []) or []),
+            "decision_audit": {
+                "matched_strategies": list(getattr(sig, "matched_entry_types", []) or []),
+                "primary_strategy": str(sig.entry_type),
+                "strategy_scores": dict(getattr(sig, "strategy_scores", {}) or {}),
+                "factors_positive": list(getattr(sig, "factor_keys", []) or []),
+                "reasons": list(getattr(sig, "reasons", []) or []),
+                "warnings": list(getattr(sig, "warnings", []) or []),
+                "market_regime": str(getattr(sig, "market_regime", "neutral")),
+                "score": int(getattr(sig, "score", 0) or 0),
+                "entry": round(float(getattr(sig, "price", 0) or 0), 4),
+                "stop": round(float(getattr(sig, "stop_loss", 0) or 0), 4),
+                "tp1": round(float(getattr(sig, "tp1", 0) or 0), 4),
+                "tp2": round(float(getattr(sig, "tp2", 0) or 0), 4),
+                "tp3": round(float(getattr(sig, "tp3", 0) or 0), 4),
+                "adaptive_generation": int(_load_adaptive_policy().get("generation", 0)),
+            },
             "status": "pending",
         }
     )
@@ -2611,7 +2786,9 @@ def analyze_daily(
         warnings.append("تذبذب عالي")
         score -= 5
 
-    learning_adj = _learning_adjustment(factors, entry_type)
+    # Legacy learning remains available for historical research only.
+    # The new Adaptive layer is the sole learning modifier for live scoring.
+    learning_adj = 0.0
     adaptive_adj = _adaptive_score_adjustment(factors, market_regime, entry_type)
     total_learning_adj = learning_adj + adaptive_adj
     if total_learning_adj:
@@ -3344,6 +3521,10 @@ def scan_daily(
         len(results),
         stage2_rejects,
     )
+    records_for_dedup = _read_learning_records()
+    before_dedup = len(results)
+    results = [sig for sig in results if not _signal_duplicate_recent(sig, records_for_dedup)]
+    log.info("SIGNAL DEDUP | removed=%d | remaining=%d", before_dedup - len(results), len(results))
     rank={et:i for i,et in enumerate(ENTRY_TYPES)}
     results.sort(key=lambda x:(
         -(float(x.score)+1.5*min(float(getattr(x,'reward_r',0) or 0),3.0)
