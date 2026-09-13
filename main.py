@@ -32,7 +32,14 @@ from telegram.ext import (
     filters,
 )
 
-from analyzer import analyze, format_signal_ar, rank_all, scan_symbols, register_daily_signal
+from analyzer import (
+    analyze,
+    format_signal_ar,
+    rank_all,
+    scan_symbols,
+    register_daily_signal,
+    ADAPTIVE_POLICY_FILE as DAILY_ADAPTIVE_POLICY_FILE,
+)
 from analyzer_intraday import (
     INTRADAY_MIN_SCORE,
     analyze_intraday,
@@ -41,6 +48,7 @@ from analyzer_intraday import (
     session_window_ok,
     monthly_self_optimization,
     get_live_entry_price,
+    ADAPTIVE_POLICY_FILE as INTRADAY_ADAPTIVE_POLICY_FILE,
 )
 from backtest import run_backtest
 from charting import build_signal_chart
@@ -195,6 +203,8 @@ def load_reports() -> dict:
         "monthly_swing_performance_sent_on": "",
         "monthly_intraday_performance_sent_on": "",
         "monthly_learning_sent_on": "",
+        "adaptive_daily_alert_key": "",
+        "adaptive_intraday_alert_key": "",
     }
 
 
@@ -1066,92 +1076,252 @@ async def monthly_performance_job(context: ContextTypes.DEFAULT_TYPE) -> None:
     save_reports(reports)
 
 
-async def monthly_learning_job(context: ContextTypes.DEFAULT_TYPE) -> None:
-    """مراجعة التعلم الشاملة مرة واحدة شهريًا وإرسال تقرير Telegram."""
-    if not SUBSCRIBERS:
-        return
 
-    now = now_ny()
-    if now.day != 1:
-        return
-
-    reports = load_reports()
-    month_key = now.strftime("%Y-%m")
-    if reports.get("monthly_learning_sent_on") == month_key:
-        return
-
+def _load_adaptive_policy_snapshot(path: str) -> dict:
+    """قراءة Policy الحالية للعرض فقط؛ لا تعدّل أي ملف."""
     try:
-        result = await asyncio.to_thread(monthly_self_optimization)
+        p = Path(path)
+        if p.exists():
+            data = json.loads(p.read_text(encoding="utf-8"))
+            return data if isinstance(data, dict) else {}
+    except Exception as exc:
+        log.warning("adaptive policy snapshot failed: %s", exc)
+    return {}
+
+
+def _policy_live_view(policy: dict) -> dict:
+    """يستبعد بيانات السجل/الإحصاءات المتغيرة ويُبقي إعدادات الـPolicy الفعلية."""
+    if not isinstance(policy, dict):
+        return {}
+    volatile = {
+        "history", "strategy_stats", "sample_count", "monthly_cycle_total",
+        "monthly_cycle_base_samples", "last_monthly_period",
+        "last_monthly_sample_count", "generation", "created_at", "updated_at",
+        "timestamp", "last_train_at", "last_optimization_at",
+    }
+    return {k: v for k, v in policy.items() if k not in volatile}
+
+
+def _flatten_policy_changes(old: object, new: object, prefix: str = "") -> list[tuple[str, object, object]]:
+    """فرق مختصر بين Policy القديمة والجديدة."""
+    changes: list[tuple[str, object, object]] = []
+    if isinstance(old, dict) and isinstance(new, dict):
+        keys = sorted(set(old) | set(new))
+        for key in keys:
+            path = f"{prefix}.{key}" if prefix else str(key)
+            if key not in old:
+                changes.append((path, "غير موجود", new[key]))
+            elif key not in new:
+                changes.append((path, old[key], "أزيل"))
+            else:
+                changes.extend(_flatten_policy_changes(old[key], new[key], path))
+        return changes
+    if isinstance(old, list) and isinstance(new, list):
+        if old != new:
+            changes.append((prefix or "قائمة", old, new))
+        return changes
+    if old != new:
+        changes.append((prefix or "قيمة", old, new))
+    return changes
+
+
+def _arabic_policy_label(path: str) -> str:
+    labels = {
+        "weights": "الأوزان",
+        "interaction_weights": "أوزان التفاعلات",
+        "entry_limits": "حدود الدخول",
+        "min_volume_ratio": "حد نسبة الحجم",
+        "regime_weights": "أوزان حالة السوق",
+        "exit_policy": "سياسة الخروج",
+        "reason_policy": "سياسة الأسباب",
+        "legacy_factor_bias": "انحياز العوامل القديم",
+        "legacy_strategy_bias": "انحياز الاستراتيجية القديم",
+        "regime_active": "تعلم حالة السوق",
+        "exit_active": "تعلم الخروج",
+        "approved": "حالة الاعتماد",
+        "kill_switch": "مفتاح الإيقاف التكيفي",
+    }
+    tail = path.split(".")[-1]
+    return labels.get(tail, path)
+
+
+def _fmt_policy_value(value: object) -> str:
+    if isinstance(value, float):
+        return f"{value:.4g}"
+    if isinstance(value, (dict, list)):
+        raw = json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+        return raw[:180] + ("…" if len(raw) > 180 else "")
+    return str(value)
+
+
+def _policy_change_lines(old_policy: dict, new_policy: dict, limit: int = 12) -> list[str]:
+    old_view = _policy_live_view(old_policy)
+    new_view = _policy_live_view(new_policy)
+    changes = _flatten_policy_changes(old_view, new_view)
+    if not changes:
+        return ["• لم يتغير أي إعداد في السياسة ظاهر."]
+    lines = []
+    for path, old, new in changes[:limit]:
+        lines.append(
+            f"• {_arabic_policy_label(path)}: "
+            f"{_fmt_policy_value(old)} → {_fmt_policy_value(new)}"
+        )
+    if len(changes) > limit:
+        lines.append(f"• ... وهناك {len(changes) - limit} تغييرات إضافية")
+    return lines
+
+
+def _adaptive_result_text(label: str, result: dict, old_policy: dict, new_policy: dict, cycle_samples: int = 0) -> str | None:
+    status = str(result.get("status", "unknown"))
+    samples = int(result.get("samples", 0) or 0)
+    generation = int(result.get("generation", 0) or 0)
+    old_rate = float(result.get("current_shadow_rate", 0) or 0) * 100
+    new_rate = float(result.get("candidate_shadow_rate", 0) or 0) * 100
+    coverage = float(result.get("coverage", 0) or 0) * 100
+    prefix = f"🧠 التعلم التكيفي — {label}"
+
+    if status == "approved":
+        lines = [
+            prefix,
+            "",
+            "🟢 تم اعتماد تعديل جديد وتطبيقه فعليًا",
+            "",
+            f"الجيل: #{generation}",
+            f"الصفقات التراكمية: {cycle_samples or samples} / 100",
+            "",
+            "📊 اختبار خارج العينة",
+            f"قبل: {old_rate:.1f}%",
+            f"بعد: {new_rate:.1f}%",
+            f"التغطية: {coverage:.1f}%",
+            "",
+            "🔧 ما الذي تم تعديله؟",
+            *_policy_change_lines(old_policy, new_policy),
+            "",
+            "🧪 التحقق:",
+            "✅ اجتاز اختبار خارج العينة",
+            "✅ تم اعتماد النسخة الجديدة",
+            "",
+            "📌 الحالة:",
+            "نشط — التعديل مطبق فعليًا",
+        ]
+        return "\n".join(lines)
+
+    if status == "rejected":
+        lines = [
+            prefix,
+            "",
+            "❌ لم يتم تطبيق التعديل",
+            "",
+            f"الجيل المرشح: #{generation}",
+            f"الصفقات التراكمية: {cycle_samples or samples} / 100",
+            "",
+            "📊 اختبار خارج العينة",
+            f"الحالي: {old_rate:.1f}%",
+            f"المرشح: {new_rate:.1f}%",
+            f"التغطية: {coverage:.1f}%",
+            "",
+            "🔧 التغيير المقترح:",
+            *_policy_change_lines(old_policy, new_policy),
+            "",
+            "🔒 السياسة الحالية مستمرة بدون تغيير",
+            f"السبب: {result.get('message', 'لم تحقق النسخة شروط الاعتماد')}",
+        ]
+        return "\n".join(lines)
+
+    if status == "rollback":
+        from_gen = int(result.get("from_generation", 0) or 0)
+        to_gen = int(result.get("to_generation", 0) or 0)
+        lines = [
+            prefix,
+            "",
+            "🔄 تم تنفيذ الاسترجاع",
+            "",
+            f"الجيل الذي تم التراجع عنه: #{from_gen}",
+            f"الجيل المستعاد: #{to_gen}",
+            "",
+            "🔧 ما الذي تغير بعد الاسترجاع؟",
+            *_policy_change_lines(old_policy, new_policy),
+            "",
+            "📌 الحالة:",
+            "تم استعادة النسخة السابقة/الأفضل المحفوظة",
+            "⚠️ تأثرت طبقات التعلم التكيفي فقط — الاستراتيجية الأساسية مستمرة",
+        ]
+        return "\n".join(lines)
+
+    if status == "kill_switch":
+        return "\n".join([
+            prefix,
+            "",
+            "🚨 تم تفعيل مفتاح الإيقاف التكيفي",
+            "",
+            f"السبب: {result.get('reason', 'تراجع الأداء')}",
+            "🔒 تم تعطيل طبقات التعلم التكيفي فقط",
+            "✅ الاستراتيجية الأساسية مستمرة",
+        ])
+
+    return None
+
+
+async def monthly_learning_job(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """تشغيل التعلم الجديد فقط، ثم إرسال نتيجة القرار الفعلي بوضوح."""
+    reports = load_reports()
+    try:
+        # نأخذ snapshot قبل القرار للعرض فقط.
+        intra_path = str(INTRADAY_ADAPTIVE_POLICY_FILE)
+        daily_path = str(DAILY_ADAPTIVE_POLICY_FILE)
+        intra_old = _load_adaptive_policy_snapshot(intra_path)
+        daily_old = _load_adaptive_policy_snapshot(daily_path)
+        intra_cycle_before = int(intra_old.get("monthly_cycle_total", 0) or 0)
+        daily_cycle_before = int(daily_old.get("monthly_cycle_total", 0) or 0)
+
+        # الـAnalyzer هو صاحب قرار التعلم والاعتماد؛ Main لا يغيّر Policy.
+        try:
+            intra_result = await asyncio.to_thread(monthly_self_optimization)
+        except Exception as exc:
+            log.exception("intraday monthly optimization failed: %s", exc)
+            intra_result = {"status": "error", "samples": 0, "generation": 0}
+
         try:
             from analyzer import monthly_self_optimization as daily_monthly_self_optimization
-            daily_v2_result = await asyncio.to_thread(daily_monthly_self_optimization)
+            daily_result = await asyncio.to_thread(daily_monthly_self_optimization)
         except Exception as exc:
-            log.warning("daily V2 monthly optimization failed: %s", exc)
-            daily_v2_result = {"status": "error", "samples": 0, "generation": 0}
+            log.exception("daily V2 monthly optimization failed: %s", exc)
+            daily_result = {"status": "error", "samples": 0, "generation": 0}
 
-        status = result.get("status", "unknown")
-        samples = int(result.get("samples", 0))
-        generation = int(result.get("generation", 0))
-        regime = "مفعل" if result.get("regime_active") else "غير مفعل"
-        exit_active = "مفعل" if result.get("exit_active") else "غير مفعل"
-        reason = "مفعل" if result.get("reason_active") else "غير مفعل"
+        intra_new = _load_adaptive_policy_snapshot(intra_path)
+        daily_new = _load_adaptive_policy_snapshot(daily_path)
 
-        if status in {"waiting", "waiting_oos"}:
-            body = (
-                "🧠 التقرير الشهري للتعلم\n\n"
-                f"📊 البيانات المتاحة: {samples} صفقة\n"
-                "⏳ لم تتوفر عينة كافية لاختبار OOS بأمان.\n"
-                "🔒 لم يتم تغيير أي سياسة.\n\n"
-                f"Regime: {regime}\n"
-                f"Exit: {exit_active}\n"
-                f"Reason: {reason}\n"
-                f"Policy: #{generation}"
-            )
-        elif status == "unchanged":
-            body = (
-                "🧠 التقرير الشهري للتعلم\n\n"
-                f"📊 الصفقات المحللة: {samples}\n"
-                "🔒 لم يتم اعتماد تغيير جديد.\n"
-                "النظام مستمر على أفضل Policy حالية.\n\n"
-                f"Regime: {regime}\n"
-                f"Exit: {exit_active}\n"
-                f"Reason: {reason}\n"
-                f"Policy: #{generation}"
-            )
-        else:
-            approved = bool(result.get("approved")) or status in {
-                "regime_or_exit_approved", "regime_approved"
-            }
-            decision = "✅ تم اعتماد تحسين" if approved else "🔒 لم يثبت التحسن — بدون تغيير"
-            body = (
-                "🧠 التقرير الشهري للتعلم\n\n"
-                f"📊 الصفقات المحللة: {samples}\n"
-                f"📈 OOS الحالي: {float(result.get('current_shadow_rate', 0))*100:.1f}%\n"
-                f"📈 المرشح: {float(result.get('candidate_shadow_rate', 0))*100:.1f}%\n"
-                f"🧠 Regime: {float(result.get('regime_shadow_rate', 0))*100:.1f}%\n"
-                f"🎯 Exit: {float(result.get('exit_shadow_rate', 0))*100:.1f}%\n"
-                f"🔎 Reason: {float(result.get('reason_shadow_rate', 0))*100:.1f}%\n\n"
-                f"{decision}\n"
-                f"Regime: {regime}\n"
-                f"Exit: {exit_active}\n"
-                f"Reason: {reason}\n"
-                f"Policy: #{generation}"
+        def _event_key(r: dict) -> str:
+            return (
+                f"{r.get('status','unknown')}|"
+                f"{int(r.get('generation',0) or 0)}|"
+                f"{int(r.get('from_generation',-1) or -1)}|"
+                f"{int(r.get('to_generation',-1) or -1)}"
             )
 
-        daily_line = (
-            "\n\n🌆 Daily V2: "
-            f"{int(daily_v2_result.get('samples', 0))} صفقة | "
-            f"OOS {float(daily_v2_result.get('current_shadow_rate', 0))*100:.1f}% → "
-            f"{float(daily_v2_result.get('candidate_shadow_rate', 0))*100:.1f}% | "
-            f"Policy #{int(daily_v2_result.get('generation', 0))} | "
-            f"{'تم الاعتماد' if daily_v2_result.get('approved') else 'بدون تغيير'}"
+        events = []
+
+        intra_text = _adaptive_result_text(
+            "اللحظي", intra_result, intra_old, intra_new, intra_cycle_before
         )
-        body += daily_line
-        await broadcast(context.bot, body)
-        reports["monthly_learning_sent_on"] = month_key
-        save_reports(reports)
-        log.info("monthly learning report sent: %s", month_key)
+        intra_key = _event_key(intra_result)
+        if intra_text and reports.get("adaptive_intraday_alert_key") != intra_key:
+            events.append(intra_text)
+            reports["adaptive_intraday_alert_key"] = intra_key
 
+        daily_text = _adaptive_result_text(
+            "اليومي", daily_result, daily_old, daily_new, daily_cycle_before
+        )
+        daily_key = _event_key(daily_result)
+        if daily_text and reports.get("adaptive_daily_alert_key") != daily_key:
+            events.append(daily_text)
+            reports["adaptive_daily_alert_key"] = daily_key
+
+        if events:
+            await broadcast(context.bot, "\n\n" + "\n\n".join(events))
+            log.info("adaptive learning event alert sent: %s", events)
+
+        save_reports(reports)
     except Exception as exc:
         log.exception("monthly learning job: %s", exc)
 

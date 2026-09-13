@@ -1,10 +1,10 @@
 """
-مسار المضاربة اللحظية (معزول عن السوينغ اليومي).
-- اتجاه: ساعة
-- تأكيد ناعم: 15 دقيقة
-- دخول/زخم: 5 دقائق
-- TP1: أقرب مقاومة/قمة سابقة مناسبة
-- تعلم مستقل من نتائج اللحظي فقط
+محرك السوينغ/اليومي V2 — نفس تكتيك اليومي، مع أطر زمنية يومية/أسبوعية/4س.
+- اتجاه: أسبوعي
+- تأكيد ناعم: 4 ساعات
+- دخول/زخم: يومي
+- TP1: أقرب مقاومة/قمة يومية أو أسبوعية مناسبة
+- تعلم مستقل من نتائج اليومي فقط
 """
 
 from __future__ import annotations
@@ -17,46 +17,42 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import json
 import logging
 import os
+import time as time_module
 import urllib.parse
 import urllib.request
 
 import numpy as np
 import pandas as pd
 
-from market import now_ny, REGULAR_OPEN, REGULAR_CLOSE
+from market import now_ny, REGULAR_OPEN, REGULAR_CLOSE, is_us_regular_session, session_label
 from stocks import MAX_AUTO_PRICE
 
-log = logging.getLogger(__name__)
+log = logging.getLogger("halal-bot.daily")
 
-# Deployment marker: proves which analyzer_intraday build Render actually loaded.
-INTRADAY_ANALYZER_VERSION = "REGIME_ADAPTIVE_PROFESSIONAL_MARKET_REGIME_V5"
-log.info("INTRADAY ANALYZER VERSION | %s", INTRADAY_ANALYZER_VERSION)
+SKIP_OPEN_MIN = 0
+SKIP_CLOSE_MIN = 0
+DAILY_MIN_SCORE = 82
 
-SKIP_OPEN_MIN = 20
-SKIP_CLOSE_MIN = 20
-INTRADAY_MIN_SCORE = 82
-
-INTRADAY_LEARNING_FILE = Path("/var/data/intraday_learning.jsonl")
+DAILY_LEARNING_FILE = Path("/var/data/daily_v2_learning.jsonl")
 LEARNING_MIN_SAMPLES = 20
 LEARNING_LOOKBACK = 60
 LEARNING_MAX_ADJUSTMENT = 4.0
-ADAPTIVE_POLICY_FILE = Path("/var/data/intraday_adaptive_policy.json")
+ADAPTIVE_POLICY_FILE = Path("/var/data/daily_v2_adaptive_policy.json")
 ADAPTIVE_MIN_SAMPLES = 30
 ADAPTIVE_CONFIRM_SAMPLES = 40
 ADAPTIVE_MAX_CHANGE = 0.15
-ADAPTIVE_BEST_FILE = Path("/var/data/intraday_adaptive_best.json")
-ADAPTIVE_SHADOW_FILE = Path("/var/data/intraday_shadow_results.jsonl")
-LEARNING_ALERT_FILE = Path("/var/data/intraday_learning_alert.json")
+ADAPTIVE_BEST_FILE = Path("/var/data/daily_v2_adaptive_best.json")
+ADAPTIVE_SHADOW_FILE = Path("/var/data/daily_v2_shadow_results.jsonl")
+LEARNING_ALERT_FILE = Path("/var/data/daily_v2_learning_alert.json")
 
 # Canonical list: the adaptive learner must track every real entry strategy.
 ENTRY_TYPES = (
     "اختراق مؤكد", "إعادة اختبار", "دخول مبكر", "ارتداد VWAP", "ارتداد EMA20",
     "سحب سيولة", "اختراق نطاق الافتتاح", "استمرار الزخم", "ضغط ثم انفجار",
-    "علم صاعد", "استعادة مستوى", "دخول بعد Opening Drive", "استعادة قمة اليوم",
+    "علم صاعد", "استعادة مستوى", "دخول بعد Opening Drive", "استعادة قمة الفترة",
     "استعادة بعد فشل ORB", "استمرار ABC", "سحب سيولة مع Displacement",
 )
 PREFILTER_MAX_CANDIDATES = 50
-# Stage-1 strategy-aware routing: reserve a small lane for every one of the 16 strategies.
 PREFILTER_STRATEGY_TOP_K = 4
 PREFILTER_STRATEGY_CAP = 100
 ADAPTIVE_MIN_EDGE = 0.04
@@ -71,11 +67,6 @@ REGIME_WEIGHT_MIN = 0.85
 REGIME_WEIGHT_MAX = 1.15
 REGIME_MIN_EDGE = 0.04
 REGIME_MIN_COVERAGE = 0.45
-
-# New dedicated market state: both SPY/QQQ are above session open but below VWAP.
-# It is intentionally separate from mixed/weak and starts with a neutral learning weight.
-POSITIVE_BELOW_VWAP_MAX_OPEN_GAP_PCT = 0.30
-POSITIVE_BELOW_VWAP_MIN_SCORE = 85
 
 # Adaptive Exit Engine: learns TP/SL behavior from MFE/MAE and time-to-result.
 # It starts shadow-only and can activate automatically after OOS validation.
@@ -126,7 +117,7 @@ NEWS_POSITIVE_WORDS = {
 
 
 @dataclass
-class IntradaySignal:
+class DailySignal:
     symbol: str
     name: str
     price: float
@@ -142,14 +133,16 @@ class IntradaySignal:
     risk_pct: float
     reward_r: float
     sl_method: str
-    vwap_day_note: str
+    vwap_note: str
     above_open: bool
-    vol_session_ok: bool
+    vol_ok: bool
     reasons: list[str]
     warnings: list[str]
-    mode: str = "intraday"
+    mode: str = "daily"
     entry_type: str = ""
     entry_emoji: str = "🟢"
+    matched_entry_types: list[str] | None = None
+    strategy_scores: dict[str, float] | None = None
     structure_zone: str = "محايدة"
     quality_ok: bool = True
     live_ok: bool = True
@@ -159,9 +152,7 @@ class IntradaySignal:
     sma20: float = 0.0
     atr_pct: float = 0.0
     ext_sma20: float = 0.0
-    # سعر الدخول الفعلي وقت إرسال التنبيه؛ لا يغيّر سعر التحليل الأصلي
-    alert_entry_price: float = 0.0
-    m15_state: str = "محايد"
+    h4_state: str = "محايد"
     learning_adjustment: float = 0.0
     resistance_tp1: float = 0.0
     news_state: str = "neutral"
@@ -179,19 +170,18 @@ class IntradaySignal:
     expected_slippage_pct: float = 0.0
     dollar_volume_3m: float = 0.0
     liquidity_ok: bool = True
-    diagnostic_reasons: list[str] | None = None
-    # جميع الاستراتيجيات المطابقة فعليًا، وليس الاستراتيجية الأساسية فقط.
-    matched_entry_types: list[str] | None = None
-    # تقييم قوة كل استراتيجية مطابقة لاختيار الأقوى بدل أولوية الاسم فقط.
-    strategy_scores: dict[str, float] | None = None
+    quality_reasons: list[str] | None = None
 
 
+
+# Backward-compatible name used by charting.py/performance.py.
+SignalResult = DailySignal
 def _read_learning_records() -> list[dict]:
-    if not INTRADAY_LEARNING_FILE.exists():
+    if not DAILY_LEARNING_FILE.exists():
         return []
     rows: list[dict] = []
     try:
-        with INTRADAY_LEARNING_FILE.open("r", encoding="utf-8") as f:
+        with DAILY_LEARNING_FILE.open("r", encoding="utf-8") as f:
             for line in f:
                 try:
                     row = json.loads(line)
@@ -205,8 +195,8 @@ def _read_learning_records() -> list[dict]:
 
 
 def _append_learning_record(record: dict) -> None:
-    INTRADAY_LEARNING_FILE.parent.mkdir(parents=True, exist_ok=True)
-    with INTRADAY_LEARNING_FILE.open("a", encoding="utf-8") as f:
+    DAILY_LEARNING_FILE.parent.mkdir(parents=True, exist_ok=True)
+    with DAILY_LEARNING_FILE.open("a", encoding="utf-8") as f:
         f.write(json.dumps(record, ensure_ascii=False) + "\n")
 
 
@@ -228,13 +218,13 @@ def _default_adaptive_policy() -> dict:
         "samples_at_update": 0,
         "approved": False,
         "weights": {
-            "h1_trend": 1.0, "m15": 1.0, "m5": 1.0, "vwap": 1.0,
+            "weekly_trend": 1.0, "h4": 1.0, "daily": 1.0, "vwap": 1.0,
             "vol_session": 1.0, "market": 1.0, "breakout": 1.0,
             "breakout_candle": 1.0, "retest": 1.0, "vwap_bounce": 1.0,
-            "ema_pullback": 1.0, "liquidity_sweep": 1.0, "liquidity_displacement": 1.0, "orb": 1.0, "momentum_continuation": 1.0, "compression_expansion": 1.0, "bull_flag": 1.0, "resistance_reclaim": 1.0, "opening_drive_pullback": 1.0, "hod_reclaim": 1.0, "orb_failed_reclaim": 1.0, "abc_continuation": 1.0, "vwap_h1_confluence": 1.0, "multi_level_confluence": 1.0, "early": 1.0,
+            "ema_pullback": 1.0, "liquidity_sweep": 1.0, "liquidity_displacement": 1.0, "orb": 1.0, "momentum_continuation": 1.0, "compression_expansion": 1.0, "bull_flag": 1.0, "resistance_reclaim": 1.0, "opening_drive_pullback": 1.0, "hod_reclaim": 1.0, "orb_failed_reclaim": 1.0, "abc_continuation": 1.0, "vwap_weekly_confluence": 1.0, "multi_level_confluence": 1.0, "early": 1.0,
             "news_momentum": 1.0,
         },
-        "entry_limits": {"دخول مبكر": 94, "إعادة اختبار": 95, "ارتداد VWAP": 96, "ارتداد EMA20": 96, "سحب سيولة": 97, "ضغط ثم انفجار": 98, "استمرار الزخم": 97, "اختراق نطاق الافتتاح": 99, "اختراق مؤكد": 100, "علم صاعد": 98, "استعادة مستوى": 98, "دخول بعد Opening Drive": 98, "استعادة قمة اليوم": 98, "استعادة بعد فشل ORB": 99, "استمرار ABC": 98, "سحب سيولة مع Displacement": 99},
+        "entry_limits": {"دخول مبكر": 94, "إعادة اختبار": 95, "ارتداد VWAP": 96, "ارتداد EMA20": 96, "سحب سيولة": 97, "ضغط ثم انفجار": 98, "استمرار الزخم": 97, "اختراق نطاق الافتتاح": 99, "اختراق مؤكد": 100, "علم صاعد": 98, "استعادة مستوى": 98, "دخول بعد Opening Drive": 98, "استعادة قمة الفترة": 98, "استعادة بعد فشل ORB": 99, "استمرار ABC": 98, "سحب سيولة مع Displacement": 99},
         "strategy_stats": {et: {"samples": 0, "wins": 0, "win_rate": 0.0} for et in ENTRY_TYPES},
         "min_volume_ratio": 0.85,
         "min_news_volume_ratio": 1.50,
@@ -244,7 +234,6 @@ def _default_adaptive_policy() -> dict:
             regime: {et: 1.0 for et in ENTRY_TYPES}
             for regime in (
                 "chop", "trend_clean", "trend_mixed", "market_weak",
-                "market_positive_below_vwap",
                 "news_momentum", "high_volatility", "neutral"
             )
         },
@@ -257,7 +246,6 @@ def _default_adaptive_policy() -> dict:
             }
             for regime in (
                 "chop", "trend_clean", "trend_mixed", "market_weak",
-                "market_positive_below_vwap",
                 "news_momentum", "high_volatility", "neutral"
             )
         },
@@ -407,12 +395,7 @@ def _rate(rows: list[dict]) -> float:
 
 
 def _strategy_stats(rows: list[dict]) -> dict:
-    """إحصاءات التعلم حسب الاستراتيجية الأساسية Primary فقط.
-
-    ``matched_entry_types`` يبقى محفوظًا للبحث والتحليل متعدد الاستراتيجيات،
-    لكن لا نكرر الصفقة نفسها داخل تعلم الأوزان؛ وإلا قد تتضخم عينة
-    الاستراتيجية لمجرد أن الإشارة طابقت عدة setups متداخلة.
-    """
+    """إحصاءات منفصلة لكل واحدة من استراتيجيات الدخول الـ16."""
     stats = {}
     for et in ENTRY_TYPES:
         subset = [r for r in rows if str(r.get("entry_type") or "") == et]
@@ -488,26 +471,23 @@ def _validate_candidate(candidate: dict, completed: list[dict]) -> tuple[bool, f
 
 def _classify_regime(
     trend_up: bool,
-    m15_state: str,
+    h4_state: str,
     chop: bool,
     market_ok: bool,
     atr_pct: float,
     news_state: str,
-    market_condition: str = "غير مؤكد",
 ) -> str:
     if news_state == "positive_strong":
         return "news_momentum"
     if chop:
         return "chop"
-    if market_condition == "إيجابي_تحت_VWAP":
-        return "market_positive_below_vwap"
     if not market_ok:
         return "market_weak"
-    if trend_up and m15_state == "داعم" and atr_pct <= 4.5:
+    if trend_up and h4_state == "داعم" and atr_pct <= 4.5:
         return "trend_clean"
-    if trend_up and m15_state != "معاكس":
+    if trend_up and h4_state != "معاكس":
         return "trend_mixed"
-    if atr_pct > 6.0:
+    if atr_pct > 8.0:
         return "high_volatility"
     return "neutral"
 
@@ -515,11 +495,11 @@ def _classify_regime(
 def _interaction_keys(
     entry_type: str,
     market_regime: str,
-    m15_state: str,
+    h4_state: str,
     volume_ratio: float,
     breakout_quality: float,
 ) -> list[str]:
-    keys = [f"type:{entry_type}", f"regime:{market_regime}", f"m15:{m15_state}"]
+    keys = [f"type:{entry_type}", f"regime:{market_regime}", f"h4:{h4_state}"]
     if volume_ratio >= 1.5:
         keys.append("volume:strong")
     elif volume_ratio < 1.0:
@@ -530,8 +510,8 @@ def _interaction_keys(
         keys.append("breakout:weak")
     if entry_type in ENTRY_TYPES and volume_ratio >= 1.5:
         keys.append("combo:breakout+volume")
-    if m15_state == "داعم" and volume_ratio >= 1.2 and market_regime == "trend_clean":
-        keys.append("combo:m15+volume+trend")
+    if h4_state == "داعم" and volume_ratio >= 1.2 and market_regime == "trend_clean":
+        keys.append("combo:h4+volume+trend")
     if market_regime == "chop" and volume_ratio < 1.2:
         keys.append("combo:chop+weak_volume")
     return keys
@@ -1058,8 +1038,11 @@ def adaptive_retrain_if_ready(force_monthly: bool = False) -> dict:
             candidate["interaction_weights"][key] = max(1.0 - ADAPTIVE_MAX_CHANGE, w - 0.05)
 
     # نوع الدخول
-    for et in ("دخول مبكر", "إعادة اختبار", "ارتداد VWAP", "ارتداد EMA20", "سحب سيولة", "سحب سيولة مع Displacement", "ضغط ثم انفجار", "استمرار الزخم", "اختراق نطاق الافتتاح", "اختراق مؤكد", "علم صاعد", "استعادة مستوى", "دخول بعد Opening Drive", "استعادة قمة اليوم", "استعادة بعد فشل ORB", "استمرار ABC"):
-        subset = [r for r in train if str(r.get("entry_type") or "") == et]
+    for et in ("دخول مبكر", "إعادة اختبار", "ارتداد VWAP", "ارتداد EMA20", "سحب سيولة", "سحب سيولة مع Displacement", "ضغط ثم انفجار", "استمرار الزخم", "اختراق نطاق الافتتاح", "اختراق مؤكد", "علم صاعد", "استعادة مستوى", "دخول بعد Opening Drive", "استعادة قمة الفترة", "استعادة بعد فشل ORB", "استمرار ABC"):
+        subset = [
+            r for r in train
+            if str(r.get("entry_type") or "") == et
+        ]
         if len(subset) < STRATEGY_MIN_SAMPLES:
             continue
         rate = _rate(subset)
@@ -1297,7 +1280,7 @@ def _learning_adjustment(factors: list[str], entry_type: str) -> float:
     return float(max(-LEARNING_MAX_ADJUSTMENT, min(LEARNING_MAX_ADJUSTMENT, adjustment)))
 
 
-def register_intraday_signal(sig: IntradaySignal) -> str:
+def register_daily_signal(sig: DailySignal) -> str:
     """يحفظ لقطة الإشارة قبل إرسالها؛ لا يؤثر على سجل السوينغ."""
     signal_id = (
         f"{sig.symbol}_{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S%f')}"
@@ -1308,22 +1291,21 @@ def register_intraday_signal(sig: IntradaySignal) -> str:
             "signal_id": signal_id,
             "created_at": datetime.now(timezone.utc).isoformat(),
             "symbol": sig.symbol,
-            "entry": round(float(getattr(sig, "alert_entry_price", 0.0) or sig.price), 4),
-            "analysis_price": round(float(sig.price), 4),
+            "entry": round(float(sig.price), 4),
             "stop_loss": round(float(sig.stop_loss), 4),
             "tp1": round(float(sig.tp1), 4),
             "score": int(sig.score),
             "grade": sig.grade,
             "entry_type": sig.entry_type,
-            "matched_entry_types": list(sig.matched_entry_types or []),
-            "strategy_scores": dict(sig.strategy_scores or {}),
+            "matched_entry_types": list(getattr(sig, "matched_entry_types", []) or []),
+            "strategy_scores": dict(getattr(sig, "strategy_scores", {}) or {}),
             "factors": list(sig.factor_keys or []),
-            "m15_state": sig.m15_state,
+            "h4_state": sig.h4_state,
             "volume_ratio": float(sig.volume_ratio),
             "atr_pct": float(sig.atr_pct),
             "ext_sma20": float(sig.ext_sma20),
             "above_open": bool(sig.above_open),
-            "vwap": sig.vwap_day_note,
+            "vwap": sig.vwap_note,
             "news_state": sig.news_state,
             "breakout_quality": sig.breakout_quality,
             "market_state": sig.market_state,
@@ -1358,7 +1340,7 @@ def register_intraday_signal(sig: IntradaySignal) -> str:
     return signal_id
 
 
-def record_intraday_outcome(
+def record_daily_outcome(
     signal_id: str | None,
     symbol: str,
     status: str,
@@ -1412,10 +1394,10 @@ def record_intraday_outcome(
             "score": target.get("score"),
             "grade": target.get("grade"),
             "entry_type": target.get("entry_type"),
-            "matched_entry_types": target.get("matched_entry_types") or [],
+            "matched_entry_types": target.get("matched_entry_types") or [target.get("entry_type")],
             "strategy_scores": target.get("strategy_scores") or {},
             "factors": target.get("factors") or [],
-            "m15_state": target.get("m15_state", "محايد"),
+            "h4_state": target.get("h4_state", "محايد"),
             "volume_ratio": target.get("volume_ratio", 0),
             "atr_pct": target.get("atr_pct", 0),
             "ext_sma20": target.get("ext_sma20", 0),
@@ -1442,15 +1424,88 @@ def record_intraday_outcome(
     target["status"] = "completed"
 
 
-def _m15_confirmation(m15: pd.DataFrame, price: float) -> tuple[str, int]:
-    """تأكيد ناعم: لا يمنع الإشارة وحده، لكنه يرفع/يخفض الثقة."""
+
+def _build_4h_from_60m(df: pd.DataFrame) -> pd.DataFrame | None:
+    """حوّل شموع 60 دقيقة إلى شموع 4 ساعات فعلية من جلسة التداول النظامية.
+    يتم تكوين كل شمعة 4س من أربع شموع 60د متتالية في نفس يوم التداول،
+    مع تجاهل المجموعة الجزئية الأخيرة إذا لم تكتمل 4 شموع.
+    """
     try:
-        if m15 is None or len(m15) < 30:
+        if df is None or df.empty:
+            return None
+
+        x = df.copy()
+        x = x.sort_index()
+
+        # توحيد أسماء الأعمدة إذا كانت MultiIndex.
+        if isinstance(x.columns, pd.MultiIndex):
+            x.columns = [c[0] if isinstance(c, tuple) else c for c in x.columns]
+
+        needed = ["Open", "High", "Low", "Close"]
+        if any(c not in x.columns for c in needed):
+            return None
+
+        # نحتاج فقط لشموع الجلسة النظامية؛ نستبعد أي pre/post-market
+        # إن كانت موجودة في المصدر.
+        if getattr(x.index, "tz", None) is not None:
+            local_idx = x.index.tz_convert("America/New_York")
+        else:
+            local_idx = x.index
+
+        session_mask = (
+            (local_idx.time >= pd.Timestamp("09:30").time()) &
+            (local_idx.time < pd.Timestamp("16:00").time())
+        )
+        x = x.loc[session_mask].copy()
+        if x.empty:
+            return None
+
+        if getattr(x.index, "tz", None) is not None:
+            session_day = x.index.tz_convert("America/New_York").date
+        else:
+            session_day = x.index.date
+
+        # أربع شموع 60د متتالية = شمعة 4 ساعات.
+        x["_session_day"] = session_day
+        x["_bar_no"] = x.groupby("_session_day").cumcount()
+        x["_group"] = x["_bar_no"] // 4
+
+        agg = {
+            "Open": "first",
+            "High": "max",
+            "Low": "min",
+            "Close": "last",
+        }
+        if "Volume" in x.columns:
+            agg["Volume"] = "sum"
+
+        g = x.groupby(["_session_day", "_group"], sort=True)
+        counts = g["Close"].count()
+        valid_groups = counts[counts >= 4].index
+
+        y = g.agg(agg).loc[valid_groups]
+        if y.empty:
+            return None
+
+        # استخدم نهاية آخر ساعة داخل كل مجموعة كزمن الشمعة 4س.
+        end_times = x.groupby(["_session_day", "_group"], sort=True).apply(
+            lambda z: z.index[-1]
+        ).loc[valid_groups]
+        y.index = pd.DatetimeIndex(end_times.values)
+
+        y = y.sort_index()
+        y = y[~y.index.duplicated(keep="last")]
+        return y
+    except Exception:
+        return None
+
+
+def _m15_confirmation(h4: pd.DataFrame, price: float) -> tuple[str, int]:
+    """تأكيد ناعم 4 ساعات: نفس فكرة 15د في اللحظي، لكن على بنية 4س."""
+    try:
+        if h4 is None or len(h4) < 30:
             return "محايد", 0
-        last_day = m15.index[-1].date()
-        cur = m15[m15.index.date == last_day]
-        if len(cur) < 6:
-            cur = m15.tail(20)
+        cur = h4.tail(30)
         c = cur["Close"].astype(float)
         e20 = _ema(c, 20)
         e50 = _ema(c, 50)
@@ -1476,7 +1531,6 @@ def _m15_confirmation(m15: pd.DataFrame, price: float) -> tuple[str, int]:
         return "محايد", 0
 
 
-
 def _fetch_recent_news(symbol: str) -> list[dict]:
     """مصدر أخبار اختياري. فشل المصدر لا يوقف البوت."""
     if not FINNHUB_API_KEY:
@@ -1491,7 +1545,7 @@ def _fetch_recent_news(symbol: str) -> list[dict]:
             "token": FINNHUB_API_KEY,
         })
         url = f"https://finnhub.io/api/v1/company-news?{params}"
-        req = urllib.request.Request(url, headers={"User-Agent": "IntradayScanner/1.0"})
+        req = urllib.request.Request(url, headers={"User-Agent": "DailyScanner/1.0"})
         with urllib.request.urlopen(req, timeout=3.5) as r:
             data = json.loads(r.read().decode("utf-8", errors="replace"))
         return data if isinstance(data, list) else []
@@ -1525,16 +1579,16 @@ def _classify_news(symbol: str) -> tuple[str, str, str]:
     return "neutral", title, source
 
 
-def _chop_filter(today_5: pd.DataFrame, price: float, vwap: float) -> bool:
+def _chop_filter(today_d: pd.DataFrame, price: float, vwap: float) -> bool:
     """True = سوق متذبذب/Chop، فلا نطارد الإشارات."""
     try:
-        c = today_5["Close"].astype(float)
+        c = today_d["Close"].astype(float)
         if len(c) < 12:
             return False
         e9 = _ema(c, 9)
         cross = ((c > e9).astype(int).diff().abs()).tail(12).sum()
         vwap_dist = abs(price - vwap) / price * 100 if price else 0
-        ranges = (today_5["High"] - today_5["Low"]).astype(float)
+        ranges = (today_d["High"] - today_d["Low"]).astype(float)
         avg_range = ranges.tail(12).mean()
         if avg_range <= 0:
             return False
@@ -1544,21 +1598,21 @@ def _chop_filter(today_5: pd.DataFrame, price: float, vwap: float) -> bool:
         return False
 
 
-def _breakout_quality(today_5: pd.DataFrame, level: float, price: float) -> tuple[bool, float]:
+def _breakout_quality(today_d: pd.DataFrame, level: float, price: float) -> tuple[bool, float]:
     """
-    جودة آخر شمعة 5د فوق المقاومة + متابعة الشمعة السابقة.
+    جودة آخر شمعة يومي فوق المقاومة + متابعة الشمعة السابقة.
     لا نعتبر لمس المستوى اختراقًا.
     """
     try:
-        if level <= 0 or len(today_5) < 3:
+        if level <= 0 or len(today_d) < 3:
             return False, 0.0
-        b = today_5.iloc[-1]
+        b = today_d.iloc[-1]
         o, h, l, c = map(float, (b["Open"], b["High"], b["Low"], b["Close"]))
         rng = max(h - l, 1e-9)
         body = abs(c - o) / rng
         close_pos = (c - l) / rng
         upper_wick = (h - max(o, c)) / rng
-        prior_close = float(today_5["Close"].iloc[-2])
+        prior_close = float(today_d["Close"].iloc[-2])
 
         strong_close = c >= level * 1.001 and close_pos >= 0.70
         body_ok = body >= 0.45
@@ -1570,17 +1624,134 @@ def _breakout_quality(today_5: pd.DataFrame, level: float, price: float) -> tupl
         return False, 0.0
 
 
-MARKET_RETRY_ATTEMPTS = 4
-MARKET_RETRY_SLEEP_SECONDS = 0.25
-MARKET_RELATIVE_CACHE_TTL_SECONDS = 300
-_MARKET_RELATIVE_CACHE: tuple[float, float, float] | None = None
+def _period_days(period: str, default: int = 5) -> int:
+    """Convert common history periods (e.g. 5y, 6mo, 30d) to calendar days."""
+    try:
+        raw = str(period).strip().lower()
+        if raw.endswith("y"):
+            return max(1, int(float(raw[:-1]) * 365.25))
+        if raw.endswith("mo"):
+            return max(1, int(float(raw[:-2]) * 30.5))
+        if raw.endswith("d"):
+            return max(1, int(float(raw[:-1])))
+        if raw.endswith("wk"):
+            return max(1, int(float(raw[:-2]) * 7))
+    except Exception:
+        pass
+    return int(default)
 
 
-def _market_regime_from_state(market_state: str) -> str:
+DAILY_MARKET_RETRY_ATTEMPTS = 4
+DAILY_MARKET_RETRY_DELAYS = (0.0, 0.5, 1.0, 1.5)
+DAILY_POSITIVE_EMA50_BUFFER_PCT = 0.50
+
+
+def _market_alignment(fetch_intraday) -> tuple[bool, str]:
+    """
+    Daily SPY/QQQ market regime:
+      قوي    = كلاهما فوق EMA20 و EMA20 >= EMA50
+      إيجابي = كلاهما فوق EMA50، لكن ليسا قويين بالكامل
+      مختلط  = أحدهما قوي/إيجابي والآخر ضعيف
+      ضعيف   = كلاهما ضعيف
+      غير مؤكد = بيانات غير مكتملة
+    """
+    states = []
+
+    for sym in ("SPY", "QQQ"):
+        state = None
+        for attempt in range(DAILY_MARKET_RETRY_ATTEMPTS):
+            attempt_no = attempt + 1
+            try:
+                log.info(
+                    "DAILY MARKET FETCH | %s | attempt %d/%d | interval=1d | period=6mo",
+                    sym, attempt_no, DAILY_MARKET_RETRY_ATTEMPTS,
+                )
+                d = fetch_intraday(sym, interval="1d", period="6mo")
+
+                if d is None:
+                    raise ValueError("market data is None")
+                if "Close" not in d.columns:
+                    raise ValueError("Close column missing")
+
+                c = pd.to_numeric(d["Close"], errors="coerce").dropna()
+                if len(c) < 50:
+                    raise ValueError(f"insufficient daily closes: {len(c)} < 50")
+
+                e20 = float(_ema(c, 20).iloc[-1])
+                e50 = float(_ema(c, 50).iloc[-1])
+                p = float(c.iloc[-1])
+
+                if not (np.isfinite(e20) and np.isfinite(e50) and np.isfinite(p)):
+                    raise ValueError("non-finite market values")
+
+                strong = bool(p >= e20 and e20 >= e50)
+                positive = bool(
+                    not strong
+                    and p >= e50 * (1.0 - DAILY_POSITIVE_EMA50_BUFFER_PCT / 100.0)
+                )
+
+                state = "داعم" if strong else "إيجابي" if positive else "ضعيف"
+
+                log.info(
+                    "DAILY MARKET RESULT | %s | attempt %d/%d | close=%.4f | ema20=%.4f | ema50=%.4f | state=%s",
+                    sym, attempt_no, DAILY_MARKET_RETRY_ATTEMPTS,
+                    p, e20, e50, state,
+                )
+                break
+
+            except Exception as exc:
+                log.warning(
+                    "DAILY MARKET FETCH FAILED | %s | attempt %d/%d | %s",
+                    sym, attempt_no, DAILY_MARKET_RETRY_ATTEMPTS, exc,
+                )
+                if attempt < DAILY_MARKET_RETRY_ATTEMPTS - 1:
+                    delay = DAILY_MARKET_RETRY_DELAYS[
+                        min(attempt + 1, len(DAILY_MARKET_RETRY_DELAYS) - 1)
+                    ]
+                    if delay > 0:
+                        time_module.sleep(delay)
+
+        states.append(state)
+        log.info(
+            "DAILY MARKET SYMBOL FINAL | %s | state=%s",
+            sym, state or "غير متاح",
+        )
+
+    if any(x is None for x in states):
+        return False, "بيانات SPY/QQQ غير مكتملة بعد إعادة المحاولة"
+
+    if states[0] == "داعم" and states[1] == "داعم":
+        log.info("DAILY MARKET FINAL | SPY=داعم | QQQ=داعم | ok=True | state=SPY+QQQ داعمان يوميًا")
+        return True, "SPY+QQQ داعمان يوميًا"
+
+    if states[0] in {"داعم", "إيجابي"} and states[1] in {"داعم", "إيجابي"}:
+        log.info(
+            "DAILY MARKET FINAL | SPY=%s | QQQ=%s | ok=True | state=SPY+QQQ إيجابيان يوميًا",
+            states[0], states[1],
+        )
+        return True, "SPY+QQQ إيجابيان يوميًا"
+
+    if states[0] == "ضعيف" and states[1] == "ضعيف":
+        log.info("DAILY MARKET FINAL | SPY=ضعيف | QQQ=ضعيف | ok=False | state=SPY+QQQ ضعيفان يوميًا")
+        return False, "SPY+QQQ ضعيفان يوميًا"
+
+    log.info(
+        "DAILY MARKET FINAL | SPY=%s | QQQ=%s | ok=True | state=SPY/QQQ مختلطان يوميًا",
+        states[0], states[1],
+    )
+    return True, "SPY/QQQ مختلطان يوميًا"
+
+def _daily_market_condition(market_state: str) -> str:
+    """Map the benchmark state to the daily policy regime.
+
+    This is deliberately separate from the internal adaptive ``market_regime``
+    used for learning so the execution gate always reflects the actual
+    SPY/QQQ condition detected before the scan.
+    """
     state = str(market_state or "")
     if "داعمان" in state:
         return "قوي"
-    if "إيجابيان تحت VWAP" in state:
+    if "إيجابيان" in state:
         return "إيجابي_تحت_VWAP"
     if "ضعيفان" in state:
         return "ضعيف"
@@ -1589,111 +1760,12 @@ def _market_regime_from_state(market_state: str) -> str:
     return "غير مؤكد"
 
 
-def _market_relative_returns(fetch_intraday) -> tuple[float, float, float]:
-    import time
-    global _MARKET_RELATIVE_CACHE
-    now = time.time()
-    if _MARKET_RELATIVE_CACHE and now - _MARKET_RELATIVE_CACHE[0] < MARKET_RELATIVE_CACHE_TTL_SECONDS:
-        spy, qqq = _MARKET_RELATIVE_CACHE[1], _MARKET_RELATIVE_CACHE[2]
-        return spy, qqq, (spy + qqq) / 2.0
-    vals: dict[str, float] = {}
-    for sym in ("SPY", "QQQ"):
-        try:
-            d = fetch_intraday(sym, interval="5m", period="3d")
-            if d is None or len(d) < 6:
-                vals[sym] = 0.0
-                continue
-            day = d.index[-1].date()
-            cur = d[d.index.date == day]
-            prev = d[d.index.date < day]
-            if cur.empty or prev.empty:
-                vals[sym] = 0.0
-                continue
-            prev_close = float(prev["Close"].iloc[-1])
-            last = float(cur["Close"].iloc[-1])
-            vals[sym] = (last - prev_close) / prev_close * 100 if prev_close > 0 else 0.0
-        except Exception:
-            vals[sym] = 0.0
-    spy, qqq = float(vals.get("SPY", 0.0)), float(vals.get("QQQ", 0.0))
-    _MARKET_RELATIVE_CACHE = (now, spy, qqq)
-    return spy, qqq, (spy + qqq) / 2.0
-
-
-def _market_alignment(fetch_intraday) -> tuple[bool, str]:
-    """SPY + QQQ: جلب مستقل مع Retry وتسجيل واضح؛ الاختلاط لا يرفض السهم."""
-    import time
-
-    states = []
-    for sym in ("SPY", "QQQ"):
-        state = None
-        for attempt in range(1, MARKET_RETRY_ATTEMPTS + 1):
-            try:
-                log.info("MARKET DATA | %s | attempt %d/%d", sym, attempt, MARKET_RETRY_ATTEMPTS)
-                d = fetch_intraday(sym, interval="5m", period="2d")
-                if d is None or len(d) < 20:
-                    raise ValueError("market data unavailable/incomplete")
-                day = d.index[-1].date()
-                cur = d[d.index.date == day]
-                if len(cur) < 6:
-                    raise ValueError("market session data incomplete")
-                p = float(cur["Close"].iloc[-1])
-                op = float(cur["Open"].iloc[0])
-                vw = float(_vwap(cur).iloc[-1])
-                if p >= op and p >= vw:
-                    state = "داعم"
-                elif p >= op and p < vw and p >= op * (1.0 - POSITIVE_BELOW_VWAP_MAX_OPEN_GAP_PCT / 100.0):
-                    state = "إيجابي_تحت_VWAP"
-                else:
-                    state = "ضعيف"
-                log.info(
-                    "MARKET DATA | %s | success | bars=%d | close=%.4f | open=%.4f | vwap=%.4f | state=%s",
-                    sym, len(cur), p, op, vw, state,
-                )
-                break
-            except Exception as exc:
-                log.warning(
-                    "MARKET DATA | %s | failed attempt %d/%d | %s",
-                    sym, attempt, MARKET_RETRY_ATTEMPTS, str(exc),
-                )
-                if attempt < MARKET_RETRY_ATTEMPTS:
-                    time.sleep(MARKET_RETRY_SLEEP_SECONDS)
-        states.append(state)
-
-    if states == ["داعم", "داعم"]:
-        result = (True, "SPY+QQQ داعمان")
-    elif states == ["إيجابي_تحت_VWAP", "إيجابي_تحت_VWAP"]:
-        result = (True, "SPY+QQQ إيجابيان تحت VWAP")
-    elif states == ["ضعيف", "ضعيف"]:
-        result = (False, "SPY+QQQ ضعيفان")
-    elif all(x is None for x in states):
-        result = (False, "السوق غير مؤكد")
-    elif any(x is None for x in states):
-        result = (False, "بيانات السوق غير مكتملة")
-    else:
-        # أي مزيج بين داعم/إيجابي تحت VWAP/ضعيف يبقى سوقًا مختلطًا.
-        result = (True, "SPY/QQQ مختلطان")
-
-    log.info(
-        "MARKET RESULT | SPY=%s | QQQ=%s | ok=%s | state=%s",
-        states[0] if states[0] is not None else "غير متوفر",
-        states[1] if states[1] is not None else "غير متوفر",
-        result[0], result[1],
-    )
-    return result
-
-
 def session_window_ok(dt=None) -> tuple[bool, str]:
+    """Daily engine: market must be a real US trading session; no intraday first/last-20 restriction."""
     dt = dt or now_ny()
-    t = dt.time()
-    open_ok_after = time(9, 50)
-    close_cut = time(15, 40)
-    if t < open_ok_after:
-        return False, "داخل أول 20 دقيقة — ضجيج افتتاح"
-    if t > close_cut:
-        return False, "آخر 20 دقيقة — تجنب التبييت"
-    if t < REGULAR_OPEN or t > REGULAR_CLOSE:
-        return False, "خارج الجلسة النظامية"
-    return True, "نافذة لحظية مسموحة"
+    if not is_us_regular_session(dt):
+        return False, session_label(dt)
+    return True, "نافذة يومية مسموحة"
 
 
 def _ema(s: pd.Series, n: int) -> pd.Series:
@@ -1717,9 +1789,10 @@ def _atr(df: pd.DataFrame, n: int = 14) -> pd.Series:
 
 
 def _vwap(df: pd.DataFrame) -> pd.Series:
-    tp = (df["High"] + df["Low"] + df["Close"]) / 3
-    vol = df["Volume"].replace(0, np.nan)
-    return (tp * vol).cumsum() / vol.cumsum()
+    """Daily anchored VWAP: rolling 20-bar volume-weighted typical price."""
+    tp = (df["High"].astype(float) + df["Low"].astype(float) + df["Close"].astype(float)) / 3
+    vol = df["Volume"].astype(float).replace(0, np.nan)
+    return (tp * vol).rolling(20, min_periods=5).sum() / vol.rolling(20, min_periods=5).sum()
 
 
 def _grade(score: int, strong: bool = False) -> str:
@@ -1737,14 +1810,14 @@ def _grade(score: int, strong: bool = False) -> str:
 
 
 def _find_prior_resistance(
-    today_5: pd.DataFrame,
-    h1: pd.DataFrame,
+    today_d: pd.DataFrame,
+    weekly: pd.DataFrame,
     price: float,
 ) -> tuple[float, str]:
     candidates: list[tuple[float, str]] = []
 
     try:
-        x = today_5.iloc[:-1].copy()
+        x = today_d.iloc[:-1].copy()
         if len(x) >= 8:
             highs = x["High"].astype(float)
             for i in range(2, len(highs) - 2):
@@ -1756,12 +1829,12 @@ def _find_prior_resistance(
                     and v >= float(highs.iloc[i + 2])
                     and price * 1.008 <= v <= price * 1.07
                 ):
-                    candidates.append((v, "قمة 5د سابقة"))
+                    candidates.append((v, "قمة يومي سابقة"))
     except Exception:
         pass
 
     try:
-        x = h1.iloc[:-1].tail(30)
+        x = weekly.iloc[:-1].tail(30)
         if len(x) >= 5:
             highs = x["High"].astype(float)
             for i in range(2, len(highs) - 2):
@@ -1773,7 +1846,7 @@ def _find_prior_resistance(
                     and v >= float(highs.iloc[i + 2])
                     and price * 1.008 <= v <= price * 1.07
                 ):
-                    candidates.append((v, "قمة ساعة سابقة"))
+                    candidates.append((v, "قمة أسبوعية سابقة"))
     except Exception:
         pass
 
@@ -1784,12 +1857,12 @@ def _find_prior_resistance(
 
 _QUOTE_CACHE: dict[str, tuple[datetime, dict]] = {}
 QUOTE_CACHE_SECONDS = 30
-MAX_SPREAD_PCT = 0.80
-HARD_MAX_SPREAD_PCT = 1.20
+MAX_SPREAD_PCT = 1.20
+HARD_MAX_SPREAD_PCT = 2.00
 MIN_DOLLAR_VOLUME_3M = 10_000_000.0
 
 def _quote_liquidity(symbol: str, price: float) -> dict:
-    """لحظي: Bid/Ask من Alpaca فقط؛ لا نستخدم Yahoo كبديل للتنفيذ اللحظي."""
+    """يومي: Bid/Ask من Alpaca فقط؛ لا نستخدم Yahoo كبديل للتنفيذ اليومي."""
     now = datetime.now(timezone.utc)
     cached = _QUOTE_CACHE.get(symbol)
     if cached and (now - cached[0]).total_seconds() < QUOTE_CACHE_SECONDS:
@@ -1824,92 +1897,108 @@ def _quote_liquidity(symbol: str, price: float) -> dict:
     return result
 
 
-def get_live_entry_price(symbol: str) -> float:
-    """يأخذ سعرًا لحظيًا واحدًا وقت الإرسال من Alpaca (متوسط Bid/Ask).
-    مستقل عن سعر التحليل ولا يعيد حساب الوقف أو الأهداف.
+_DAILY_MARKET_RET_CACHE = {"ts": 0.0, "spy": None, "qqq": None}
+
+def _daily_market_relative_returns(fetch_intraday) -> tuple[float | None, float | None]:
+    """Return current daily % change for SPY/QQQ with a short cache.
+
+    Used only by the daily weak-market exception. It does not alter the normal
+    market gate; it provides the benchmark returns needed to measure whether a
+    stock is materially outperforming a weak market.
     """
-    try:
-        from market_data import fetch_latest_quote, data_age_minutes
-        q = fetch_latest_quote(symbol)
-        bid = float(q.get("bid") or 0)
-        ask = float(q.get("ask") or 0)
-        if bid <= 0 or ask <= 0 or ask < bid:
-            return 0.0
-        ts = q.get("timestamp")
-        if ts:
-            mid = (bid + ask) / 2.0
-            qdf = pd.DataFrame({"Close": [mid]}, index=[pd.Timestamp(ts)])
-            if data_age_minutes(qdf) > 2.0:
-                return 0.0
-        return round((bid + ask) / 2.0, 4)
-    except Exception:
-        return 0.0
+    now_ts = time_module.time()
+    cached = _DAILY_MARKET_RET_CACHE
+    if (now_ts - float(cached.get("ts", 0.0))) < 300.0 and cached.get("spy") is not None and cached.get("qqq") is not None:
+        return float(cached["spy"]), float(cached["qqq"])
+
+    vals = {}
+    for sym in ("SPY", "QQQ"):
+        try:
+            d = fetch_intraday(sym, interval="1d", period="10d")
+            c = pd.to_numeric(d["Close"], errors="coerce").dropna() if d is not None and "Close" in d.columns else pd.Series(dtype=float)
+            if len(c) >= 2 and float(c.iloc[-2]) > 0:
+                vals[sym] = (float(c.iloc[-1]) - float(c.iloc[-2])) / float(c.iloc[-2]) * 100.0
+            else:
+                vals[sym] = None
+        except Exception as exc:
+            log.warning("DAILY RELATIVE MARKET FETCH FAILED | %s | %s", sym, str(exc))
+            vals[sym] = None
+
+    if vals.get("SPY") is not None and vals.get("QQQ") is not None:
+        cached.update({"ts": now_ts, "spy": vals["SPY"], "qqq": vals["QQQ"]})
+    return vals.get("SPY"), vals.get("QQQ")
 
 
-def analyze_intraday(
+def analyze_daily(
     symbol: str,
     name: str = "",
+    live: bool = True,
     market_context: tuple[bool, str] | None = None,
     preloaded: tuple[pd.DataFrame, pd.DataFrame] | None = None,
-) -> Optional[IntradaySignal]:
+) -> Optional[DailySignal]:
     from market_data import fetch_intraday
     from market_data import intraday_data_fresh
 
     if preloaded is not None:
-        h1, m5 = preloaded
+        weekly, daily = preloaded
     else:
-        h1 = fetch_intraday(symbol, interval="60m", period="10d")
-        m5 = fetch_intraday(symbol, interval="5m", period="5d")
+        weekly = fetch_intraday(symbol, interval="1wk", period="5y")
+        daily = fetch_intraday(symbol, interval="1d", period="2y")
 
-    ok_h1, _ = intraday_data_fresh(h1, "60m", 90)
-    if h1 is None or len(h1) < 40 or not ok_h1:
+    if weekly is None or len(weekly) < 60 or daily is None or len(daily) < 80:
         return None
 
-    ok_m5, _ = intraday_data_fresh(m5, "5m", 12)
-    if m5 is None or len(m5) < 30 or not ok_m5:
-        return None
-
+    # Daily bars can be current during regular session. The engine is deliberately
+    # tolerant of the last bar being today's partial candle.
+    today_d = daily.tail(120).copy()
+    last_day = daily.index[-1].date()
     try:
-        m15 = fetch_intraday(symbol, interval="15m", period="10d")
-        ok_m15, _ = intraday_data_fresh(m15, "15m", 25)
-        if not ok_m15:
-            m15 = None
+        h4_60m = fetch_intraday(symbol, interval="60m", period="60d")
+        ok_h4, _ = intraday_data_fresh(h4_60m, "60m", 240)
+        if not ok_h4:
+            h4 = None
+        else:
+            # مهم: المصدر يعطينا 60د؛ نحوله فعليًا إلى 4س قبل
+            # تمريره إلى _m15_confirmation، حتى لا تُحسب مؤشرات
+            # "4H" على شموع 60د.
+            h4 = _build_4h_from_60m(h4_60m)
+            if h4 is None or len(h4) < 30:
+                h4 = None
     except Exception:
-        m15 = None
+        h4 = None
 
-    last_day = m5.index[-1].date()
-    today_5 = m5[m5.index.date == last_day]
-    if len(today_5) < 6:
-        return None
+    # Compatibility aliases keep the proven 16-setup intelligence readable.
+    weekly = weekly.copy()
+    daily = daily.copy()
 
-    price = float(today_5["Close"].iloc[-1])
+    price = float(today_d["Close"].iloc[-1])
     if price <= 0 or price > float(MAX_AUTO_PRICE):
         return None
 
-    day_open = float(today_5["Open"].iloc[0])
-    prev_days = m5[m5.index.date < last_day]
+    day_open = float(today_d["Open"].iloc[-1])
+    prev_days = daily[daily.index.date < last_day]
     prev_close = float(prev_days["Close"].iloc[-1]) if not prev_days.empty else price
     change_pct = (price - prev_close) / prev_close * 100 if prev_close else 0.0
 
-    vwap_s = _vwap(today_5)
+    vwap_s = _vwap(today_d)
     vwap_last = float(vwap_s.iloc[-1]) if pd.notna(vwap_s.iloc[-1]) else price
     above_vwap = price >= vwap_last
-    vwap_note = "فوق VWAP اليوم" if above_vwap else "تحت VWAP اليوم"
+    vwap_note = "فوق VWAP 20 يوم" if above_vwap else "تحت VWAP 20 يوم"
     above_open = price >= day_open
 
-    vol_today = float(today_5["Volume"].sum())
-    bars = max(len(today_5), 1)
+    vol_today = float(today_d["Volume"].sum())
+    bars = max(len(today_d), 1)
     avg_bar_today = vol_today / bars
-    hist_5 = m5[m5.index.date < last_day].tail(120)
+    hist_5 = daily[daily.index.date < last_day].tail(120)
     vol_hist = (
         float(hist_5["Volume"].mean())
         if not hist_5.empty
-        else float(m5["Volume"].tail(60).mean() or 1)
+        else float(daily["Volume"].tail(60).mean() or 1)
     )
-    vol_session_ratio = avg_bar_today / vol_hist if vol_hist else 1.0
-    vol_session_ok = vol_session_ratio >= 0.90
+    vol_ratio = avg_bar_today / vol_hist if vol_hist else 1.0
+    vol_ok = vol_ratio >= 0.90
 
-    hc = h1["Close"]
+    hc = weekly["Close"]
     ema20 = _ema(hc, 20)
     ema50 = _ema(hc, 50)
     e20 = float(ema20.iloc[-1])
@@ -1917,25 +2006,42 @@ def analyze_intraday(
     h_rsi = float(_rsi(hc, 14).iloc[-1])
     trend_up = price > e20 > e50 * 0.998 and h_rsi >= 45
 
-    c5 = today_5["Close"]
+    c5 = today_d["Close"]
     e5 = float(_ema(c5, 20).iloc[-1])
     r5 = float(_rsi(c5, 14).iloc[-1])
-    last_green = float(today_5["Close"].iloc[-1]) >= float(today_5["Open"].iloc[-1])
+    last_green = float(today_d["Close"].iloc[-1]) >= float(today_d["Open"].iloc[-1])
     mom = (price - float(c5.iloc[-6])) / float(c5.iloc[-6]) * 100 if len(c5) >= 6 else 0.0
     live_ok = price >= e5 * 0.998 and above_vwap and (last_green or mom > 0.05) and r5 < 78
 
-    m15_state, m15_points = _m15_confirmation(m15, price)
+    h4_state, h4_points = _m15_confirmation(h4, price)
     news_state, news_title, news_source = _classify_news(symbol)
     market_ok, market_state = market_context if market_context is not None else _market_alignment(fetch_intraday)
-    market_condition = _market_regime_from_state(market_state)
+    market_condition = _daily_market_condition(market_state)
+    log.info(
+        "DAILY MARKET REGIME | condition=%s | state=%s | market_ok=%s",
+        market_condition, market_state, market_ok,
+    )
 
-    chop = _chop_filter(today_5, price, vwap_last)
+    spy_daily_pct = qqq_daily_pct = None
+    if market_condition == "ضعيف":
+        spy_daily_pct, qqq_daily_pct = _daily_market_relative_returns(fetch_intraday)
+    market_avg_pct = ((spy_daily_pct + qqq_daily_pct) / 2.0) if spy_daily_pct is not None and qqq_daily_pct is not None else None
+    relative_strength_pct = (change_pct - market_avg_pct) if market_avg_pct is not None else None
 
-    session_high = float(today_5["High"].max())
+    # Weak market: allow only stocks showing genuine relative strength.
+    relative_strength_ok = bool(
+        market_condition == "ضعيف"
+        and change_pct >= 0.75
+        and relative_strength_pct is not None
+        and relative_strength_pct >= 1.25
+    )
+    chop = _chop_filter(today_d, price, vwap_last)
+
+    session_high = float(today_d["High"].max())
     drop = (session_high - price) / session_high * 100 if session_high else 0
     dump = drop >= 2.5 and change_pct <= -1.2
 
-    h_win = h1.tail(20)
+    h_win = weekly.tail(20)
     level_high = float(h_win["High"].iloc[:-1].max()) if len(h_win) > 3 else session_high
     was_below = float(h_win["Close"].iloc[-3]) < level_high * 0.998 if len(h_win) >= 3 else False
     breakout_now = price >= level_high * 1.001 and was_below
@@ -1949,60 +2055,15 @@ def analyze_intraday(
     near_level = abs(price - level_high) / max(price, 1e-9) * 100 <= 0.7
     ext_tmp = (price - e20) / e20 * 100 if e20 else 0.0
 
-    market_rel_spy = market_rel_qqq = market_rel_avg = 0.0
-    stock_relative_strength = 0.0
-    relative_strength_ok = False
-    if market_condition == "ضعيف":
-        market_rel_spy, market_rel_qqq, market_rel_avg = _market_relative_returns(fetch_intraday)
-        stock_relative_strength = change_pct - market_rel_avg
-        relative_strength_ok = bool(
-            change_pct >= 0.75 and stock_relative_strength >= 1.25
-        )
-
-    # نظام السوق هو الذي يحدد بوابة الدخول: قوي/مختلط/ضعيف.
-    mixed_market_ok = bool(
-        market_condition == "مختلط"
-        and trend_up and live_ok and above_vwap and above_open
-        and m15_state == "داعم" and vol_session_ratio >= 1.0
-        and not dump and not chop and ext_tmp <= 4.0
-    )
-
-    # بوابة اكتشاف الإشارات: تسمح ببناء/تقييم setup في الأنظمة الثلاثة.
-    # لا تعني القبول النهائي؛ السوق المختلط/الضعيف سيُحسم لاحقاً بعد اكتمال
-    # الدرجة وشروط الجودة والاستثناء الخاص بالسهم القوي.
-    setup_market_permission = market_condition in {"قوي", "مختلط", "إيجابي_تحت_VWAP", "ضعيف"}
-
-    # بوابة السوق التمهيدية للـScore: السوق القوي مسموح مباشرة، والمختلط فقط
-    # إذا اجتاز شروطه التمهيدية. السوق الضعيف لا يأخذ مكافأة السوق قبل حسم
-    # استثناء السهم القوي بعد اكتمال الدرجة.
-    positive_below_vwap_ok = bool(
-        market_condition == "إيجابي_تحت_VWAP"
-        and trend_up
-        and live_ok
-        and above_vwap
-        and above_open
-        and m15_state != "معاكس"
-        and vol_session_ratio >= 0.90
-        and not dump
-        and not chop
-        and ext_tmp <= 4.5
-    )
-
-    market_permission = bool(
-        market_condition == "قوي"
-        or mixed_market_ok
-        or positive_below_vwap_ok
-    )
-
     failed = (
-        float(today_5["High"].max()) >= level_high * 1.001
+        float(today_d["High"].max()) >= level_high * 1.001
         and price < level_high * 0.997
         and not above_vwap
     ) or (dump and not above_vwap)
     retest = prior_break and near_level and price >= level_high * 0.997 and above_vwap and not failed
 
     # 1) VWAP Bounce/Reclaim: رجوع منظم إلى VWAP ثم استعادة المستوى.
-    recent4 = today_5.tail(4)
+    recent4 = today_d.tail(4)
     vwap_touch = False
     try:
         vwap_touch = bool((recent4["Low"].astype(float) <= vwap_last * 1.006).any())
@@ -2011,8 +2072,8 @@ def analyze_intraday(
     vwap_bounce = (
         above_vwap and vwap_touch and not failed
         and last_green and (mom > 0.05)
-        and vol_session_ratio >= 1.0
-        and trend_up and m15_state != "معاكس"
+        and vol_ratio >= 1.0
+        and trend_up and h4_state != "معاكس"
     )
 
     # 2) EMA20 Pullback: ترند صاعد + تصحيح صحي إلى EMA20 + استعادة.
@@ -2024,23 +2085,23 @@ def analyze_intraday(
     ema_pullback = (
         trend_up and ema_touch and price >= e5 * 1.001
         and last_green and mom > 0.05
-        and vol_session_ratio >= 1.0
-        and m15_state != "معاكس" and not failed
+        and vol_ratio >= 1.0
+        and h4_state != "معاكس" and not failed
     )
 
     # 3) Liquidity Sweep + Reclaim: كسر قاع قريب ثم استعادة المستوى بسرعة.
     support_level = 0.0
     liquidity_sweep = False
     try:
-        support_window = today_5["Low"].astype(float).iloc[-12:-2]
+        support_window = today_d["Low"].astype(float).iloc[-12:-2]
         if len(support_window) >= 5:
             support_level = float(support_window.min())
-            recent3 = today_5.tail(3)
+            recent3 = today_d.tail(3)
             swept = (recent3["Low"].astype(float) < support_level * 0.998).any()
             reclaimed = price >= support_level * 1.002
             liquidity_sweep = bool(
                 swept and reclaimed and last_green and mom > 0.05
-                and vol_session_ratio >= 1.0 and m15_state != "معاكس"
+                and vol_ratio >= 1.0 and h4_state != "معاكس"
                 and not failed and above_vwap
             )
     except Exception:
@@ -2049,9 +2110,9 @@ def analyze_intraday(
     # 4) Liquidity Sweep + Displacement: سحب سيولة يتبعه اندفاع سعري واضح.
     liquidity_displacement = False
     try:
-        if len(today_5) >= 8 and support_level > 0:
-            cur = today_5.iloc[-1]
-            prev3 = today_5.iloc[-4:-1]
+        if len(today_d) >= 8 and support_level > 0:
+            cur = today_d.iloc[-1]
+            prev3 = today_d.iloc[-4:-1]
             cur_o, cur_c = float(cur["Open"]), float(cur["Close"])
             cur_h, cur_l = float(cur["High"]), float(cur["Low"])
             cur_range = max(cur_h - cur_l, price * 0.0001)
@@ -2059,41 +2120,45 @@ def analyze_intraday(
             close_pos = (cur_c - cur_l) / cur_range
             prior_ranges = (prev3["High"].astype(float) - prev3["Low"].astype(float)).clip(lower=0)
             med_range = float(prior_ranges.median()) if len(prior_ranges) else 0.0
-            swept = bool((today_5["Low"].astype(float).iloc[-5:-1] < support_level * 0.998).any())
+            swept = bool((today_d["Low"].astype(float).iloc[-5:-1] < support_level * 0.998).any())
             reclaimed = price >= support_level * 1.002
             displacement = bool(
                 cur_c > cur_o and cur_body / cur_range >= 0.55 and close_pos >= 0.75
                 and (med_range <= 0 or cur_range >= med_range * 1.35)
-                and vol_session_ratio >= 1.25
+                and vol_ratio >= 1.25
             )
             liquidity_displacement = bool(
                 swept and reclaimed and displacement and trend_up and above_vwap and above_open
-                and m15_state != "معاكس" and setup_market_permission and not failed
-                and mom > 0.08 and ext_tmp <= 3.5
+                and h4_state != "معاكس" and market_ok and not failed
+                and mom > 0.08 and ext_tmp <= 6.0
             )
     except Exception:
         liquidity_displacement = False
 
-    # 5) Opening Range Breakout (ORB): اختراق أعلى أول 15 دقيقة مع متابعة.
-    orb_high = 0.0
+    # Daily equivalent of ORB: first 3 sessions of the current calendar month.
+    # This preserves the tactic (range -> break -> follow-through) without pretending
+    # that a 5-minute opening range exists on a daily chart.
+    month_d = daily[daily.index.to_period("M") == daily.index[-1].to_period("M")] if isinstance(daily.index, pd.DatetimeIndex) else daily.tail(22)
+    opening_range_high = float(month_d["High"].head(3).max()) if len(month_d) >= 3 else 0.0
+    opening_range_low = float(month_d["Low"].head(3).min()) if len(month_d) >= 3 else 0.0
+
+    # 5) Opening Range Breakout (ORB): اختراق نطاق بداية الشهر مع متابعة.
+    orb_high = opening_range_high
     orb_breakout = False
     try:
-        if len(today_5) >= 6:
-            orb = today_5.iloc[:3]
-            orb_high = float(orb["High"].max())
-            prior_orb = float(today_5["Close"].iloc[-2]) < orb_high * 1.001
-            orb_breakout = bool(
-                price >= orb_high * 1.001 and prior_orb and last_green
-                and vol_session_ratio >= 1.0 and above_vwap
-                and m15_state != "معاكس" and not failed
-            )
+        prior_orb = float(daily["Close"].iloc[-2]) < orb_high * 1.001 if orb_high > 0 and len(daily) >= 2 else False
+        orb_breakout = bool(
+            orb_high > 0 and price >= orb_high * 1.001 and prior_orb and last_green
+            and vol_ratio >= 1.0 and above_vwap
+            and h4_state != "معاكس" and not failed
+        )
     except Exception:
         orb_breakout = False
 
     # 5) Momentum Continuation: استمرار دفعة صاعدة بدون مطاردة اختراق ضعيف.
     momentum_continuation = False
     try:
-        tail5 = today_5.tail(4)
+        tail5 = today_d.tail(4)
         closes = tail5["Close"].astype(float)
         opens = tail5["Open"].astype(float)
         highs = tail5["High"].astype(float)
@@ -2107,11 +2172,11 @@ def analyze_intraday(
             prior_move = (closes.iloc[-2] - closes.iloc[-4]) / max(closes.iloc[-4], 1e-9) * 100
             momentum_continuation = bool(
                 trend_up and above_vwap and above_open and not failed and not breakout_now
-                and m15_state != "معاكس" and setup_market_permission
+                and h4_state != "معاكس" and market_ok
                 and rising and green_now and prior_move >= 0.35
-                and mom > 0.08 and vol_session_ratio >= 1.05
+                and mom > 0.08 and vol_ratio >= 1.05
                 and body_now / range_now >= 0.45 and close_pos >= 0.65
-                and ext_tmp <= 3.5
+                and ext_tmp <= 6.0
             )
     except Exception:
         momentum_continuation = False
@@ -2119,9 +2184,9 @@ def analyze_intraday(
     # 6) Compression → Expansion: ضغط سعري ثم توسع مدعوم بالحجم.
     compression_expansion = False
     try:
-        if len(today_5) >= 10:
-            prev = today_5.iloc[-9:-1]
-            cur = today_5.iloc[-1]
+        if len(today_d) >= 10:
+            prev = today_d.iloc[-9:-1]
+            cur = today_d.iloc[-1]
             prev_ranges = (prev["High"].astype(float) - prev["Low"].astype(float)).clip(lower=0)
             cur_range = max(float(cur["High"]) - float(cur["Low"]), price * 0.0001)
             med_range = float(prev_ranges.median()) if len(prev_ranges) else 0.0
@@ -2133,30 +2198,29 @@ def analyze_intraday(
             compression = comp_width_pct <= 2.2 and med_range > 0
             compression_expansion = bool(
                 compression and expansion and float(cur["Close"]) > float(cur["Open"])
-                and cur_pos >= 0.70 and vol_session_ratio >= 1.20
+                and cur_pos >= 0.70 and vol_ratio >= 1.20
                 and above_vwap and above_open and trend_up
-                and m15_state != "معاكس" and setup_market_permission and not failed
-                and cur_body / cur_range >= 0.45 and ext_tmp <= 4.0
+                and h4_state != "معاكس" and market_ok and not failed
+                and cur_body / cur_range >= 0.45 and ext_tmp <= 7.0
             )
     except Exception:
         compression_expansion = False
 
-    # مستويات اليوم السابق/الافتتاح كعامل جودة، وليس كإشارة دخول مستقلة.
+    # مستويات اليوم السابق/الأسبوع السابق/بداية الشهر كعامل جودة.
     prev_day_high = 0.0
     prev_day_low = 0.0
     prev_close_level = 0.0
     try:
-        if len(h1) >= 30:
-            prior = h1.iloc[:-20]
-            if len(prior) >= 5:
-                prev_day_high = float(prior["High"].max())
-                prev_day_low = float(prior["Low"].min())
-                prev_close_level = float(prior["Close"].iloc[-1])
+        if len(daily) >= 2:
+            prev = daily.iloc[:-1].tail(20)
+            prev_day_high = float(prev["High"].max())
+            prev_day_low = float(prev["Low"].min())
+            prev_close_level = float(daily["Close"].iloc[-2])
     except Exception:
         pass
 
     key_level_near = any(
-        lvl > 0 and abs(price - lvl) / max(price, 1e-9) * 100 <= 0.45
+        lvl > 0 and abs(price - lvl) / max(price, 1e-9) * 100 <= 0.60
         for lvl in (prev_day_high, prev_day_low, prev_close_level, orb_high, level_high)
     )
 
@@ -2167,9 +2231,9 @@ def analyze_intraday(
     # the prior leg must already be clearly bullish and the pullback must stay controlled.
     bull_flag = False
     try:
-        if len(today_5) >= 12:
-            impulse = today_5.iloc[-12:-6]
-            flag = today_5.iloc[-6:-1]
+        if len(today_d) >= 12:
+            impulse = today_d.iloc[-12:-6]
+            flag = today_d.iloc[-6:-1]
             impulse_open = float(impulse["Open"].iloc[0])
             impulse_high = float(impulse["High"].max())
             impulse_gain = (impulse_high - impulse_open) / max(impulse_open, 1e-9) * 100
@@ -2182,10 +2246,10 @@ def analyze_intraday(
                 and flag_range <= 2.0
                 and breakout_flag
                 and trend_up and above_vwap and above_open
-                and m15_state != "معاكس" and setup_market_permission and not failed
+                and h4_state != "معاكس" and market_ok and not failed
                 and last_green and mom > 0.05
-                and vol_session_ratio >= 1.05
-                and ext_tmp <= 3.5
+                and vol_ratio >= 1.05
+                and ext_tmp <= 6.0
                 and not orb_breakout
             )
     except Exception:
@@ -2193,14 +2257,14 @@ def analyze_intraday(
 
     # 6) Resistance Reclaim: a previously established resistance is lost,
     # then reclaimed with confirmation. This is different from HOD reclaim:
-    # the level can be an intraday structural resistance, not necessarily today's high.
+    # the level can be an daily structural resistance, not necessarily today's high.
     resistance_reclaim = False
     reclaim_level = 0.0
     try:
-        if len(today_5) >= 10:
-            prior = today_5.iloc[-10:-2]
+        if len(today_d) >= 10:
+            prior = today_d.iloc[-10:-2]
             reclaim_level = float(prior["High"].quantile(0.80))
-            prev_close = float(today_5["Close"].iloc[-2])
+            prev_close = float(today_d["Close"].iloc[-2])
             resistance_was_lost = prev_close < reclaim_level * 0.999
             reclaimed = price >= reclaim_level * 1.001
             touches = int((prior["High"] >= reclaim_level * 0.995).sum())
@@ -2208,68 +2272,62 @@ def analyze_intraday(
                 touches >= 2
                 and resistance_was_lost and reclaimed
                 and trend_up and above_vwap and above_open
-                and m15_state != "معاكس" and setup_market_permission and not failed
+                and h4_state != "معاكس" and market_ok and not failed
                 and last_green and mom > 0.05
-                and vol_session_ratio >= 1.05
-                and ext_tmp <= 3.5
+                and vol_ratio >= 1.05
+                and ext_tmp <= 6.0
             )
     except Exception:
         resistance_reclaim = False
 
-    # 7) Opening Drive → Pullback:
-    # لا يدخل على أول اختراق (حتى لا يتداخل مع ORB/اختراق مؤكد).
-    # نبحث عن دفعة قوية مبكرة، ثم تراجع منظم، ثم استعادة منطقة الدفعة.
+    # 7) Opening Drive → Pullback: دفعة قوية في بداية الشهر ثم تصحيح منظم واستعادة.
     opening_drive_pullback = False
     drive_level = 0.0
     try:
-        if len(today_5) >= 8:
-            first6 = today_5.iloc[:6]  # أول 30 دقيقة على شموع 5د
-            later = today_5.iloc[6:]
+        first6 = month_d.head(6)
+        later = month_d.iloc[6:]
+        if len(first6) >= 3:
             drive_open = float(first6["Open"].iloc[0])
             drive_high = float(first6["High"].max())
             drive_return = (drive_high - drive_open) / max(drive_open, 1e-9) * 100
             drive_level = drive_high
-            if not later.empty and drive_return >= 1.0:
-                recent = today_5.tail(3)
+            if not later.empty and drive_return >= 2.0:
+                recent = today_d.tail(3)
                 recent_low = float(recent["Low"].min())
                 pullback_from_high = (drive_high - recent_low) / max(drive_high, 1e-9) * 100
                 reclaim_drive = price >= drive_high * 0.999
-                controlled_pullback = 0.25 <= pullback_from_high <= 2.5
-                not_chasing = ext_tmp <= 3.5
+                controlled_pullback = 0.50 <= pullback_from_high <= 8.0
+                not_chasing = ext_tmp <= 6.0
                 opening_drive_pullback = bool(
                     trend_up and above_vwap and above_open
-                    and m15_state != "معاكس" and setup_market_permission and not failed
-                    and drive_return >= 1.0
-                    and controlled_pullback and reclaim_drive
-                    and last_green and mom > 0.05
-                    and vol_session_ratio >= 1.05
-                    and not breakout_now
-                    and not orb_breakout
-                    and not_chasing
+                    and h4_state != "معاكس" and market_ok and not failed
+                    and drive_return >= 2.0 and controlled_pullback and reclaim_drive
+                    and last_green and mom > 0.20 and vol_ratio >= 1.05
+                    and not breakout_now and not orb_breakout and not_chasing
                 )
     except Exception:
         opening_drive_pullback = False
 
-    # 8) High-of-Day Reclaim:
+    # 8) Period-High Reclaim: استعادة قمة الفترة (20 يومًا).
     # بعد تسجيل قمة يومية، يحصل تراجع تحت القمة ثم استعادة فعلية لها.
     # هذا ليس ORB: المستوى هنا هو HOD المتكوّن خلال الجلسة، وليس أول 15 دقيقة.
     hod_reclaim = False
     hod_level = 0.0
     try:
-        if len(today_5) >= 8:
-            prior = today_5.iloc[:-2]
+        if len(today_d) >= 8:
+            prior = today_d.iloc[:-2]
             hod_level = float(prior["High"].max())
             if hod_level > 0:
-                pullback_below_hod = float(today_5["Close"].iloc[-2]) < hod_level * 0.999
+                pullback_below_hod = float(today_d["Close"].iloc[-2]) < hod_level * 0.999
                 reclaimed_hod = price >= hod_level * 1.001
                 had_hod = float(prior["High"].max()) >= hod_level * 0.999
                 hod_reclaim = bool(
                     had_hod and pullback_below_hod and reclaimed_hod
                     and above_vwap and above_open and trend_up
-                    and m15_state != "معاكس" and setup_market_permission and not failed
+                    and h4_state != "معاكس" and market_ok and not failed
                     and last_green and mom > 0.05
-                    and vol_session_ratio >= 1.05
-                    and ext_tmp <= 3.5
+                    and vol_ratio >= 1.05
+                    and ext_tmp <= 6.0
                 )
     except Exception:
         hod_reclaim = False
@@ -2278,18 +2336,18 @@ def analyze_intraday(
     # مختلف عن سحب السيولة: المستوى هنا ORB High فقط، مع شرط اختراق سابق ثم فشل ثم reclaim.
     orb_failed_reclaim = False
     try:
-        if len(today_5) >= 8 and orb_high > 0:
-            post_orb = today_5.iloc[3:-1]
+        if len(today_d) >= 8 and orb_high > 0:
+            post_orb = today_d.iloc[3:-1]
             broke = bool((post_orb["High"].astype(float) >= orb_high * 1.002).any())
             failure = bool((post_orb["Close"].astype(float) <= orb_high * 0.998).any())
             reclaim = price >= orb_high * 1.001
             orb_failed_reclaim = bool(
                 broke and failure and reclaim
                 and trend_up and above_vwap and above_open
-                and m15_state != "معاكس" and setup_market_permission and not failed
+                and h4_state != "معاكس" and market_ok and not failed
                 and last_green and mom > 0.05
-                and vol_session_ratio >= 1.05
-                and ext_tmp <= 3.5
+                and vol_ratio >= 1.05
+                and ext_tmp <= 6.0
                 and not orb_breakout
             )
     except Exception:
@@ -2299,10 +2357,10 @@ def analyze_intraday(
     # لا يكفي لمس EMA20؛ يجب أن تكون بنية A/B/C واضحة.
     abc_continuation = False
     try:
-        if len(today_5) >= 12:
-            a = today_5.iloc[-12:-8]
-            b = today_5.iloc[-8:-4]
-            c = today_5.iloc[-4:]
+        if len(today_d) >= 12:
+            a = today_d.iloc[-12:-8]
+            b = today_d.iloc[-8:-4]
+            c = today_d.iloc[-4:]
             a_open = float(a["Open"].iloc[0])
             a_high = float(a["High"].max())
             a_gain = (a_high - a_open) / max(a_open, 1e-9) * 100
@@ -2317,9 +2375,9 @@ def analyze_intraday(
                 and 20.0 <= b_retrace <= 65.0
                 and c_break and price >= a_high * 0.999
                 and c_last_green and trend_up and above_vwap and above_open
-                and m15_state != "معاكس" and setup_market_permission and not failed
-                and mom > 0.05 and vol_session_ratio >= 1.05
-                and ext_tmp <= 3.5
+                and h4_state != "معاكس" and market_ok and not failed
+                and mom > 0.05 and vol_ratio >= 1.05
+                and ext_tmp <= 6.0
             )
     except Exception:
         abc_continuation = False
@@ -2334,9 +2392,9 @@ def analyze_intraday(
         except Exception:
             pass
     multi_level_confluence = len(set(confluence_levels)) >= 3
-    vwap_h1_confluence = bool(
+    vwap_weekly_confluence = bool(
         trend_up and above_vwap and e20 > e50
-        and m15_state == "داعم" and not failed
+        and h4_state == "داعم" and not failed
     )
 
     # Early Entry is itself a structural setup, not a score fallback:
@@ -2344,15 +2402,15 @@ def analyze_intraday(
     # improving price action and no already-confirmed strategy trigger.
     early = False
     try:
-        recent3 = today_5.tail(3)
+        recent3 = today_d.tail(3)
         early_range = (float(recent3["High"].max()) - float(recent3["Low"].min())) / max(price, 1e-9) * 100
         early_near_resistance = level_high > 0 and abs(price - level_high) / max(price, 1e-9) * 100 <= 1.5
         early_holding = float(recent3["Close"].iloc[-1]) >= float(recent3["Close"].iloc[0])
         early = bool(
             trend_up and above_vwap and above_open and not breakout_now and not failed
-            and early_near_resistance and early_range <= 1.5 and early_holding
-            and last_green and mom > 0.03 and vol_session_ratio >= 0.95 and ext_tmp <= 2.2
-            and m15_state != "معاكس" and setup_market_permission
+            and early_near_resistance and early_range <= 3.0 and early_holding
+            and last_green and mom > 0.03 and vol_ratio >= 0.95 and ext_tmp <= 2.2
+            and h4_state != "معاكس" and market_ok
             and not (retest or orb_breakout or breakout_now or liquidity_displacement
                      or liquidity_sweep or compression_expansion or momentum_continuation
                      or bull_flag or resistance_reclaim or orb_failed_reclaim
@@ -2362,16 +2420,22 @@ def analyze_intraday(
     except Exception:
         early = False
 
-    breakout_ok, breakout_quality = _breakout_quality(today_5, level_high, price)
-    orb_breakout_ok, orb_quality = _breakout_quality(today_5, orb_high, price) if orb_high > 0 else (False, 0.0)
-    # كل استراتيجية لها بوابة مستقلة. لا نستخدم "دخول مبكر" كـ fallback.
-    matched_entry_types: list[str] = []
+    breakout_ok, breakout_quality = _breakout_quality(today_d, level_high, price)
+    orb_breakout_ok, orb_quality = _breakout_quality(today_d, orb_high, price) if orb_high > 0 else (False, 0.0)
+    # Failed breakout is a rejection/filter condition, not an entry strategy.
+    # If there is no separate recovery setup below, the candidate is discarded.
+    if failed and not (retest or liquidity_displacement or liquidity_sweep or orb_failed_reclaim or abc_continuation or opening_drive_pullback or hod_reclaim or vwap_bounce or ema_pullback or orb_breakout or breakout_now or compression_expansion or momentum_continuation or bull_flag or resistance_reclaim):
+        return None
+
+    # Multi-label strategy detection: every strategy that genuinely matches is
+    # recorded. One primary strategy is still selected for the alert/exit rules,
+    # using the existing precedence so overlapping setups remain deterministic.
+    matched_entry_types = []
     if retest:
         matched_entry_types.append("إعادة اختبار")
     if orb_breakout and orb_breakout_ok:
         matched_entry_types.append("اختراق نطاق الافتتاح")
-        breakout_quality = max(breakout_quality, orb_quality)
-    if breakout_now and breakout_ok and vol_session_ratio >= 1.0:
+    if breakout_now and breakout_ok and vol_ratio >= 1.0:
         matched_entry_types.append("اختراق مؤكد")
     if liquidity_displacement:
         matched_entry_types.append("سحب سيولة مع Displacement")
@@ -2392,7 +2456,7 @@ def analyze_intraday(
     if opening_drive_pullback:
         matched_entry_types.append("دخول بعد Opening Drive")
     if hod_reclaim:
-        matched_entry_types.append("استعادة قمة اليوم")
+        matched_entry_types.append("استعادة قمة الفترة")
     if vwap_bounce:
         matched_entry_types.append("ارتداد VWAP")
     if ema_pullback:
@@ -2400,85 +2464,53 @@ def analyze_intraday(
     if early:
         matched_entry_types.append("دخول مبكر")
 
-    # Failed breakout is a rejection/filter condition, not an entry strategy.
-    # إذا لم تطابق أي استراتيجية حقيقية، لا نخترع اسمًا؛ المرشح يُرفض.
-    if failed and not matched_entry_types:
-        return None
     if not matched_entry_types:
+        # Do not mislabel an unclassified setup as "دخول مبكر". It has no valid
+        # entry strategy under the canonical 16-strategy model.
         return None
 
-    # قوة الاستراتيجية: كل تطابق يحصل على تقييم مستقل من جودة setup الحالية.
-    # هذا التقييم لا يستبدل Score النهائي؛ وظيفته اختيار أقوى استراتيجية
-    # عندما تتطابق عدة استراتيجيات على السهم نفسه.
+    # Score each matched strategy independently, like the intraday engine.
     strategy_scores: dict[str, float] = {}
-    policy_for_strategy = _load_adaptive_policy()
-    strategy_stats = policy_for_strategy.get("strategy_stats", {})
+    try:
+        policy_for_strategy = _load_adaptive_policy()
+        strategy_stats = policy_for_strategy.get("strategy_stats", {})
+    except Exception:
+        strategy_stats = {}
 
     def _strategy_strength(name: str) -> float:
         q = 70.0
         if name == "اختراق مؤكد":
-            q += min(18.0, float(breakout_quality) * 0.18)
-            q += 5.0 if vol_session_ratio >= 1.5 else 2.0
+            q += min(18.0, float(breakout_quality) * 0.18) + (5.0 if vol_ratio >= 1.5 else 2.0)
         elif name == "اختراق نطاق الافتتاح":
-            q += min(18.0, float(orb_quality) * 0.18)
-            q += 4.0 if above_vwap else 0.0
+            q += min(18.0, float(orb_quality) * 0.18) + (4.0 if above_vwap else 0.0)
         elif name == "إعادة اختبار":
-            q += 8.0 if prior_break else 0.0
-            q += 7.0 if near_level else 0.0
-            q += 5.0 if above_vwap else 0.0
+            q += (8.0 if prior_break else 0.0) + (7.0 if near_level else 0.0) + (5.0 if above_vwap else 0.0)
         elif name == "ارتداد VWAP":
-            q += 10.0 if vwap_touch else 0.0
-            q += 7.0 if trend_up else 0.0
-            q += min(6.0, max(0.0, float(vol_session_ratio) - 1.0) * 6.0)
+            q += (10.0 if vwap_touch else 0.0) + (7.0 if trend_up else 0.0) + min(6.0, max(0.0, vol_ratio-1.0)*6.0)
         elif name == "ارتداد EMA20":
-            q += 10.0 if ema_touch else 0.0
-            q += 7.0 if trend_up else 0.0
-            q += 5.0 if m15_state == "داعم" else 0.0
+            q += (10.0 if ema_touch else 0.0) + (7.0 if trend_up else 0.0) + (5.0 if above_vwap else 0.0)
         elif name == "سحب سيولة مع Displacement":
-            q += 12.0 if trend_up else 0.0
-            q += 8.0 if vol_session_ratio >= 1.25 else 0.0
-            q += 5.0 if above_vwap else 0.0
+            q += (12.0 if trend_up else 0.0) + (8.0 if vol_ratio >= 1.25 else 0.0) + (5.0 if above_vwap else 0.0)
         elif name == "سحب سيولة":
-            q += 10.0 if above_vwap else 0.0
-            q += 8.0 if vol_session_ratio >= 1.25 else 0.0
+            q += (10.0 if above_vwap else 0.0) + (8.0 if vol_ratio >= 1.25 else 0.0)
         elif name == "ضغط ثم انفجار":
-            q += 10.0 if vol_session_ratio >= 1.2 else 0.0
-            q += 8.0 if trend_up else 0.0
-            q += 5.0 if above_vwap else 0.0
+            q += (10.0 if vol_ratio >= 1.2 else 0.0) + (8.0 if trend_up else 0.0) + (5.0 if above_vwap else 0.0)
         elif name == "استمرار الزخم":
-            q += 10.0 if trend_up else 0.0
-            q += 8.0 if vol_session_ratio >= 1.2 else 0.0
-            q += 6.0 if mom > 0.10 else 0.0
+            q += (10.0 if trend_up else 0.0) + (8.0 if vol_ratio >= 1.2 else 0.0) + (6.0 if mom > 0.10 else 0.0)
         elif name == "علم صاعد":
-            q += 10.0 if trend_up else 0.0
-            q += 8.0 if vol_session_ratio >= 1.2 else 0.0
-            q += 5.0 if above_vwap else 0.0
+            q += (10.0 if trend_up else 0.0) + (8.0 if vol_ratio >= 1.2 else 0.0) + (5.0 if above_vwap else 0.0)
         elif name == "استعادة مستوى":
-            q += 8.0 if key_level_near else 0.0
-            q += 8.0 if above_vwap else 0.0
-            q += 5.0 if trend_up else 0.0
+            q += (8.0 if key_level_near else 0.0) + (8.0 if above_vwap else 0.0) + (5.0 if trend_up else 0.0)
         elif name == "استعادة بعد فشل ORB":
-            q += 10.0 if orb_high > 0 else 0.0
-            q += 8.0 if above_vwap else 0.0
-            q += 5.0 if trend_up else 0.0
+            q += (10.0 if orb_high > 0 else 0.0) + (8.0 if above_vwap else 0.0) + (5.0 if trend_up else 0.0)
         elif name == "استمرار ABC":
-            q += 10.0 if trend_up else 0.0
-            q += 8.0 if above_vwap else 0.0
-            q += 5.0 if vol_session_ratio >= 1.2 else 0.0
+            q += (10.0 if trend_up else 0.0) + (8.0 if above_vwap else 0.0) + (5.0 if vol_ratio >= 1.2 else 0.0)
         elif name == "دخول بعد Opening Drive":
-            q += 10.0 if trend_up else 0.0
-            q += 8.0 if above_vwap else 0.0
-            q += 5.0 if vol_session_ratio >= 1.2 else 0.0
-        elif name == "استعادة قمة اليوم":
-            q += 10.0 if trend_up else 0.0
-            q += 8.0 if above_vwap else 0.0
-            q += 5.0 if vol_session_ratio >= 1.2 else 0.0
+            q += (10.0 if trend_up else 0.0) + (8.0 if above_vwap else 0.0) + (5.0 if vol_ratio >= 1.2 else 0.0)
+        elif name == "استعادة قمة الفترة":
+            q += (10.0 if trend_up else 0.0) + (8.0 if above_vwap else 0.0) + (5.0 if vol_ratio >= 1.2 else 0.0)
         elif name == "دخول مبكر":
-            q += 8.0 if trend_up else 0.0
-            q += 7.0 if above_vwap else 0.0
-            q += 5.0 if ext_tmp <= 1.5 else 0.0
-
-        # تعلم تاريخي صغير كمكافأة كسر التعادل، وليس كبديل عن شروط الاستراتيجية.
+            q += (8.0 if trend_up else 0.0) + (7.0 if above_vwap else 0.0) + (5.0 if ext_tmp <= 1.5 else 0.0)
         stat = strategy_stats.get(name, {}) if isinstance(strategy_stats, dict) else {}
         samples = int(stat.get("samples", 0) or 0)
         win_rate = float(stat.get("win_rate", 0.0) or 0.0)
@@ -2490,8 +2522,9 @@ def analyze_intraday(
         """Structural identity score, separate from generic market quality.
 
         Common filters (trend/VWAP/open/volume/momentum/extension) are deliberately
-        not counted here. This score measures only the defining setup structure and
-        is used as a deterministic tie-break for overlapping matches.
+        not counted here. This score answers only: "how clearly does the setup
+        exhibit the defining structure of this strategy?" It is used as a
+        deterministic tie-break for overlapping matches, not as extra trade score.
         """
         identity = {
             "اختراق مؤكد": (100.0 if breakout_ok else 0.0) + min(20.0, float(breakout_quality) * 0.20),
@@ -2508,7 +2541,7 @@ def analyze_intraday(
             "استعادة بعد فشل ORB": 100.0 if orb_failed_reclaim else 0.0,
             "استمرار ABC": 100.0 if abc_continuation else 0.0,
             "دخول بعد Opening Drive": 100.0 if opening_drive_pullback else 0.0,
-            "استعادة قمة اليوم": 100.0 if hod_reclaim else 0.0,
+            "استعادة قمة الفترة": 100.0 if hod_reclaim else 0.0,
             "دخول مبكر": 45.0,
         }
         return round(max(0.0, min(120.0, identity.get(name, 0.0))), 2)
@@ -2516,9 +2549,10 @@ def analyze_intraday(
     strategy_identity_scores = {et: _strategy_identity(et) for et in matched_entry_types}
     strategy_scores = {et: _strategy_strength(et) for et in matched_entry_types}
     entry_order = {et: i for i, et in enumerate(ENTRY_TYPES)}
-    # عند تداخل الاستراتيجيات، لا نحذف أي match. إذا تعادلت القوة، نفضّل
-    # الاستراتيجية ذات الهوية البنيوية الأوضح بدل أن يحسم ترتيب ENTRY_TYPES
-    # الاختيار بشكل اعتباطي. هذا لا يغيّر التعلم أو عدد matches.
+    # When strategies overlap, prefer the more structurally specific setup only
+    # when their strength scores are effectively tied. This does not remove
+    # matched strategies or affect per-strategy learning; it only prevents a
+    # broad setup from winning a near-tie over a setup with a clearer identity.
     strategy_specificity = {
         "سحب سيولة مع Displacement": 16,
         "استعادة بعد فشل ORB": 15,
@@ -2548,6 +2582,8 @@ def analyze_intraday(
         ),
     )
     entry_emoji = "🟡" if entry_type == "إعادة اختبار" else "🟢"
+    if entry_type == "اختراق نطاق الافتتاح":
+        breakout_quality = max(breakout_quality, orb_quality)
 
     reasons: list[str] = []
     warnings: list[str] = []
@@ -2556,10 +2592,10 @@ def analyze_intraday(
 
     if trend_up:
         score += 18
-        reasons.append("اتجاه الساعة صاعد")
-        factors.append("h1_trend")
+        reasons.append("اتجاه الأسبوعي صاعد")
+        factors.append("weekly_trend")
     else:
-        warnings.append("اتجاه الساعة غير مؤكد")
+        warnings.append("اتجاه الأسبوعي غير مؤكد")
         score -= 8
 
     if above_vwap:
@@ -2580,36 +2616,31 @@ def analyze_intraday(
 
     if live_ok:
         score += 12
-        reasons.append("تأكيد 5 دقائق")
-        factors.append("m5")
+        reasons.append("تأكيد يومي")
+        factors.append("daily")
     else:
-        warnings.append("لا تأكيد 5د كافٍ")
+        warnings.append("لا تأكيد يومي كافٍ")
         score -= 10
 
-    if vol_session_ok:
+    if vol_ok:
         score += 6
-        reasons.append(f"حجم جلسة {vol_session_ratio:.2f}x")
+        reasons.append(f"حجم جلسة {vol_ratio:.2f}x")
         factors.append("vol_session")
     else:
         warnings.append("حجم الجلسة ضعيف نسبياً")
         score -= 6
 
-    if market_permission:
-        if market_ok:
-            score += 3
-            factors.append("market")
-            reasons.append(market_state)
-        else:
-            # لا نعطي مكافأة سوق داعم للاستثناء؛ فقط نمنع انهيار الدرجة بسبب السوق.
-            factors.append("market_override")
-            reasons.append("السهم أقوى من السوق رغم ضعف/اختلاط SPY+QQQ")
+    if market_ok:
+        score += 3
+        factors.append("market")
+        reasons.append(market_state)
     else:
         score -= 7
         warnings.append(market_state)
 
     if chop:
         score -= 12
-        warnings.append("السوق متذبذب (Chop)")
+        warnings.append("السوق اليومي متذبذب (Chop)")
         factors.append("chop")
 
     if breakout_now:
@@ -2638,23 +2669,23 @@ def analyze_intraday(
         score += 1
         factors.append("news_positive")
 
-    if m15_state == "داعم":
-        score += m15_points
-        reasons.append("15 دقيقة داعمة")
-        factors.append("m15")
-    elif m15_state == "معاكس":
-        score += m15_points
-        warnings.append("15 دقيقة معاكسة")
+    if h4_state == "داعم":
+        score += h4_points
+        reasons.append("4 ساعات داعمة")
+        factors.append("h4")
+    elif h4_state == "معاكس":
+        score += h4_points
+        warnings.append("4 ساعات معاكسة")
     else:
-        reasons.append("15 دقيقة محايدة")
-        factors.append("m15_neutral")
+        reasons.append("4 ساعات محايدة")
+        factors.append("h4_neutral")
 
     if 48 <= h_rsi <= 68:
         score += 5
-        factors.append("rsi_h1")
+        factors.append("rsi_weekly")
 
     if dump:
-        warnings.append("سقوط من قمة الجلسة")
+        warnings.append("سقوط من قمة الفترة")
         score -= 20
 
     if entry_type == "اختراق مؤكد":
@@ -2716,9 +2747,9 @@ def analyze_intraday(
         score += 9
         reasons.append("دفعة افتتاحية قوية ثم تراجع منظم واستعادة")
         factors.append("opening_drive_pullback")
-    elif entry_type == "استعادة قمة اليوم":
+    elif entry_type == "استعادة قمة الفترة":
         score += 9
-        reasons.append("استعادة قمة اليوم بعد تراجع تحتها")
+        reasons.append("استعادة قمة الفترة بعد تراجع تحتها")
         factors.append("hod_reclaim")
     else:
         reasons.append("دخول مبكر فوق VWAP")
@@ -2728,10 +2759,10 @@ def analyze_intraday(
         factors.append("key_level")
         reasons.append("قرب مستوى سعري مهم")
 
-    if vwap_h1_confluence:
+    if vwap_weekly_confluence:
         score += 3
-        factors.append("vwap_h1_confluence")
-        reasons.append("Confluence: VWAP + اتجاه الساعة + 15د")
+        factors.append("vwap_weekly_confluence")
+        reasons.append("Confluence: VWAP + اتجاه الأسبوعي + 4س")
     if multi_level_confluence:
         score += 2.0
         factors.append("multi_level_confluence")
@@ -2739,19 +2770,19 @@ def analyze_intraday(
 
     ext = (price - e20) / e20 * 100 if e20 else 0
     if ext > 4.0:
-        warnings.append("امتداد عن متوسط الساعة")
+        warnings.append("امتداد عن متوسط الأسبوعي")
         score -= 8
         factors.append("extended")
 
-    atr = float(_atr(h1, 14).iloc[-1] or price * 0.01)
+    atr = float(_atr(weekly, 14).iloc[-1] or price * 0.01)
     atr_pct = atr / price * 100
     market_regime = _classify_regime(
-        trend_up, m15_state, chop, market_ok, atr_pct, news_state, market_condition
+        trend_up, h4_state, chop, market_ok, atr_pct, news_state
     )
     interaction_keys = _interaction_keys(
-        entry_type, market_regime, m15_state, vol_session_ratio, 0.0
+        entry_type, market_regime, h4_state, vol_ratio, 0.0
     )
-    if atr_pct > 6.0:
+    if atr_pct > 8.0:
         warnings.append("تذبذب عالي")
         score -= 5
 
@@ -2768,17 +2799,54 @@ def analyze_intraday(
         trend_up
         and live_ok
         and above_vwap
-        and m15_state != "معاكس"
-        and vol_session_ratio >= 1.0
+        and h4_state != "معاكس"
+        and vol_ratio >= 1.0
         and not dump
-        and ext <= 4.0
+        and ext <= 7.0
     )
 
+    # Market-aware daily execution policy. The market regime is detected first,
+    # then the stock must satisfy the rules for that regime before it can be
+    # emitted. This prevents mixed/weak markets from using the normal strong-
+    # market gate just because market_ok happened to be True.
+    strong_market_ok = bool(
+        market_condition == "قوي"
+        and market_ok
+    )
+
+    positive_market_ok = bool(
+        market_condition == "إيجابي_تحت_VWAP"
+        and market_ok
+        and trend_up
+        and live_ok
+        and above_vwap
+        and above_open
+        and h4_state != "معاكس"
+        and vol_ratio >= 0.95
+        and not dump
+        and not chop
+        and ext <= 5.5
+    )
+
+    mixed_market_ok = bool(
+        market_condition == "مختلط"
+        and market_ok
+        and trend_up
+        and live_ok
+        and above_vwap
+        and above_open
+        and h4_state != "معاكس"
+        and vol_ratio >= 1.0
+        and not dump
+        and not chop
+        and ext <= 6.0
+    )
+
+    # Daily strong-stock override: weak market can be bypassed only when the
+    # stock itself is exceptionally aligned and materially outperforms SPY/QQQ.
+    # Missing/unknown market data can never trigger this override.
     policy = _load_adaptive_policy()
     limits = policy.get("entry_limits", {})
-    # نحفظ الدرجة قبل سقف نوع الاستراتيجية لاستخدامها في استثناء السوق.
-    # سقف الاستراتيجية يبقى كما هو للـScore المعروض والترتيب.
-    override_score = float(score)
     if entry_type == "دخول مبكر":
         score = min(score, float(limits.get("دخول مبكر", 94)))
     elif entry_type == "إعادة اختبار":
@@ -2805,8 +2873,8 @@ def analyze_intraday(
         score = min(score, float(limits.get("استمرار ABC", 98.0)))
     elif entry_type == "دخول بعد Opening Drive":
         score = min(score, float(limits.get("دخول بعد Opening Drive", 98.0)))
-    elif entry_type == "استعادة قمة اليوم":
-        score = min(score, float(limits.get("استعادة قمة اليوم", 98.0)))
+    elif entry_type == "استعادة قمة الفترة":
+        score = min(score, float(limits.get("استعادة قمة الفترة", 98.0)))
     elif entry_type == "اختراق نطاق الافتتاح":
         score = min(score, float(limits.get("اختراق نطاق الافتتاح", 99.0)))
     elif entry_type == "اختراق مؤكد":
@@ -2816,52 +2884,41 @@ def analyze_intraday(
 
     score_i = int(max(0, min(100, round(score))))
 
-    # بعد اكتمال الدرجة نطبق شروط نظام السوق الفعلي.
-    if market_condition == "ضعيف":
-        strong_stock_market_override = bool(
-            relative_strength_ok
-            and strong_alignment
-            and vol_session_ratio >= 1.25
-            and not chop
-            and ext_tmp <= 3.5
-            and override_score >= 92.0
-            and entry_type != "دخول مبكر"
-        )
-    else:
-        strong_stock_market_override = False
-
-    if market_condition == "مختلط":
-        mixed_market_ok = bool(
-            score_i >= 85
-            and trend_up and live_ok and above_vwap and above_open
-            and m15_state == "داعم" and vol_session_ratio >= 1.0
-            and not dump and not chop and ext_tmp <= 4.0
-        )
-    else:
-        mixed_market_ok = False
-
-    if market_condition == "إيجابي_تحت_VWAP":
-        positive_below_vwap_ok = bool(
-            score_i >= POSITIVE_BELOW_VWAP_MIN_SCORE
-            and trend_up and live_ok and above_vwap and above_open
-            and m15_state != "معاكس"
-            and vol_session_ratio >= 0.90
-            and not dump and not chop and ext_tmp <= 4.5
-        )
-    else:
-        positive_below_vwap_ok = False
+    # Weak-market exception candidate. It is deliberately narrow: actual
+    # relative strength + strong alignment + high score. Final approval is
+    # still recomputed after TP/stop checks below, so market_block is allowed
+    # only when it is the sole remaining quality problem.
+    strong_stock_market_candidate = bool(
+        market_condition == "ضعيف"
+        and not market_ok
+        and score_i >= 92
+        and strong_alignment
+        and relative_strength_ok
+        and vol_ratio >= 1.25
+        and ext <= 5.0
+        and not chop
+    )
+    strong_stock_market_override = strong_stock_market_candidate
 
     market_permission = bool(
-        market_condition == "قوي"
+        strong_market_ok
+        or positive_market_ok
         or mixed_market_ok
-        or positive_below_vwap_ok
         or strong_stock_market_override
     )
+
+    log.info(
+        "DAILY MARKET GATE | %s | condition=%s | permission=%s | score=%d | RS=%s | market_avg=%s",
+        symbol, market_condition, market_permission, score_i,
+        f"{relative_strength_pct:.2f}%" if relative_strength_pct is not None else "n/a",
+        f"{market_avg_pct:.2f}%" if market_avg_pct is not None else "n/a",
+    )
+
     strong_for_grade = (
         score_i >= 95
         and strong_alignment
-        and entry_type in {"اختراق مؤكد", "اختراق نطاق الافتتاح", "إعادة اختبار", "ارتداد VWAP", "ارتداد EMA20", "سحب سيولة", "ضغط ثم انفجار", "استمرار الزخم", "علم صاعد", "استعادة مستوى", "دخول بعد Opening Drive", "استعادة قمة اليوم", "استعادة بعد فشل ORB", "استمرار ABC", "سحب سيولة مع Displacement"}
-        and m15_state != "معاكس"
+        and entry_type in {"اختراق مؤكد", "اختراق نطاق الافتتاح", "إعادة اختبار", "ارتداد VWAP", "ارتداد EMA20", "سحب سيولة", "ضغط ثم انفجار", "استمرار الزخم", "علم صاعد", "استعادة مستوى", "دخول بعد Opening Drive", "استعادة قمة الفترة", "استعادة بعد فشل ORB", "استمرار ABC", "سحب سيولة مع Displacement"}
+        and h4_state != "معاكس"
     )
 
     news_momentum_ok = True
@@ -2870,31 +2927,31 @@ def analyze_intraday(
     if news_state == "positive_strong":
         news_momentum_ok = (
             change_pct >= float(policy.get("min_news_change_pct", NEWS_MOMENTUM_MIN_CHANGE))
-            and vol_session_ratio >= float(policy.get("min_news_volume_ratio", NEWS_MOMENTUM_MIN_VOLUME))
+            and vol_ratio >= float(policy.get("min_news_volume_ratio", NEWS_MOMENTUM_MIN_VOLUME))
             and above_vwap
             and (breakout_ok or entry_type != "دخول مبكر")
             and (breakout_quality >= 60 or entry_type != "دخول مبكر")
-            and m15_state != "معاكس"
-            and market_permission
+            and h4_state != "معاكس"
+            and (market_ok or strong_stock_market_override)
         )
 
     quality_ok = (
         (not dump)
         and (not failed)
-        and ext <= 4.5
-        and atr_pct <= 6.5
-        and vol_session_ratio >= float(policy.get("min_volume_ratio", 0.85))
+        and ext <= 8.0
+        and atr_pct <= 8.0
+        and vol_ratio >= float(policy.get("min_volume_ratio", 0.85))
         and not chop
         and news_momentum_ok
-        and not (m15_state == "معاكس" and score_i < 92)
+        and not (h4_state == "معاكس" and score_i < 92)
         and market_permission
     )
 
-    recent_low = float(today_5["Low"].tail(12).min())
+    recent_low = float(today_d["Low"].tail(12).min())
 
-    # Structure-aware intraday stop. The stop is placed behind the structure
+    # Structure-aware daily stop. The stop is placed behind the structure
     # that actually justifies the entry, then constrained to a practical
-    # intraday risk band of 0.60%–4.50%.
+    # daily risk band of 0.60%–4.50%.
     stop_candidates = []
     if entry_type == "ارتداد VWAP":
         stop_candidates.append(vwap_last * 0.997)
@@ -2911,19 +2968,19 @@ def analyze_intraday(
         if level and level > 0:
             stop_candidates.append(level * 0.997)
     elif entry_type == "علم صاعد":
-        stop_candidates.append(float(today_5["Low"].tail(5).min()) * 0.997)
+        stop_candidates.append(float(today_d["Low"].tail(5).min()) * 0.997)
     elif entry_type == "استعادة مستوى":
         stop_candidates.append(reclaim_level * 0.997 if reclaim_level > 0 else recent_low * 0.997)
     elif entry_type == "استعادة بعد فشل ORB":
         stop_candidates.append(orb_high * 0.997 if orb_high > 0 else recent_low * 0.997)
     elif entry_type == "استمرار ABC":
-        stop_candidates.append(float(today_5["Low"].tail(4).min()) * 0.997)
+        stop_candidates.append(float(today_d["Low"].tail(4).min()) * 0.997)
     elif entry_type == "دخول بعد Opening Drive":
         stop_candidates.append(drive_level * 0.997 if drive_level > 0 else recent_low * 0.997)
-    elif entry_type == "استعادة قمة اليوم":
+    elif entry_type == "استعادة قمة الفترة":
         stop_candidates.append(hod_level * 0.997 if hod_level > 0 else recent_low * 0.997)
     elif entry_type in {"ضغط ثم انفجار", "استمرار الزخم"}:
-        stop_candidates.append(float(today_5["Low"].tail(5).min()) * 0.997)
+        stop_candidates.append(float(today_d["Low"].tail(5).min()) * 0.997)
 
     # ATR remains the fallback/secondary safety reference.
     stop_candidates.append(price - 1.5 * atr)
@@ -2934,8 +2991,8 @@ def analyze_intraday(
     stop = max(valid_stops) if valid_stops else price * 0.985
 
     risk = price - stop
-    min_risk = price * 0.006
-    max_risk = price * 0.045
+    min_risk = price * 0.015
+    max_risk = price * 0.10
     if risk < min_risk:
         stop = price - min_risk
         risk = min_risk
@@ -2944,7 +3001,7 @@ def analyze_intraday(
         quality_ok = False
         warnings.append("وقف هيكلي واسع جدًا")
 
-    resistance_tp1, resistance_source = _find_prior_resistance(today_5, h1, price)
+    resistance_tp1, resistance_source = _find_prior_resistance(today_d, weekly, price)
 
     # TP1 must be at least 1.20R. Prefer real resistance only when it clears
     # that threshold; otherwise use a risk-multiple fallback.
@@ -2969,11 +3026,11 @@ def analyze_intraday(
         tp1 = adaptive_tp1
         risk = price - stop
         risk_pct_check = risk / price * 100 if price else 0.0
-        if 0.60 <= risk_pct_check <= 4.50:
+        if 1.50 <= risk_pct_check <= 10.00:
             warnings.append(f"Adaptive Exit: TP1={adaptive_tp1_r:.2f}R")
         else:
             # Safety: revert to the original structural stop if adaptive scaling
-            # somehow leaves the allowed intraday risk band.
+            # somehow leaves the allowed daily risk band.
             stop = max(stop_candidates)
             risk = price - stop
             tp1 = price + risk * 1.20
@@ -2994,65 +3051,86 @@ def analyze_intraday(
     buy_low = max(stop * 1.01, min(price * 0.995, e5))
     buy_high = price * 1.004
 
-    # فحص Spread/السيولة يُجرى في scan_intraday للمرشحين فقط، حتى لا يبطئ تحليل كل الأسهم.
+    # فحص Spread/السيولة يُجرى في scan_daily للمرشحين فقط، حتى لا يبطئ تحليل كل الأسهم.
     liquidity = {"ok": True, "spread_pct": 0.0, "slippage_pct": 0.0, "dollar_volume": 0.0}
     liquidity_ok = True
 
     interaction_keys = _interaction_keys(
-        entry_type, market_regime, m15_state, vol_session_ratio, breakout_quality
+        entry_type, market_regime, h4_state, vol_ratio, breakout_quality
     )
+
+    # Recompute the exception after all quality/TP/stop checks. This enforces
+    # the policy: in a weak market, only a genuinely strong stock whose sole
+    # blocker is market_block may pass.
+    strong_stock_market_override = bool(
+        strong_stock_market_candidate
+        and not dump
+        and not failed
+        and ext <= 5.0
+        and atr_pct <= 8.0
+        and vol_ratio >= max(1.25, float(policy.get("min_volume_ratio", 0.85)))
+        and not chop
+        and news_momentum_ok
+        and not (h4_state == "معاكس" and score_i < 92)
+        and risk <= price * 0.10
+        and tp1 > price
+        and tp1_distance_pct >= 0.8
+        and reward_r >= float(policy.get("min_tp1_r", 1.2))
+    )
+    market_permission = bool(
+        strong_market_ok
+        or positive_market_ok
+        or mixed_market_ok
+        or strong_stock_market_override
+    )
+    if strong_stock_market_override:
+        quality_ok = True
 
     if resistance_source != "هدف مخاطر 1.20R":
         reasons.append(f"TP1 مقاومة: {tp1:.2f}")
     else:
         warnings.append("لم توجد مقاومة قريبة مناسبة؛ TP1 احتياطي")
 
-    # تشخيص فقط — لا يغيّر أي شرط تداول. يوضح بالضبط لماذا لم يتجاوز
-    # المرشح Stage 2، مع فصل أسباب الجودة/السوق/الدرجة/التأكيد.
-    diagnostic_reasons: list[str] = []
-    if score_i < INTRADAY_MIN_SCORE:
-        diagnostic_reasons.append(f"score<{INTRADAY_MIN_SCORE}")
-    if not live_ok:
-        diagnostic_reasons.append("live_ok=False")
-    if not market_permission:
-        diagnostic_reasons.append("market_block")
-    if market_condition == "مختلط" and not mixed_market_ok:
-        diagnostic_reasons.append("mixed_conditions")
-    if market_condition == "إيجابي_تحت_VWAP" and not positive_below_vwap_ok:
-        diagnostic_reasons.append("positive_below_vwap_conditions")
-    if market_condition == "ضعيف":
-        if not relative_strength_ok:
-            diagnostic_reasons.append("weak_relative_strength")
-        if override_score < 92.0:
-            diagnostic_reasons.append("weak_score<92")
-        if entry_type == "دخول مبكر":
-            diagnostic_reasons.append("weak_early_entry")
-    if "تحت" in vwap_note:
-        diagnostic_reasons.append("below_vwap")
-    if m15_state == "معاكس" and score_i < 92:
-        diagnostic_reasons.append("m15_contrary")
-    if news_state == "negative":
-        diagnostic_reasons.append("negative_news")
+    # Diagnostics only: explain exactly why a signal failed the final quality gate.
+    # This list is observational and does not change quality_ok or any selection rule.
+    quality_reasons = []
     if dump:
-        diagnostic_reasons.append("dump")
+        quality_reasons.append("dump")
     if failed:
-        diagnostic_reasons.append("failed_breakout")
-    if ext > 4.5:
-        diagnostic_reasons.append("extension>4.5%")
-    if atr_pct > 6.5:
-        diagnostic_reasons.append("atr>6.5%")
-    if vol_session_ratio < float(policy.get("min_volume_ratio", 0.85)):
-        diagnostic_reasons.append("volume<policy")
+        quality_reasons.append("failed_breakout")
+    if ext > 8.0:
+        quality_reasons.append(f"extension>{8.0:.0f}%")
+    if atr_pct > 8.0:
+        quality_reasons.append(f"atr>{8.0:.0f}%")
+    if vol_ratio < float(policy.get("min_volume_ratio", 0.85)):
+        quality_reasons.append("volume")
     if chop:
-        diagnostic_reasons.append("chop")
+        quality_reasons.append("chop")
+    if not news_momentum_ok:
+        quality_reasons.append("news_momentum")
+    if h4_state == "معاكس" and score_i < 92:
+        quality_reasons.append("h4_contrary")
+    if not market_permission:
+        quality_reasons.append("market_block")
+        if market_condition == "مختلط":
+            quality_reasons.append("mixed_conditions")
+        elif market_condition == "ضعيف":
+            if not relative_strength_ok:
+                quality_reasons.append("weak_relative_strength")
+            if score_i < 92:
+                quality_reasons.append("weak_score<92")
+        elif market_condition == "غير مؤكد":
+            quality_reasons.append("market_unknown")
+    if "وقف هيكلي واسع جدًا" in warnings:
+        quality_reasons.append("wide_stop")
+    if tp1 <= price:
+        quality_reasons.append("invalid_tp1")
     if tp1_distance_pct < 0.8:
-        diagnostic_reasons.append("tp1_distance<0.8%")
+        quality_reasons.append("tp1_too_close")
     if reward_r < float(policy.get("min_tp1_r", 1.2)):
-        diagnostic_reasons.append("tp1_r<1.20")
-    if risk > price * 0.045:
-        diagnostic_reasons.append("wide_stop>4.5%")
+        quality_reasons.append("weak_tp1_r")
 
-    return IntradaySignal(
+    return DailySignal(
         symbol=symbol,
         name=name or symbol,
         price=round(price, 4),
@@ -3068,21 +3146,23 @@ def analyze_intraday(
         risk_pct=round(risk_pct, 2),
         reward_r=round(reward_r, 2),
         sl_method="وقف هيكلي حسب نوع الدخول",
-        vwap_day_note=vwap_note,
+        vwap_note=vwap_note,
         above_open=above_open,
-        vol_session_ok=vol_session_ok,
+        vol_ok=vol_ok,
         reasons=reasons[:5],
         warnings=warnings[:4],
         quality_ok=quality_ok,
         live_ok=live_ok,
-        volume_ratio=round(vol_session_ratio, 2),
+        volume_ratio=round(vol_ratio, 2),
         factor_keys=factors,
         sma20=round(e20, 4),
         atr_pct=round(atr_pct, 2),
         ext_sma20=round(ext, 2),
         entry_type=entry_type,
         entry_emoji=entry_emoji,
-        m15_state=m15_state,
+        matched_entry_types=matched_entry_types,
+        strategy_scores=strategy_scores,
+        h4_state=h4_state,
         learning_adjustment=round(total_learning_adj, 2),
         resistance_tp1=round(tp1, 4),
         news_state=news_state,
@@ -3091,8 +3171,8 @@ def analyze_intraday(
         breakout_quality=round(breakout_quality, 1),
         market_state=market_state,
         market_condition=market_condition,
-        market_relative_strength=round(stock_relative_strength, 2),
-        market_avg_change=round(market_rel_avg, 2),
+        market_relative_strength=round(relative_strength_pct or 0.0, 2),
+        market_avg_change=round(market_avg_pct or 0.0, 2),
         chop=chop,
         market_regime=market_regime,
         interaction_keys=interaction_keys,
@@ -3100,41 +3180,11 @@ def analyze_intraday(
         expected_slippage_pct=round(float(liquidity.get("slippage_pct", 0) or 0), 3),
         dollar_volume_3m=round(float(liquidity.get("dollar_volume", 0) or 0), 0),
         liquidity_ok=liquidity_ok,
-        diagnostic_reasons=diagnostic_reasons,
-        matched_entry_types=matched_entry_types,
-        strategy_scores=strategy_scores,
+        quality_reasons=quality_reasons,
     )
 
 
-
-def _intraday_diagnostic_metrics(sig: IntradaySignal, min_score: int = INTRADAY_MIN_SCORE) -> str:
-    """Numeric diagnostic only; never changes trading decisions."""
-    try:
-        policy = _load_adaptive_policy()
-    except Exception:
-        policy = {}
-    min_vol = float(policy.get("min_volume_ratio", 0.85) or 0.85)
-    min_r = float(policy.get("min_tp1_r", 1.20) or 1.20)
-    price = float(getattr(sig, "price", 0.0) or 0.0)
-    tp1 = float(getattr(sig, "tp1", 0.0) or 0.0)
-    stop = float(getattr(sig, "stop_loss", 0.0) or 0.0)
-    tp1_dist = ((tp1 - price) / price * 100.0) if price > 0 else 0.0
-    stop_risk = ((price - stop) / price * 100.0) if price > 0 and stop > 0 else 0.0
-    return (
-        f"regime={getattr(sig, 'market_condition', 'غير مؤكد')} "
-        f"| RS={float(getattr(sig, 'market_relative_strength', 0.0) or 0.0):+.2f}% "
-        f"| MKT={float(getattr(sig, 'market_avg_change', 0.0) or 0.0):+.2f}% "
-        f"| score={float(sig.score):.0f}/{min_score} "
-        f"| vol={float(getattr(sig, 'volume_ratio', 0.0) or 0.0):.2f}x/{min_vol:.2f}x "
-        f"| ext={float(getattr(sig, 'ext_sma20', 0.0) or 0.0):.2f}%/4.50% "
-        f"| ATR={float(getattr(sig, 'atr_pct', 0.0) or 0.0):.2f}%/6.50% "
-        f"| TP1dist={tp1_dist:.2f}%/0.80% "
-        f"| TP1R={float(getattr(sig, 'reward_r', 0.0) or 0.0):.2f}R/{min_r:.2f}R "
-        f"| risk={stop_risk:.2f}%/4.50%"
-    )
-
-
-def format_intraday_ar(sig: IntradaySignal, min_score: int = INTRADAY_MIN_SCORE) -> str:
+def format_daily_ar(sig: DailySignal, min_score: int = DAILY_MIN_SCORE) -> str:
     arrow = "▲" if sig.change_pct >= 0 else "▼"
     market_map = {
         "قوي": "🟢 قوي",
@@ -3159,12 +3209,12 @@ def format_intraday_ar(sig: IntradaySignal, min_score: int = INTRADAY_MIN_SCORE)
             market_label = "⚪️ غير مؤكد"
 
     lines = [
-        f"⚡ لحظي | {sig.symbol} | {sig.score}/100 | {sig.grade} | ساعة+15د+5د",
+        f"⚡ يومي | {sig.symbol} | {sig.score}/100 | {sig.grade} | ساعة+4س+يومي",
         f"{market_label} | نظام السوق",
         f"{sig.entry_emoji} الدخول: {sig.entry_type}",
         f"{sig.name}",
         "—————————————",
-        f"السعر: {(getattr(sig, 'alert_entry_price', 0.0) or sig.price):.2f} $  ({arrow} {sig.change_pct:+.2f}%)",
+        f"السعر: {sig.price:.2f} $  ({arrow} {sig.change_pct:+.2f}%)",
         f"شراء: {sig.buy_low:.2f} — {sig.buy_high:.2f}",
         f"وقف: {sig.stop_loss:.2f} | مخاطرة: {sig.risk_pct:.2f}%",
         f"TP1: {sig.tp1:.2f} | {sig.reward_r:.2f}R",
@@ -3186,363 +3236,311 @@ def get_learning_alert() -> dict | None:
 
 
 
-def _prefilter_intraday(
-    symbol: str,
-    preloaded: tuple[pd.DataFrame, pd.DataFrame] | None = None,
-) -> tuple[float, dict[str, float], pd.DataFrame, pd.DataFrame] | None:
-    """Stage 1: cheap H1+5m routing with a lane for each of the 16 strategies.
+def _daily_strategy_route_scores(*, price: float, trend: bool, above_vwap: bool, above_open: bool, vol_ratio: float, mom: float, wrsi: float, we20: float, we50: float, daily: pd.DataFrame, weekly: pd.DataFrame) -> dict[str, float]:
+    """Cheap Stage-1 routing proxies for all 16 daily strategies. Exact gates remain in analyze_daily."""
+    dc=daily["Close"].astype(float); op=daily["Open"].astype(float); hi=daily["High"].astype(float); lo=daily["Low"].astype(float)
+    prev_close=float(dc.iloc[-2]) if len(dc)>=2 else float(op.iloc[-1]); last_high=float(hi.iloc[-1]); last_low=float(lo.iloc[-1])
+    vw_s=_vwap(daily.tail(60)); vw=float(vw_s.iloc[-1]) if pd.notna(vw_s.iloc[-1]) else price
+    e20=float(_ema(dc,20).iloc[-1]); recent_high=float(hi.tail(20).max()); recent_low=float(lo.tail(20).min())
+    near_high=abs(price-recent_high)/max(price,1e-9)*100<=1.0; near_vwap=abs(price-vw)/max(price,1e-9)*100<=1.0; near_ema=abs(price-e20)/max(price,1e-9)*100<=1.0
+    breakout=price>=max(float(hi.iloc[-2]) if len(hi)>=2 else recent_high,recent_high*0.995); reclaim=price>=recent_high*0.998 and prev_close<recent_high*0.998
+    pullback=trend and price>=e20*0.995 and price<=e20*1.015; drive=trend and mom>1.0 and pullback
+    sweep=last_low <= recent_low*1.002 and price>float(op.iloc[-1]); compression=((float(hi.tail(5).max())-float(lo.tail(5).min()))/max(price,1e-9)*100<=3.0 and mom>0)
+    abc=trend and mom>0.5 and pullback; flag=trend and compression and breakout; orb=breakout and above_open; failed_orb=prev_close<recent_high and reclaim
+    scores={et:0.0 for et in ENTRY_TYPES}
+    scores["اختراق مؤكد"]=(35 if breakout else 0)+20*(1 if above_vwap else 0)+min(20,max(0,mom)*4)+min(15,max(0,vol_ratio-1)*10)
+    scores["إعادة اختبار"]=(35 if pullback else 0)+(20 if near_high else 0)+(15 if above_vwap else 0)+(10 if trend else 0)
+    scores["دخول مبكر"]=(30 if above_vwap and above_open else 0)+(20 if trend else 0)+min(20,max(0,2.5-mom)*8)
+    scores["ارتداد VWAP"]=(40 if near_vwap else 0)+(20 if above_vwap else 0)+(15 if trend else 0)
+    scores["ارتداد EMA20"]=(40 if near_ema else 0)+(20 if trend else 0)+(10 if above_vwap else 0)
+    scores["سحب سيولة"]=(45 if sweep else 0)+(15 if above_vwap else 0)+min(20,max(0,vol_ratio-1)*10)
+    scores["اختراق نطاق الافتتاح"]=(45 if orb else 0)+(15 if above_vwap else 0)+min(20,max(0,mom)*4)
+    scores["استمرار الزخم"]=(30 if trend else 0)+min(35,max(0,mom)*7)+min(20,max(0,vol_ratio-1)*10)
+    scores["ضغط ثم انفجار"]=(45 if compression else 0)+(20 if breakout else 0)+min(15,max(0,mom)*3)
+    scores["علم صاعد"]=(40 if flag else 0)+(15 if trend else 0)+(15 if above_vwap else 0)
+    scores["استعادة مستوى"]=(40 if reclaim or near_high else 0)+(20 if above_vwap else 0)+(15 if trend else 0)
+    scores["دخول بعد Opening Drive"]=(45 if drive else 0)+(20 if above_vwap else 0)+min(15,max(0,mom)*3)
+    scores["استعادة قمة الفترة"]=(45 if near_high and price>=last_high*0.995 else 0)+(20 if above_vwap else 0)+(10 if trend else 0)
+    scores["استعادة بعد فشل ORB"]=(45 if failed_orb else 0)+(20 if above_vwap else 0)+(10 if trend else 0)
+    scores["استمرار ABC"]=(40 if abc else 0)+(20 if trend else 0)+min(15,max(0,mom)*3)
+    scores["سحب سيولة مع Displacement"]=(45 if sweep and mom>0.5 else 0)+(20 if vol_ratio>=1.2 else 0)+(10 if trend else 0)
+    return {k:round(float(v),2) for k,v in scores.items()}
 
-    Stage 1 never declares a trade strategy. It only estimates which strategies
-    deserve Stage-2 inspection using data already available here. The exact
-    strategy gates remain in analyze_intraday(), where 15m/full setup data exists.
-    """
+
+def _prefilter_daily(symbol: str) -> tuple[float, dict[str, float], pd.DataFrame, pd.DataFrame] | None:
+    """Stage 1: weekly + daily routing for the full universe."""
     try:
         from market_data import fetch_intraday, intraday_data_fresh
-        if preloaded is not None:
-            h1, m5 = preloaded
-        else:
-            h1 = fetch_intraday(symbol, interval="60m", period="10d")
-            m5 = fetch_intraday(symbol, interval="5m", period="5d")
-        ok_h1, _ = intraday_data_fresh(h1, "60m", 90)
-        ok_m5, _ = intraday_data_fresh(m5, "5m", 12)
-        if h1 is None or m5 is None or len(h1) < 40 or len(m5) < 30 or not ok_h1 or not ok_m5:
+        weekly = fetch_intraday(symbol, interval="1wk", period="5y")
+        daily = fetch_intraday(symbol, interval="1d", period="2y")
+        if weekly is None or daily is None or len(weekly) < 60 or len(daily) < 80:
             return None
-
-        last_day = m5.index[-1].date()
-        today = m5[m5.index.date == last_day]
-        if len(today) < 6:
-            return None
-        price = float(today["Close"].iloc[-1])
+        price = float(daily["Close"].iloc[-1])
         if price <= 0 or price > float(MAX_AUTO_PRICE):
             return None
-
-        hc = h1["Close"]
-        e20 = float(_ema(hc, 20).iloc[-1])
-        e50 = float(_ema(hc, 50).iloc[-1])
-        h_rsi = float(_rsi(hc, 14).iloc[-1])
-        trend = price > e20 > e50 * 0.998 and h_rsi >= 45
-
-        vwap_s = _vwap(today)
-        vwap = float(vwap_s.iloc[-1]) if pd.notna(vwap_s.iloc[-1]) else price
-        vwap_dist = (price - vwap) / max(vwap, 1e-9) * 100
-        above_vwap = price >= vwap * 0.996
-        above_open = price >= float(today["Open"].iloc[0]) * 0.997
-        last_green = float(today["Close"].iloc[-1]) >= float(today["Open"].iloc[-1])
-        c5 = today["Close"]
-        mom = (price - float(c5.iloc[-6])) / max(float(c5.iloc[-6]), 1e-9) * 100
-        r5 = float(_rsi(c5, 14).iloc[-1])
-
-        hist = m5[m5.index.date < last_day].tail(120)
-        avg_today = float(today["Volume"].mean())
-        avg_hist = float(hist["Volume"].mean()) if not hist.empty else float(m5["Volume"].tail(60).mean() or 1)
-        vol_ratio = avg_today / avg_hist if avg_hist else 1.0
-
-        # Cheap structural proxies. These are ROUTING signals only; Stage 2 is authoritative.
-        prev_high = float(hist["High"].max()) if not hist.empty else price
-        prev_low = float(hist["Low"].min()) if not hist.empty else price
-        day_high = float(today["High"].max())
-        day_low = float(today["Low"].min())
-        recent = today.tail(min(12, len(today)))
-        recent_high = float(recent["High"].max())
-        recent_low = float(recent["Low"].min())
-        recent_range_pct = (recent_high - recent_low) / max(price, 1e-9) * 100
-        prior_range = today.iloc[:-6] if len(today) > 12 else today.iloc[:-3]
-        prior_high = float(prior_range["High"].max()) if not prior_range.empty else day_high
-        prior_low = float(prior_range["Low"].min()) if not prior_range.empty else day_low
-        first_or = today.head(min(6, len(today)))
-        orb_high = float(first_or["High"].max()) if not first_or.empty else price
-        orb_low = float(first_or["Low"].min()) if not first_or.empty else price
-        last_low = float(today["Low"].iloc[-1])
-        last_high = float(today["High"].iloc[-1])
-        last_open = float(today["Open"].iloc[-1])
-        last_close = float(today["Close"].iloc[-1])
-        last_range_pct = abs(last_high - last_low) / max(last_close, 1e-9) * 100
-        near_vwap = abs(price - vwap) / max(vwap, 1e-9) * 100 <= 0.8
-        near_ema20 = abs(price - e20) / max(e20, 1e-9) * 100 <= 1.0
-        near_prev_high = abs(price - prev_high) / max(price, 1e-9) * 100 <= 1.2
-        near_orb = abs(price - orb_high) / max(price, 1e-9) * 100 <= 1.2
-        strong_volume = vol_ratio >= 1.15
-        strong_momentum = mom >= 0.35
-        pullback = last_close >= last_open and (last_low <= price * 0.997 or near_vwap or near_ema20)
-        displacement = strong_volume and last_range_pct >= 0.8 and last_close > last_open
-        sweep_low = last_low < min(prior_low, orb_low) * 1.001 and last_close > last_open
-        compression = recent_range_pct <= 2.5 and (strong_momentum or strong_volume)
-        prior_push = (price - float(today["Close"].iloc[max(0, len(today)-18)])) / max(price, 1e-9) * 100 if len(today) >= 6 else 0.0
-        bull_flag_proxy = prior_push >= 1.0 and recent_range_pct <= 2.5 and above_vwap
-        opening_drive = len(today) >= 8 and float(first_or["Close"].iloc[-1]) > float(first_or["Open"].iloc[0]) and pullback
-        hod_reclaim = price >= recent_high * 0.998 and strong_volume
-        resistance_reclaim = price >= prev_high * 0.998 or near_prev_high
-        abc_proxy = trend and above_vwap and pullback and strong_momentum
-
-        # Every strategy gets a routing score. No score here can create a signal.
-        route_by_strategy = {
-            "اختراق مؤكد": (8 if price >= prev_high * 0.998 else 0) + (3 if strong_volume else 0) + (2 if last_green else 0),
-            "إعادة اختبار": (5 if near_prev_high else 0) + (3 if pullback else 0) + (2 if above_vwap else 0),
-            "دخول مبكر": (4 if above_vwap else 0) + (3 if above_open else 0) + (2 if trend else 0) + (1 if not strong_momentum else 0),
-            "ارتداد VWAP": (6 if near_vwap else 0) + (3 if last_green else 0) + (2 if trend else 0),
-            "ارتداد EMA20": (6 if near_ema20 else 0) + (3 if trend else 0) + (2 if last_green else 0),
-            "سحب سيولة": (7 if sweep_low else 0) + (3 if above_vwap else 0) + (2 if strong_volume else 0),
-            "اختراق نطاق الافتتاح": (7 if price >= orb_high * 0.998 else 0) + (3 if strong_volume else 0) + (2 if above_vwap else 0),
-            "استمرار الزخم": (5 if strong_momentum else 0) + (3 if trend else 0) + (2 if strong_volume else 0),
-            "ضغط ثم انفجار": (6 if compression else 0) + (3 if strong_volume else 0) + (2 if last_green else 0),
-            "علم صاعد": (6 if bull_flag_proxy else 0) + (3 if trend else 0) + (2 if above_vwap else 0),
-            "استعادة مستوى": (6 if resistance_reclaim else 0) + (3 if above_vwap else 0) + (2 if last_green else 0),
-            "دخول بعد Opening Drive": (6 if opening_drive else 0) + (3 if trend else 0) + (2 if pullback else 0),
-            "استعادة قمة اليوم": (6 if hod_reclaim else 0) + (3 if strong_volume else 0) + (2 if trend else 0),
-            "استعادة بعد فشل ORB": (6 if near_orb else 0) + (3 if pullback else 0) + (2 if above_vwap else 0),
-            "استمرار ABC": (6 if abc_proxy else 0) + (3 if trend else 0) + (2 if strong_volume else 0),
-            "سحب سيولة مع Displacement": (7 if sweep_low and displacement else 0) + (3 if trend else 0) + (2 if above_vwap else 0),
-        }
-
-        # General route score remains useful for overall ranking.
-        route_score = max(route_by_strategy.values()) + (2.0 if trend else 0.0)
-        route_score += 1.5 if above_vwap else 0.0
-        route_score += 1.0 if above_open else 0.0
-        route_score += min(2.0, max(0.0, mom))
-        route_score += min(2.0, max(0.0, vol_ratio - 0.75) * 2.0)
-        route_score -= max(0.0, vwap_dist - 3.0) * 0.5
-        route_score -= 1.0 if r5 >= 82 else 0.0
-
-        # Only hard-fail unusable data/liquidity. Do NOT discard a valid setup
-        # merely because it is not a generic trend/VWAP/momentum candidate.
-        if vol_ratio < 0.65:
+        wc = weekly["Close"].astype(float)
+        dc = daily["Close"].astype(float)
+        we20 = float(_ema(wc,20).iloc[-1]); we50 = float(_ema(wc,50).iloc[-1])
+        de20 = float(_ema(dc,20).iloc[-1]); de50 = float(_ema(dc,50).iloc[-1])
+        wrsi = float(_rsi(wc,14).iloc[-1]); drsi = float(_rsi(dc,14).iloc[-1])
+        trend = price >= we20 * 0.99 and we20 >= we50 * 0.995 and drsi >= 42
+        v = _vwap(daily.tail(60)); vw = float(v.iloc[-1]) if pd.notna(v.iloc[-1]) else price
+        above_vwap = price >= vw * 0.995
+        above_open = price >= float(daily["Open"].iloc[-1]) * 0.995
+        hist = daily.iloc[:-1].tail(120)
+        avg_cur = float(daily["Volume"].tail(5).mean())
+        avg_hist = float(hist["Volume"].mean()) if not hist.empty else 1.0
+        vol_ratio = avg_cur / avg_hist if avg_hist else 1.0
+        mom = (price - float(dc.iloc[-6])) / max(float(dc.iloc[-6]),1e-9) * 100 if len(dc)>=6 else 0.0
+        route = 0.0
+        route += 3.0 if trend else 0.0
+        route += 2.0 if above_vwap else 0.0
+        route += 1.5 if above_open else 0.0
+        route += min(2.5,max(0.0,mom))
+        route += min(2.0,max(0.0,vol_ratio-0.75)*2.0)
+        route += 1.0 if we20 > we50 else 0.0
+        route -= 1.0 if wrsi >= 80 else 0.0
+        if vol_ratio < 0.55:
             return None
-        return route_score, route_by_strategy, h1, m5
+        routes=_daily_strategy_route_scores(price=price, trend=trend, above_vwap=above_vwap, above_open=above_open, vol_ratio=vol_ratio, mom=mom, wrsi=wrsi, we20=we20, we50=we50, daily=daily, weekly=weekly)
+        return route, routes, weekly, daily
     except Exception:
         return None
 
 
-def scan_intraday(
+
+def _prefilter_daily_from_frames(symbol: str, weekly: pd.DataFrame, daily: pd.DataFrame) -> tuple[float, dict[str, float], pd.DataFrame, pd.DataFrame] | None:
+    try:
+        if weekly is None or daily is None or len(weekly) < 60 or len(daily) < 80:
+            return None
+        price = float(daily["Close"].iloc[-1])
+        if price <= 0 or price > float(MAX_AUTO_PRICE):
+            return None
+        wc = weekly["Close"].astype(float); dc = daily["Close"].astype(float)
+        we20 = float(_ema(wc,20).iloc[-1]); we50 = float(_ema(wc,50).iloc[-1])
+        wrsi = float(_rsi(wc,14).iloc[-1]); drsi = float(_rsi(dc,14).iloc[-1])
+        trend = price >= we20 * 0.99 and we20 >= we50 * 0.995 and drsi >= 42
+        v = _vwap(daily.tail(60)); vw = float(v.iloc[-1]) if pd.notna(v.iloc[-1]) else price
+        above_vwap = price >= vw * 0.995
+        above_open = price >= float(daily["Open"].iloc[-1]) * 0.995
+        hist = daily.iloc[:-1].tail(120)
+        avg_cur = float(daily["Volume"].tail(5).mean()); avg_hist = float(hist["Volume"].mean()) if not hist.empty else 1.0
+        vol_ratio = avg_cur / avg_hist if avg_hist else 1.0
+        mom = (price - float(dc.iloc[-6])) / max(float(dc.iloc[-6]),1e-9) * 100 if len(dc)>=6 else 0.0
+        route = (3.0 if trend else 0.0) + (2.0 if above_vwap else 0.0) + (1.5 if above_open else 0.0)
+        route += min(2.5,max(0.0,mom)) + min(2.0,max(0.0,vol_ratio-0.75)*2.0) + (1.0 if we20 > we50 else 0.0)
+        route -= 1.0 if wrsi >= 80 else 0.0
+        if vol_ratio < 0.55:
+            return None
+        routes=_daily_strategy_route_scores(price=price, trend=trend, above_vwap=above_vwap, above_open=above_open, vol_ratio=vol_ratio, mom=mom, wrsi=wrsi, we20=we20, we50=we50, daily=daily, weekly=weekly)
+        return route, routes, weekly, daily
+    except Exception:
+        return None
+
+def scan_daily(
     symbols: list[str],
     names: dict,
-    min_score: int = INTRADAY_MIN_SCORE,
+    min_score: int = DAILY_MIN_SCORE,
     limit: int = 8,
-) -> list[IntradaySignal]:
-    ok, _ = session_window_ok()
+) -> list[DailySignal]:
+    ok, reason = session_window_ok()
     if not ok:
-        scan_intraday.last_window = _
+        scan_daily.last_window = reason
         return []
-    scan_intraday.last_window = "ok"
-
+    scan_daily.last_window = "ok"
     try:
-        # IMPORTANT: scan_intraday has its own scope; fetch_intraday must be
-        # imported here before calling _market_alignment. Without this import
-        # the old code raised NameError, silently fell back to "السوق غير مؤكد",
-        # and every Stage-2 signal failed market_permission.
         from market_data import fetch_intraday
         market_context = _market_alignment(fetch_intraday)
-        market_regime = _market_regime_from_state(market_context[1])
-        if market_regime == "ضعيف":
-            scan_intraday.last_window = "SPY+QQQ لحظيًا ضعيفان"
-            min_score = max(min_score, 88)
-        elif market_regime == "إيجابي_تحت_VWAP":
-            scan_intraday.last_window = "SPY+QQQ إيجابيان تحت VWAP"
-            min_score = max(min_score, POSITIVE_BELOW_VWAP_MIN_SCORE)
-        elif market_regime == "مختلط":
+        market_condition = _daily_market_condition(market_context[1])
+        if market_condition == "قوي":
+            min_score = max(min_score, 82)
+        elif market_condition == "إيجابي_تحت_VWAP":
             min_score = max(min_score, 85)
+        elif market_condition == "مختلط":
+            min_score = max(min_score, 86)
+        elif market_condition == "ضعيف":
+            min_score = max(min_score, 92)
+        else:
+            # Unknown/incomplete benchmark data must not be treated as a
+            # supportive market. The per-symbol gate will reject it as well.
+            min_score = max(min_score, 92)
         log.info(
-            "INTRADAY MARKET REGIME | regime=%s | state=%s | min_score=%d",
-            market_regime, market_context[1], min_score,
+            "DAILY MARKET REGIME POLICY | condition=%s | state=%s | min_score=%d",
+            market_condition, market_context[1], min_score,
         )
     except Exception as exc:
-        log.warning("INTRADAY MARKET CONTEXT FAILED | %s", str(exc))
-        market_context = (False, "السوق غير مؤكد")
+        log.warning("Daily market context unavailable after retries: %s", exc)
+        market_context = (False, "بيانات SPY/QQQ غير متاحة")
 
     workers = min(8, max(2, len(symbols)))
-    stage1: list[tuple[float, dict[str, float], str, pd.DataFrame, pd.DataFrame]] = []
-
-    log.info("INTRADAY SCAN: %d symbols loaded", len(symbols))
-
-    # Stage 1 bulk load: two multi-symbol requests (H1 + 5m) instead of
-    # hundreds of per-symbol requests. If bulk loading fails, fall back to
-    # the existing per-symbol path, which is protected by market_data rate limiting.
-    bulk_h1: dict[str, pd.DataFrame] = {}
-    bulk_m5: dict[str, pd.DataFrame] = {}
+    stage1=[]
+    log.info("DAILY V2 SCAN: %d symbols loaded", len(symbols))
     try:
         from market_data import fetch_alpaca_bars_multi, alpaca_configured
-        from datetime import datetime, timedelta, timezone
         if alpaca_configured():
-            end = datetime.now(timezone.utc)
-            bulk_h1 = fetch_alpaca_bars_multi(
-                symbols, "1Hour", end - timedelta(days=13), end=end, chunk_size=50
-            )
-            bulk_m5 = fetch_alpaca_bars_multi(
-                symbols, "5Min", end - timedelta(days=8), end=end, chunk_size=50
-            )
-            log.info(
-                "STAGE 1 BULK: H1=%d symbols, 5m=%d symbols",
-                len(bulk_h1), len(bulk_m5),
-            )
+            days_w = _period_days("5y", 365)
+            days_d = _period_days("2y", 365)
+            now_utc = datetime.now(timezone.utc)
+            weekly_map = fetch_alpaca_bars_multi(symbols, "1Week", now_utc - timedelta(days=days_w + 5), now_utc)
+            daily_map = fetch_alpaca_bars_multi(symbols, "1Day", now_utc - timedelta(days=days_d + 5), now_utc)
+            def _route_from_frames(sym):
+                weekly = weekly_map.get(sym.upper()); daily = daily_map.get(sym.upper())
+                if weekly is None or daily is None or len(weekly) < 60 or len(daily) < 80:
+                    return None
+                return _prefilter_daily_from_frames(sym, weekly, daily)
+            for sym in symbols:
+                item = _route_from_frames(sym)
+                if item:
+                    route, routes, weekly, daily = item; stage1.append((route, routes, sym, weekly, daily))
+        else:
+            raise RuntimeError("Alpaca not configured")
     except Exception as exc:
-        log.warning("STAGE 1 bulk load failed; fallback to per-symbol: %s", exc)
-        bulk_h1, bulk_m5 = {}, {}
-
-    # Stage 1 — H1 + 5m only for the full universe.
-    with ThreadPoolExecutor(max_workers=workers) as pool:
-        futures = {
-            pool.submit(
-                _prefilter_intraday,
-                sym,
-                (bulk_h1.get(sym), bulk_m5.get(sym))
-                if sym in bulk_h1 and sym in bulk_m5 else None,
-            ): sym
-            for sym in symbols
-        }
-        for fut in as_completed(futures):
-            sym = futures[fut]
-            try:
-                item = fut.result()
-            except Exception:
-                item = None
-            if item:
-                route_score, route_by_strategy, h1, m5 = item
-                stage1.append((route_score, route_by_strategy, sym, h1, m5))
-
-    stage1.sort(key=lambda x: x[0], reverse=True)
-    log.info(
-        "STAGE 1: %d/%d completed; %d candidates passed prefilter",
-        len(stage1), len(symbols), len(stage1),
-    )
-    # Strategy-aware routing: keep the strongest overall names AND reserve a
-    # small candidate lane for every strategy. This prevents a generic Stage-1
-    # score from starving a valid setup type before analyze_intraday() sees it.
-    base_n = max(PREFILTER_MAX_CANDIDATES, limit * 5)
-    selected: dict[str, tuple] = {sym: item for item in stage1[:base_n] for sym in [item[2]]}
+        log.warning("Daily batch scan unavailable; using per-symbol fallback: %s", exc)
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            futures={pool.submit(_prefilter_daily,sym):sym for sym in symbols}
+            for fut in as_completed(futures):
+                sym=futures[fut]
+                try: item=fut.result()
+                except Exception: item=None
+                if item:
+                    route,routes,weekly,daily=item; stage1.append((route,routes,sym,weekly,daily))
+    stage1.sort(key=lambda x:(x[0], max(x[1].values()) if x[1] else 0.0), reverse=True)
+    log.info("STAGE 1 DAILY: %d/%d passed", len(stage1), len(symbols))
+    base_n=max(PREFILTER_MAX_CANDIDATES, limit*5)
+    selected={item[2]:item for item in stage1[:base_n]}
     for et in ENTRY_TYPES:
-        ranked_for_strategy = sorted(
-            stage1, key=lambda item: float(item[1].get(et, 0.0)), reverse=True
-        )
-        for item in ranked_for_strategy[:PREFILTER_STRATEGY_TOP_K]:
-            selected[item[2]] = item
-    finalists = sorted(
-        selected.values(),
-        key=lambda item: (float(item[0]), max(item[1].values()) if item[1] else 0.0),
-        reverse=True,
-    )[:max(base_n, min(PREFILTER_STRATEGY_CAP, base_n + len(ENTRY_TYPES) * PREFILTER_STRATEGY_TOP_K))]
-    log.info(
-        "STAGE 2: top %d candidates selected; strategy-aware routing reserved lanes for %d strategies",
-        len(finalists), len(ENTRY_TYPES),
-    )
-
-    # Stage 2 — only finalists receive 15m + full setup/confluence/news analysis.
-    results: list[IntradaySignal] = []
-    rejection_counts = {
+        candidates=sorted((item for item in stage1 if float(item[1].get(et,0.0))>0.0), key=lambda item:float(item[1].get(et,0.0)), reverse=True)[:PREFILTER_STRATEGY_TOP_K]
+        for item in candidates:
+            selected[item[2]]=item
+    finalists=sorted(selected.values(), key=lambda item:(float(item[0]), max(item[1].values()) if item[1] else 0.0), reverse=True)[:max(base_n,min(PREFILTER_STRATEGY_CAP,base_n+len(ENTRY_TYPES)*PREFILTER_STRATEGY_TOP_K))]
+    log.info("STAGE 2 DAILY: top %d", len(finalists))
+    results=[]
+    stage2_scores = []
+    # Diagnostics only: these counters do NOT change any selection rule.
+    # Each finalist is counted at the first rejection gate it fails so /scan
+    # reports exactly where Stage 2 candidates disappear.
+    stage2_rejects = {
+        "exception": 0,
         "no_signal": 0,
         "score": 0,
         "live_ok": 0,
         "quality": 0,
-        "below_vwap": 0,
-        "m15_contrary": 0,
         "negative_news": 0,
         "liquidity": 0,
+        "stale_or_no_quote": 0,
     }
-    rejection_samples: list[str] = []
-    def _one_stage2(item):
-        _, _, sym, h1, m5 = item
+    def one(item):
+        _,_,sym,weekly,daily=item
         try:
-            return analyze_intraday(
-                sym,
-                names.get(sym, sym),
-                market_context=market_context,
-                preloaded=(h1, m5),
-            )
-        except Exception:
+            return analyze_daily(sym,names.get(sym,sym),True,market_context,(weekly,daily))
+        except Exception as exc:
+            log.warning("DAILY STAGE 2 EXCEPTION | %s | %s", sym, str(exc))
             return None
-
     with ThreadPoolExecutor(max_workers=workers) as pool:
-        futures = [pool.submit(_one_stage2, item) for item in finalists]
+        futures=[pool.submit(one,x) for x in finalists]
         for fut in as_completed(futures):
-            sig = fut.result()
-            if not sig:
-                rejection_counts["no_signal"] += 1
+            try:
+                sig=fut.result()
+            except Exception as exc:
+                stage2_rejects["exception"] += 1
+                log.warning("DAILY STAGE 2 FUTURE EXCEPTION | %s", str(exc))
                 continue
-            # تشخيص أول سبب فعلي للرفض، مع الاحتفاظ بأسباب الإشارة كلها داخل
-            # diagnostic_reasons حتى نعرف هل المشكلة درجة أم جودة أم سوق...
-            reasons = list(getattr(sig, "diagnostic_reasons", []) or [])
-
+            if not sig:
+                stage2_rejects["no_signal"] += 1
+                continue
+            stage2_scores.append((str(getattr(sig, "symbol", "?")), float(getattr(sig, "score", 0) or 0)))
             if sig.score < min_score:
-                rejection_counts["score"] += 1
-                rejection_samples.append(
-                    f"{sig.symbol}: score={sig.score}<{min_score} reasons={reasons} | {_intraday_diagnostic_metrics(sig, min_score)}"
-                )
+                stage2_rejects["score"] += 1
                 continue
             if not sig.live_ok:
-                rejection_counts["live_ok"] += 1
-                rejection_samples.append(
-                    f"{sig.symbol}: live_ok=False reasons={reasons} | {_intraday_diagnostic_metrics(sig, min_score)}"
-                )
+                stage2_rejects["live_ok"] += 1
                 continue
             if not sig.quality_ok:
-                rejection_counts["quality"] += 1
-                rejection_samples.append(
-                    f"{sig.symbol}: quality=False reasons={reasons} | {_intraday_diagnostic_metrics(sig, min_score)}"
-                )
-                continue
-            if "تحت" in sig.vwap_day_note:
-                rejection_counts["below_vwap"] += 1
-                rejection_samples.append(
-                    f"{sig.symbol}: below_vwap reasons={reasons} | {_intraday_diagnostic_metrics(sig, min_score)}"
-                )
-                continue
-            if sig.m15_state == "معاكس" and sig.score < 92:
-                rejection_counts["m15_contrary"] += 1
-                rejection_samples.append(
-                    f"{sig.symbol}: m15_contrary score={sig.score} reasons={reasons} | {_intraday_diagnostic_metrics(sig, min_score)}"
+                stage2_rejects["quality"] += 1
+                qreasons = getattr(sig, "quality_reasons", None) or []
+                log.info(
+                    "DAILY QUALITY REJECT | %s | score=%s | reasons=%s | ext=%.2f%% | atr=%.2f%% | vol=%.2fx | h4=%s | market=%s | tp1R=%.2f",
+                    sig.symbol, sig.score, qreasons or ["unspecified"],
+                    float(getattr(sig, "ext_sma20", 0) or 0),
+                    float(getattr(sig, "atr_pct", 0) or 0),
+                    float(getattr(sig, "volume_ratio", 0) or 0),
+                    getattr(sig, "h4_state", "?"),
+                    getattr(sig, "market_state", "?"),
+                    float(getattr(sig, "reward_r", 0) or 0),
                 )
                 continue
             if sig.news_state == "negative":
-                rejection_counts["negative_news"] += 1
-                rejection_samples.append(
-                    f"{sig.symbol}: negative_news reasons={reasons} | {_intraday_diagnostic_metrics(sig, min_score)}"
-                )
+                stage2_rejects["negative_news"] += 1
                 continue
-            liq = _quote_liquidity(sig.symbol, sig.price)
-            sig.spread_pct = round(float(liq.get("spread_pct", 0) or 0), 3)
-            sig.expected_slippage_pct = round(float(liq.get("slippage_pct", 0) or 0), 3)
-            sig.dollar_volume_3m = round(float(liq.get("dollar_volume", 0) or 0), 0)
-            sig.liquidity_ok = bool(liq.get("ok", True))
-            if sig.spread_pct > MAX_SPREAD_PCT:
-                sig.warnings.append(f"Spread مرتفع {sig.spread_pct:.2f}%")
-            if not sig.liquidity_ok:
-                rejection_counts["liquidity"] += 1
-                rejection_samples.append(
-                    f"{sig.symbol}: liquidity=False spread={sig.spread_pct:.3f}% slippage={sig.expected_slippage_pct:.3f}% | {_intraday_diagnostic_metrics(sig, min_score)}"
-                )
-                continue
-            if liq.get("quote_source") == "none" or float(liq.get("quote_age_min", 999) or 999) > 2.0:
-                rejection_counts["liquidity"] += 1
-                rejection_samples.append(
-                    f"{sig.symbol}: stale_or_no_quote source={liq.get('quote_source')} age={float(liq.get('quote_age_min', 999) or 999):.2f}m | {_intraday_diagnostic_metrics(sig, min_score)}"
-                )
+            # Validate current bid/ask only for the Stage-2 finalists.
+            # This keeps the full-universe scan fast while preventing Daily V2
+            # from reporting a false "liquidity suitable" result.
+            try:
+                liq = _quote_liquidity(sig.symbol, sig.price)
+                sig.spread_pct = round(float(liq.get("spread_pct", 0) or 0), 3)
+                sig.expected_slippage_pct = round(float(liq.get("slippage_pct", 0) or 0), 3)
+                sig.dollar_volume_3m = round(float(liq.get("dollar_volume", 0) or 0), 0)
+                sig.liquidity_ok = bool(liq.get("ok", False))
+                if not sig.liquidity_ok:
+                    stage2_rejects["liquidity"] += 1
+                    continue
+                if liq.get("quote_source") == "none" or float(liq.get("quote_age_min", 999) or 999) > 2.0:
+                    stage2_rejects["stale_or_no_quote"] += 1
+                    continue
+            except Exception as exc:
+                stage2_rejects["liquidity"] += 1
+                log.warning("DAILY LIQUIDITY CHECK FAILED | %s | %s", sig.symbol, str(exc))
                 continue
             results.append(sig)
-            log.info(
-                "INTRADAY QUALIFIED METRICS | %s | %s",
-                sig.symbol,
-                _intraday_diagnostic_metrics(sig, min_score),
-            )
+
+    # Score distribution diagnostics only. These values are observational and
+    # do not alter any selection rule. They show whether the zero-qualified
+    # result is caused by scores being far below the threshold or merely just
+    # below it.
+    scores = [score for _, score in stage2_scores]
+    if scores:
+        avg_score = sum(scores) / len(scores)
+        max_score = max(scores)
+        ge_min = sum(1 for score in scores if score >= float(min_score))
+        b85_87 = sum(1 for score in scores if 85 <= score < 88)
+        b80_84 = sum(1 for score in scores if 80 <= score < 85)
+        lt80 = sum(1 for score in scores if score < 80)
+        top10 = sorted(stage2_scores, key=lambda x: (-x[1], x[0]))[:10]
+        top10_text = ", ".join(f"{sym}:{score:.1f}" for sym, score in top10)
+        log.info(
+            "STAGE 2 DAILY SCORE DISTRIBUTION: analyzed=%d | max=%.1f | avg=%.1f | >=%d=%d | 85-87=%d | 80-84=%d | <80=%d | top10=%s",
+            len(scores), max_score, avg_score, int(min_score), ge_min,
+            b85_87, b80_84, lt80, top10_text,
+        )
+    else:
+        log.info("STAGE 2 DAILY SCORE DISTRIBUTION: analyzed=0 | no completed signals")
 
     log.info(
-        "STAGE 2: %d deep candidates completed; %d qualified signals | rejects=%s",
-        len(finalists), len(results), rejection_counts,
+        "STAGE 2 DAILY RESULT: finalists=%d | qualified=%d | rejects=%s",
+        len(finalists),
+        len(results),
+        stage2_rejects,
     )
-    if rejection_samples:
-        for sample in rejection_samples[:20]:
-            log.info("INTRADAY REJECT DETAIL | %s", sample)
-
     records_for_dedup = _read_learning_records()
     before_dedup = len(results)
     results = [sig for sig in results if not _signal_duplicate_recent(sig, records_for_dedup)]
     log.info("SIGNAL DEDUP | removed=%d | remaining=%d", before_dedup - len(results), len(results))
-    rank = {et: i for i, et in enumerate(ENTRY_TYPES)}
-    results.sort(key=lambda x: (
-        -(float(x.score) + 1.5 * min(float(getattr(x, "reward_r", 0) or 0), 3.0)
-                    - 1.5 * float(getattr(x, "spread_pct", 0) or 0)
-          - 1.0 * float(getattr(x, "expected_slippage_pct", 0) or 0)
-          - 0.8 * max(float(getattr(x, "ext_sma20", 0) or 0) - 2.0, 0.0)),
-        rank.get(x.entry_type, 99), -float(x.score), -float(getattr(x, "reward_r", 0) or 0)
-    ))
+    rank={et:i for i,et in enumerate(ENTRY_TYPES)}
+    results.sort(key=lambda x:(
+        -(float(x.score)+1.5*min(float(getattr(x,'reward_r',0) or 0),3.0)
+          -1.5*float(getattr(x,'spread_pct',0) or 0)
+          -1.0*float(getattr(x,'expected_slippage_pct',0) or 0)
+          -0.8*max(float(getattr(x,'ext_sma20',0) or 0)-3.0,0.0)),
+        rank.get(x.entry_type,99),-float(x.score),-float(getattr(x,'reward_r',0) or 0)))
     return results[:limit]
 
 
-scan_intraday.last_window = ""
+scan_daily.last_window = ""
+
+
+# Public compatibility API expected by the existing bot.
+analyze = analyze_daily
+format_signal_ar = format_daily_ar
+scan_symbols = scan_daily
+rank_all = lambda symbols, names: scan_daily(symbols, names, DAILY_MIN_SCORE, 5)
+
