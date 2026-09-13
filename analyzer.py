@@ -352,10 +352,7 @@ def _strategy_stats(rows: list[dict]) -> dict:
     """إحصاءات منفصلة لكل واحدة من استراتيجيات الدخول الـ16."""
     stats = {}
     for et in ENTRY_TYPES:
-        subset = [
-            r for r in rows
-            if et in (r.get("matched_entry_types") or [r.get("entry_type")])
-        ]
+        subset = [r for r in rows if str(r.get("entry_type") or "") == et]
         wins = sum(1 for r in subset if r.get("status") == "tp1")
         stats[et] = {
             "samples": len(subset),
@@ -384,10 +381,7 @@ def _build_candidate_policy(completed: list[dict], current: dict) -> dict | None
             candidate["weights"][factor] = max(1.0 - ADAPTIVE_MAX_CHANGE, w - 0.05)
 
     for et in ENTRY_TYPES:
-        subset = [
-            r for r in recent
-            if et in (r.get("matched_entry_types") or [r.get("entry_type")])
-        ]
+        subset = [r for r in recent if str(r.get("entry_type") or "") == et]
         if len(subset) < 6:
             continue
         r = _rate(subset)
@@ -873,7 +867,7 @@ def adaptive_retrain_if_ready(force_monthly: bool = False) -> dict:
     for et in ("دخول مبكر", "إعادة اختبار", "ارتداد VWAP", "ارتداد EMA20", "سحب سيولة", "سحب سيولة مع Displacement", "ضغط ثم انفجار", "استمرار الزخم", "اختراق نطاق الافتتاح", "اختراق مؤكد", "علم صاعد", "استعادة مستوى", "دخول بعد Opening Drive", "استعادة قمة الفترة", "استعادة بعد فشل ORB", "استمرار ABC"):
         subset = [
             r for r in train
-            if et in (r.get("matched_entry_types") or [r.get("entry_type")])
+            if str(r.get("entry_type") or "") == et
         ]
         if len(subset) < 6:
             continue
@@ -1876,8 +1870,11 @@ def analyze_daily(
     level_high = float(h_win["High"].iloc[:-1].max()) if len(h_win) > 3 else session_high
     was_below = float(h_win["Close"].iloc[-3]) < level_high * 0.998 if len(h_win) >= 3 else False
     breakout_now = price >= level_high * 1.001 and was_below
+    # A real retest requires a prior close above the broken resistance,
+    # followed by a return toward that same level. A mere historical touch is
+    # not enough to label the setup as Retest.
     prior_break = (
-        float(h_win["High"].iloc[-8:-2].max()) >= level_high * 0.999
+        bool((h_win["Close"].astype(float).iloc[-8:-2] >= level_high * 1.001).any())
         if len(h_win) >= 8 else False
     )
     near_level = abs(price - level_high) / max(price, 1e-9) * 100 <= 0.7
@@ -2225,7 +2222,28 @@ def analyze_daily(
         and h4_state == "داعم" and not failed
     )
 
-    early = above_vwap and above_open and not breakout_now and ext_tmp <= 2.2 and not failed
+    # Early Entry is itself a structural setup, not a score fallback:
+    # pre-breakout compression/holding under a meaningful resistance, with
+    # improving price action and no already-confirmed strategy trigger.
+    early = False
+    try:
+        recent3 = today_d.tail(3)
+        early_range = (float(recent3["High"].max()) - float(recent3["Low"].min())) / max(price, 1e-9) * 100
+        early_near_resistance = level_high > 0 and abs(price - level_high) / max(price, 1e-9) * 100 <= 1.5
+        early_holding = float(recent3["Close"].iloc[-1]) >= float(recent3["Close"].iloc[0])
+        early = bool(
+            trend_up and above_vwap and above_open and not breakout_now and not failed
+            and early_near_resistance and early_range <= 3.0 and early_holding
+            and last_green and mom > 0.03 and vol_ratio >= 0.95 and ext_tmp <= 2.2
+            and h4_state != "معاكس" and market_ok
+            and not (retest or orb_breakout or breakout_now or liquidity_displacement
+                     or liquidity_sweep or compression_expansion or momentum_continuation
+                     or bull_flag or resistance_reclaim or orb_failed_reclaim
+                     or abc_continuation or opening_drive_pullback or hod_reclaim
+                     or vwap_bounce or ema_pullback)
+        )
+    except Exception:
+        early = False
 
     breakout_ok, breakout_quality = _breakout_quality(today_d, level_high, price)
     orb_breakout_ok, orb_quality = _breakout_quality(today_d, orb_high, price) if orb_high > 0 else (False, 0.0)
@@ -2268,7 +2286,7 @@ def analyze_daily(
         matched_entry_types.append("ارتداد VWAP")
     if ema_pullback:
         matched_entry_types.append("ارتداد EMA20")
-    if early or (above_vwap and trend_up and ext_tmp <= 2.5):
+    if early:
         matched_entry_types.append("دخول مبكر")
 
     if not matched_entry_types:
@@ -2325,9 +2343,69 @@ def analyze_daily(
             q += max(-4.0, min(4.0, (win_rate - 0.50) * 8.0))
         return round(max(0.0, min(100.0, q)), 2)
 
+    def _strategy_identity(name: str) -> float:
+        """Structural identity score, separate from generic market quality.
+
+        Common filters (trend/VWAP/open/volume/momentum/extension) are deliberately
+        not counted here. This score answers only: "how clearly does the setup
+        exhibit the defining structure of this strategy?" It is used as a
+        deterministic tie-break for overlapping matches, not as extra trade score.
+        """
+        identity = {
+            "اختراق مؤكد": (100.0 if breakout_ok else 0.0) + min(20.0, float(breakout_quality) * 0.20),
+            "اختراق نطاق الافتتاح": (100.0 if orb_breakout_ok else 0.0) + min(20.0, float(orb_quality) * 0.20),
+            "إعادة اختبار": 55.0 + (25.0 if prior_break else 0.0) + (20.0 if near_level else 0.0),
+            "ارتداد VWAP": 100.0 if vwap_touch else 0.0,
+            "ارتداد EMA20": 100.0 if ema_touch else 0.0,
+            "سحب سيولة مع Displacement": 100.0 if liquidity_displacement else 0.0,
+            "سحب سيولة": 100.0 if liquidity_sweep else 0.0,
+            "ضغط ثم انفجار": 100.0 if compression_expansion else 0.0,
+            "استمرار الزخم": 100.0 if momentum_continuation else 0.0,
+            "علم صاعد": 100.0 if bull_flag else 0.0,
+            "استعادة مستوى": 100.0 if resistance_reclaim else 0.0,
+            "استعادة بعد فشل ORB": 100.0 if orb_failed_reclaim else 0.0,
+            "استمرار ABC": 100.0 if abc_continuation else 0.0,
+            "دخول بعد Opening Drive": 100.0 if opening_drive_pullback else 0.0,
+            "استعادة قمة الفترة": 100.0 if hod_reclaim else 0.0,
+            "دخول مبكر": 45.0,
+        }
+        return round(max(0.0, min(120.0, identity.get(name, 0.0))), 2)
+
+    strategy_identity_scores = {et: _strategy_identity(et) for et in matched_entry_types}
     strategy_scores = {et: _strategy_strength(et) for et in matched_entry_types}
     entry_order = {et: i for i, et in enumerate(ENTRY_TYPES)}
-    entry_type = max(matched_entry_types, key=lambda et: (strategy_scores.get(et, 0.0), -entry_order.get(et, 999)))
+    # When strategies overlap, prefer the more structurally specific setup only
+    # when their strength scores are effectively tied. This does not remove
+    # matched strategies or affect per-strategy learning; it only prevents a
+    # broad setup from winning a near-tie over a setup with a clearer identity.
+    strategy_specificity = {
+        "سحب سيولة مع Displacement": 16,
+        "استعادة بعد فشل ORB": 15,
+        "دخول بعد Opening Drive": 14,
+        "استمرار ABC": 13,
+        "علم صاعد": 12,
+        "ضغط ثم انفجار": 11,
+        "اختراق نطاق الافتتاح": 10,
+        "اختراق مؤكد": 9,
+        "إعادة اختبار": 8,
+        "سحب سيولة": 7,
+        "استعادة قمة اليوم": 6,
+        "استعادة قمة الفترة": 6,
+        "استعادة مستوى": 5,
+        "ارتداد VWAP": 4,
+        "ارتداد EMA20": 3,
+        "استمرار الزخم": 2,
+        "دخول مبكر": 1,
+    }
+    entry_type = max(
+        matched_entry_types,
+        key=lambda et: (
+            strategy_scores.get(et, 0.0),
+            strategy_identity_scores.get(et, 0.0),
+            strategy_specificity.get(et, 0),
+            -entry_order.get(et, 999),
+        ),
+    )
     entry_emoji = "🟡" if entry_type == "إعادة اختبار" else "🟢"
     if entry_type == "اختراق نطاق الافتتاح":
         breakout_quality = max(breakout_quality, orb_quality)
@@ -2511,7 +2589,7 @@ def analyze_daily(
         factors.append("vwap_weekly_confluence")
         reasons.append("Confluence: VWAP + اتجاه الأسبوعي + 4س")
     if multi_level_confluence:
-        score += min(5, 2 + len(set(confluence_levels)))
+        score += 2.0
         factors.append("multi_level_confluence")
         reasons.append("تجمع مستويات: " + "/".join(confluence_levels[:4]))
 
@@ -3269,8 +3347,6 @@ def scan_daily(
     rank={et:i for i,et in enumerate(ENTRY_TYPES)}
     results.sort(key=lambda x:(
         -(float(x.score)+1.5*min(float(getattr(x,'reward_r',0) or 0),3.0)
-          +2.0*("multi_level_confluence" in (getattr(x,'factor_keys',[]) or []))
-          +1.5*("vwap_weekly_confluence" in (getattr(x,'factor_keys',[]) or []))
           -1.5*float(getattr(x,'spread_pct',0) or 0)
           -1.0*float(getattr(x,'expected_slippage_pct',0) or 0)
           -0.8*max(float(getattr(x,'ext_sma20',0) or 0)-3.0,0.0)),
