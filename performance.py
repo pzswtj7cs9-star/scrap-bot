@@ -638,6 +638,97 @@ class PerformanceLog:
         }
 
     @staticmethod
+    def _best_strategy_stats(rows: list[dict[str, Any]]) -> dict[str, Any] | None:
+        """أفضل استراتيجية للفترة بناءً على الأداء الفعلي للصفقات.
+        الصفقة متعددة الاستراتيجيات تُحسب لكل استراتيجية طابقت عليها.
+        لا نعلن فائزًا بعينة أقل من 5 صفقات مغلقة.
+        """
+        closed = [r for r in rows if r.get("status") == "closed"]
+        by_strategy: dict[str, list[dict[str, Any]]] = {}
+
+        for r in closed:
+            strategies = list(r.get("matched_entry_types") or [])
+            primary = str(r.get("entry_type") or "").strip()
+            if not strategies and primary:
+                strategies = [primary]
+            # إزالة التكرار داخل الصفقة الواحدة.
+            seen = set()
+            for raw in strategies:
+                s = str(raw or "").strip()
+                if not s or s in seen:
+                    continue
+                seen.add(s)
+                by_strategy.setdefault(s, []).append(r)
+
+        candidates = []
+        for strategy, subset in by_strategy.items():
+            if len(subset) < 5:
+                continue
+
+            wins = sum(
+                1 for r in subset
+                if str(r.get("result") or "").lower() in {"tp1", "tp2", "tp3"}
+            )
+            losses = sum(
+                1 for r in subset
+                if str(r.get("result") or "").lower() == "stop"
+            )
+            normal = len(subset) - wins - losses
+            decided = wins + losses
+            win_rate = (wins / decided * 100) if decided else 0.0
+
+            # متوسط R الفعلي لكل صفقة مغلقة.
+            r_values = []
+            for r in subset:
+                entry = float(r.get("entry") or 0)
+                stop = float(r.get("stop_loss") or 0)
+                pnl = float(r.get("pnl_pct") or 0)
+                risk_pct = ((entry - stop) / entry * 100) if entry and stop and entry > stop else 0
+                if risk_pct > 0:
+                    r_values.append(pnl / risk_pct)
+            avg_r = sum(r_values) / len(r_values) if r_values else 0.0
+
+            # Drawdown تقريبي خاص بالاستراتيجية، على أساس ترتيب الخروج.
+            ordered = sorted(
+                subset,
+                key=lambda r: str(r.get("exit_at") or r.get("opened_at") or "")
+            )
+            equity = peak = max_dd = 0.0
+            for r in ordered:
+                equity += float(r.get("pnl_pct") or 0)
+                peak = max(peak, equity)
+                max_dd = max(max_dd, peak - equity)
+
+            # ترتيب الأداء: متوسط R أولًا، ثم نسبة النجاح، ثم حجم العينة،
+            # مع تفضيل التراجع الأقل عند التعادل.
+            rank_key = (avg_r, win_rate, len(subset), -max_dd)
+            candidates.append((rank_key, strategy, {
+                "strategy": strategy,
+                "signals": len(subset),
+                "wins": wins,
+                "losses": losses,
+                "normal": normal,
+                "win_rate": win_rate,
+                "avg_r": avg_r,
+                "max_dd": max_dd,
+            }))
+
+        if not candidates:
+            return None
+        candidates.sort(key=lambda x: x[0], reverse=True)
+        return candidates[0][2]
+
+    @staticmethod
+    def _strategy_name_ar(strategy: str, intraday: bool = False) -> str:
+        """أسماء العرض بالعربي مع توحيد تسمية S13 بين اليومي واللحظي."""
+        s = str(strategy or "").strip()
+        if s == "استعادة قمة اليوم":
+            return "استعادة قمة اليوم"
+        if s == "استعادة قمة الفترة":
+            return "استعادة قمة الفترة"
+        return s
+
+    @staticmethod
     def _period_report_text(title: str, stats: dict[str, Any], intraday: bool = False) -> str:
         lines = [title, f"🔔 الإشارات: {stats['signals']}"]
         if intraday:
@@ -650,6 +741,31 @@ class PerformanceLog:
             f"📈 نسبة النجاح: {stats['win_rate']:.1f}%",
             f"📊 متوسط النتيجة: {stats['avg']:+.2f}%",
             f"📉 أقصى تراجع: -{stats['max_dd']:.2f}%",
+        ]
+
+        best = PerformanceLog._best_strategy_stats(rows)
+        if best:
+            best_name = PerformanceLog._strategy_name_ar(
+                best["strategy"], intraday=intraday
+            )
+            lines += [
+                "",
+                f"🏆 أفضل استراتيجية: {best_name}",
+                (
+                    f"الصفقات: {best['signals']} | "
+                    f"🟢 ناجحة: {best['wins']} | "
+                    f"🔴 خاسرة: {best['losses']} | "
+                    f"⚪ مغلقة عادي: {best['normal']}"
+                ),
+                f"نسبة النجاح: {best['win_rate']:.1f}%",
+            ]
+        else:
+            lines += [
+                "",
+                "🏆 أفضل استراتيجية: لا توجد عينة كافية",
+            ]
+
+        lines += [
             "",
             "تحليل تعليمي — ليست توصية استثمارية.",
         ]
