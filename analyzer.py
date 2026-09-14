@@ -41,6 +41,10 @@ ADAPTIVE_POLICY_FILE = Path("/var/data/daily_v2_adaptive_policy.json")
 ADAPTIVE_MIN_SAMPLES = 30
 ADAPTIVE_CONFIRM_SAMPLES = 40
 ADAPTIVE_MAX_CHANGE = 0.15
+STRATEGY_WEIGHT_MIN_SAMPLES = 20
+STRATEGY_WEIGHT_STEP = 0.05
+STRATEGY_WEIGHT_MIN_FACTOR = 0.50
+STRATEGY_WEIGHT_MAX_FACTOR = 1.50
 ADAPTIVE_BEST_FILE = Path("/var/data/daily_v2_adaptive_best.json")
 ADAPTIVE_SHADOW_FILE = Path("/var/data/daily_v2_shadow_results.jsonl")
 LEARNING_ALERT_FILE = Path("/var/data/daily_v2_learning_alert.json")
@@ -143,6 +147,7 @@ class DailySignal:
     entry_emoji: str = "🟢"
     matched_entry_types: list[str] | None = None
     strategy_scores: dict[str, float] | None = None
+    strategy_component_scores: dict[str, dict[str, float]] | None = None
     structure_zone: str = "محايدة"
     quality_ok: bool = True
     live_ok: bool = True
@@ -226,6 +231,9 @@ def _default_adaptive_policy() -> dict:
         },
         "entry_limits": {"دخول مبكر": 94, "إعادة اختبار": 95, "ارتداد VWAP": 96, "ارتداد EMA20": 96, "سحب سيولة": 97, "ضغط ثم انفجار": 98, "استمرار الزخم": 97, "اختراق نطاق الافتتاح": 99, "اختراق مؤكد": 100, "علم صاعد": 98, "استعادة مستوى": 98, "دخول بعد Opening Drive": 98, "استعادة قمة الفترة": 98, "استعادة بعد فشل ORB": 99, "استمرار ABC": 98, "سحب سيولة مع Displacement": 99},
         "strategy_stats": {et: {"samples": 0, "wins": 0, "win_rate": 0.0} for et in ENTRY_TYPES},
+        "strategy_weights": {},
+        "strategy_weights_active": False,
+        "strategy_weights_generation": 0,
         "min_volume_ratio": 0.85,
         "min_news_volume_ratio": 1.50,
         "min_news_change_pct": 4.0,
@@ -259,7 +267,6 @@ def _default_adaptive_policy() -> dict:
         # Legacy learning knowledge is preserved inside the approved Adaptive
         # policy. It is no longer a second live-learning engine.
         "legacy_factor_bias": {},
-        "legacy_strategy_bias": {},
         "history": [],
         "kill_switch": False,
         "kill_switch_reason": "",
@@ -294,6 +301,9 @@ def _load_adaptive_policy() -> dict:
         for k, v in default["entry_limits"].items():
             data["entry_limits"].setdefault(k, v)
         data.setdefault("strategy_stats", {})
+        data.setdefault("strategy_weights", {})
+        data.setdefault("strategy_weights_active", False)
+        data.setdefault("strategy_weights_generation", 0)
         for et, stat in default["strategy_stats"].items():
             data["strategy_stats"].setdefault(et, dict(stat))
         data.setdefault("regime_weights", {})
@@ -315,7 +325,6 @@ def _load_adaptive_policy() -> dict:
         data["reason_policy"].setdefault("active", False)
         data["reason_policy"].setdefault("generation", 0)
         data.setdefault("legacy_factor_bias", {})
-        data.setdefault("legacy_strategy_bias", {})
         data.setdefault("kill_switch", False)
         data.setdefault("kill_switch_reason", "")
         data.setdefault("kill_switch_at", None)
@@ -381,7 +390,6 @@ def _adaptive_score_adjustment(
             fvals = [float(fb[f]) for f in factors if f in fb]
             if fvals:
                 adjustment += sum(fvals) / len(fvals)
-            adjustment += float((p.get("legacy_strategy_bias", {}) or {}).get(entry_type, 0.0))
 
         return max(-5.0, min(5.0, adjustment))
     except Exception:
@@ -392,6 +400,95 @@ def _rate(rows: list[dict]) -> float:
     if not rows:
         return 0.0
     return sum(r.get("status") == "tp1" for r in rows) / len(rows)
+
+
+def _strategy_weight_defaults() -> dict:
+    """Baseline component weights for the 16 strategy-quality scores."""
+    return {
+        "اختراق مؤكد": {"breakout_quality": .55, "volume": .25, "candle": .20},
+        "اختراق نطاق الافتتاح": {"orb_quality": .55, "volume": .25, "candle": .20},
+        "إعادة اختبار": {"prior_break": .25, "near_level": .35, "reclaim": .25, "volume": .15},
+        "ارتداد VWAP": {"touch": .30, "reclaim": .30, "candle": .20, "momentum": .10, "volume": .10},
+        "ارتداد EMA20": {"touch": .30, "reclaim": .30, "candle": .20, "higher_tf": .10, "volume": .10},
+        "سحب سيولة": {"sweep": .35, "volume": .25, "candle": .20, "momentum": .20},
+        "سحب سيولة مع Displacement": {"sweep": .20, "displacement": .40, "volume": .20, "momentum": .10, "candle": .10},
+        "ضغط ثم انفجار": {"match": .40, "volume": .25, "candle": .20, "momentum": .15},
+        "استمرار الزخم": {"momentum": .45, "volume": .30, "candle": .15, "higher_tf": .10},
+        "علم صاعد": {"impulse": .30, "flag": .30, "candle": .20, "volume": .20},
+        "استعادة مستوى": {"match": .35, "reclaim": .25, "candle": .20, "volume": .20},
+        "دخول بعد Opening Drive": {"drive": .35, "pullback": .25, "candle": .20, "volume": .20},
+        "استعادة قمة الفترة": {"match": .35, "reclaim": .25, "candle": .20, "volume": .20},
+        "استعادة قمة اليوم": {"match": .35, "reclaim": .25, "candle": .20, "volume": .20},
+        "استعادة بعد فشل ORB": {"failed_reclaim": .25, "orb_quality": .25, "reclaim": .30, "momentum": .10, "volume": .10},
+        "استمرار ABC": {"a": .25, "b": .25, "c_break": .30, "momentum": .10, "volume": .10},
+        "دخول مبكر": {"early_range": .30, "near_resistance": .25, "holding": .20, "momentum": .15, "candle": .10},
+    }
+
+
+def _strategy_weights_for(policy: dict, name: str) -> dict:
+    base = _strategy_weight_defaults().get(name, {})
+    if not base:
+        return {}
+    raw = (policy.get("strategy_weights", {}) or {}).get(name, {})
+    if not policy.get("strategy_weights_active") or not isinstance(raw, dict):
+        return dict(base)
+    vals = {k: float(raw.get(k, v)) for k, v in base.items()}
+    total = sum(max(0.0, v) for v in vals.values())
+    if total <= 0:
+        return dict(base)
+    return {k: max(0.0, v) / total for k, v in vals.items()}
+
+
+def _weighted_strategy_score(components: dict[str, float], weights: dict[str, float]) -> float:
+    if not components or not weights:
+        return 0.0
+    return sum(float(components.get(k, 0.0)) * float(w) for k, w in weights.items())
+
+
+def _learn_strategy_weights(train: list[dict], current: dict) -> dict:
+    """Learn component weights per strategy; only produces a candidate policy."""
+    defaults = _strategy_weight_defaults()
+    learned = json.loads(json.dumps(current.get("strategy_weights", {}) or {}))
+    for et, base in defaults.items():
+        rows = [r for r in train if str(r.get("entry_type") or "") == et and isinstance((r.get("strategy_component_scores") or {}).get(et), dict)]
+        if len(rows) < STRATEGY_WEIGHT_MIN_SAMPLES:
+            continue
+        wins = [r for r in rows if r.get("status") == "tp1"]
+        losses = [r for r in rows if r.get("status") in {"stop", "timeout"}]
+        if len(wins) < 5 or len(losses) < 5:
+            continue
+        neww = {k: float((learned.get(et) or {}).get(k, v)) for k, v in base.items()}
+        for k, bw in base.items():
+            wm = sum(float((r.get("strategy_component_scores") or {}).get(et, {}).get(k, 0.0)) for r in wins) / len(wins)
+            lm = sum(float((r.get("strategy_component_scores") or {}).get(et, {}).get(k, 0.0)) for r in losses) / len(losses)
+            if wm - lm >= 8.0:
+                neww[k] += STRATEGY_WEIGHT_STEP
+            elif wm - lm <= -8.0:
+                neww[k] -= STRATEGY_WEIGHT_STEP
+            neww[k] = max(bw * STRATEGY_WEIGHT_MIN_FACTOR, min(bw * STRATEGY_WEIGHT_MAX_FACTOR, neww[k]))
+        # Normalize while respecting broad safety bounds.
+        total = sum(neww.values()) or 1.0
+        neww = {k: v / total for k, v in neww.items()}
+        learned[et] = neww
+    return learned
+
+
+def _strategy_weight_oos_quality(rows: list[dict], policy: dict) -> tuple[float, int]:
+    scored = []
+    for r in rows:
+        et = str(r.get("entry_type") or "")
+        comps = (r.get("strategy_component_scores") or {}).get(et)
+        if not isinstance(comps, dict):
+            continue
+        score = _weighted_strategy_score(comps, _strategy_weights_for(policy, et))
+        scored.append((score, r.get("status") == "tp1"))
+    if len(scored) < 10:
+        return 0.0, len(scored)
+    wins = [s for s, w in scored if w]
+    losses = [s for s, w in scored if not w]
+    if not wins or not losses:
+        return 0.0, len(scored)
+    return (sum(wins) / len(wins)) - (sum(losses) / len(losses)), len(scored)
 
 
 def _strategy_stats(rows: list[dict]) -> dict:
@@ -547,7 +644,6 @@ def _shadow_score_row(row: dict, policy: dict) -> bool:
         fvals = [float(fb[f]) for f in factors if f in fb]
         if fvals:
             score += sum(fvals) / len(fvals)
-        score += float((policy.get("legacy_strategy_bias", {}) or {}).get(et, 0.0))
 
     limit = float(policy.get("entry_limits", {}).get(et, 94))
     vol = float(row.get("volume_ratio", 1.0) or 1.0)
@@ -595,14 +691,14 @@ def _rollback_if_needed() -> dict:
 
 def monthly_self_optimization() -> dict:
     """
-    Monthly controlled optimization entry point.
-    Reviews the full accumulated learning set once per month and returns a
-    Telegram-friendly summary. It never changes core trading rules.
+    Unified Adaptive optimization entry point.
+    Reviews the full accumulated learning set once per 100 newly completed
+    trades and returns a Telegram-friendly summary. It never changes core rules.
     """
     result = adaptive_retrain_if_ready(force_monthly=True)
     policy = _load_adaptive_policy()
 
-    if result.get("status") in {"waiting", "waiting_oos", "unchanged"}:
+    if result.get("status") in {"waiting", "waiting_oos", "waiting_cycle_samples", "unchanged"}:
         return {
             **result,
             "generation": int(policy.get("generation", 0)),
@@ -926,29 +1022,19 @@ def adaptive_retrain_if_ready(force_monthly: bool = False) -> dict:
     completed = _recent_learning_rows()
     policy = _load_adaptive_policy()
 
-    if force_monthly:
-        period = _monthly_period_key()
-        # Calendar-month limit + cumulative 100-trade gate.
-        # Example: 40 trades in one month + 60 in the next = 100.
-        if policy.get("last_monthly_period") == period:
-            return {"status": "unchanged_month", "samples": len(completed), "period": period, "monthly_cycle_total": int(policy.get("monthly_cycle_total", 0) or 0)}
-        if not policy.get("monthly_cycle_initialized", False):
-            # First run after introducing the cumulative gate: start the cycle
-            # from the existing learning history so no prior completed sample
-            # is silently discarded.
-            policy["monthly_cycle_base_samples"] = 0
-            policy["monthly_cycle_initialized"] = True
-        base = int(policy.get("monthly_cycle_base_samples", 0) or 0)
-        if base > len(completed):
-            base = len(completed)
-        cycle_total = max(0, len(completed) - base)
-        policy["monthly_cycle_total"] = cycle_total
-        if cycle_total < MONTHLY_MIN_SAMPLES:
-            policy["last_monthly_sample_count"] = cycle_total
-            # Do not mark the calendar month as processed; samples carry into
-            # the next month until the cumulative 100-trade gate is reached.
-            _save_adaptive_policy(policy)
-            return {"status": "waiting_monthly_samples", "samples": len(completed), "required": MONTHLY_MIN_SAMPLES, "period": period, "monthly_cycle_total": cycle_total}
+    # Unified Adaptive cycle: evaluate once after every 100 newly completed
+    # trades. Calendar months are NOT a learning boundary. The full accumulated
+    # history remains available, so small-sample strategies carry forward and
+    # can qualify in a later cycle without losing their observations.
+    cycle_anchor = int(policy.get("adaptive_cycle_anchor_samples", policy.get("samples_at_update", 0)) or 0)
+    if cycle_anchor > len(completed):
+        cycle_anchor = len(completed)
+    cycle_total = max(0, len(completed) - cycle_anchor)
+    policy["adaptive_cycle_total"] = cycle_total
+    if cycle_total < MONTHLY_MIN_SAMPLES:
+        policy["last_monthly_sample_count"] = cycle_total
+        _save_adaptive_policy(policy)
+        return {"status": "waiting_cycle_samples", "samples": len(completed), "required": MONTHLY_MIN_SAMPLES, "cycle_total": cycle_total}
 
     kill, kill_reason = _adaptive_kill_switch_state(completed, policy)
     if kill:
@@ -969,9 +1055,9 @@ def adaptive_retrain_if_ready(force_monthly: bool = False) -> dict:
     if not force_monthly and len(completed) <= last_update:
         return {"status": "unchanged", "samples": len(completed)}
 
-    # Normal learning stays bounded to the recent confirmation window.
-    # Monthly optimization intentionally reviews the full accumulated dataset.
-    recent = completed if force_monthly else completed[-ADAPTIVE_CONFIRM_SAMPLES:]
+    # Every Adaptive generation uses the full accumulated dataset. This lets
+    # strategies with small samples carry their observations into later cycles.
+    recent = completed
     # اختبار خارج العينة: الجزء الأحدث يبقى خارج التدريب حتى لا نعتمد على نفس البيانات.
     split = max(20, int(len(recent) * 0.70))
     train = recent[:split]
@@ -993,19 +1079,13 @@ def adaptive_retrain_if_ready(force_monthly: bool = False) -> dict:
                 -LEARNING_MAX_ADJUSTMENT,
                 min(LEARNING_MAX_ADJUSTMENT, (_rate(subset) - baseline_rate) * 10.0),
             )
-    legacy_strategy_bias = {}
-    for et in ENTRY_TYPES:
-        subset = [r for r in train if str(r.get("entry_type") or "") == et]
-        if len(subset) >= STRATEGY_MIN_SAMPLES:
-            legacy_strategy_bias[et] = max(
-                -LEARNING_MAX_ADJUSTMENT,
-                min(LEARNING_MAX_ADJUSTMENT, (_rate(subset) - baseline_rate) * 6.0),
-            )
-    candidate["legacy_factor_bias"] = legacy_factor_bias
-    candidate["legacy_strategy_bias"] = legacy_strategy_bias
     candidate.setdefault("interaction_weights", {})
     # Always refresh per-strategy statistics so all 16 setups are observable.
     candidate["strategy_stats"] = _strategy_stats(completed)
+
+    # Strategy-weight learning replaces the old live strategy bias. It is
+    # optional and remains inactive until its own OOS test proves improvement.
+    candidate["strategy_weights"] = _learn_strategy_weights(train, policy)
 
     # Regime layer: learns separately for each market condition, but remains
     # shadow-only until its OOS gate proves that it improves the current policy.
@@ -1111,6 +1191,18 @@ def adaptive_retrain_if_ready(force_monthly: bool = False) -> dict:
         and len(reason_selected) >= 10
     )
 
+    current_sw_quality, sw_n = _strategy_weight_oos_quality(test, policy)
+    candidate_sw_quality, _ = _strategy_weight_oos_quality(test, candidate)
+    strategy_weights_improved = (
+        sw_n >= 10 and candidate_sw_quality >= current_sw_quality + 2.0
+    )
+    candidate["strategy_weights_oos_quality"] = round(candidate_sw_quality, 4)
+    candidate["strategy_weights_active"] = bool(strategy_weights_improved or policy.get("strategy_weights_active", False))
+    candidate["strategy_weights_generation"] = (
+        candidate["generation"] if strategy_weights_improved
+        else int(policy.get("strategy_weights_generation", 0) or 0)
+    )
+
     approved = (
         candidate_rate >= current_rate + ADAPTIVE_MIN_EDGE
         and coverage >= ADAPTIVE_MIN_COVERAGE
@@ -1137,6 +1229,9 @@ def adaptive_retrain_if_ready(force_monthly: bool = False) -> dict:
         "reason_improved": bool(reason_improved),
         "reason_active_before": bool(policy.get("reason_policy", {}).get("active", False)),
         "oos_samples": len(test),
+        "strategy_weights_oos_quality_before": round(current_sw_quality, 4),
+        "strategy_weights_oos_quality_after": round(candidate_sw_quality, 4),
+        "strategy_weights_improved": bool(strategy_weights_improved),
         "train_samples": len(train),
         "approved": bool(approved),
         "at": datetime.now(timezone.utc).isoformat(),
@@ -1151,12 +1246,9 @@ def adaptive_retrain_if_ready(force_monthly: bool = False) -> dict:
 
     if approved:
         candidate["approved"] = True
-        if force_monthly:
-            candidate["last_monthly_period"] = _monthly_period_key()
-            candidate["last_monthly_sample_count"] = cycle_total
-            candidate["monthly_cycle_base_samples"] = len(completed)
-            candidate["monthly_cycle_total"] = 0
-            candidate["monthly_cycle_initialized"] = True
+        candidate["last_monthly_sample_count"] = cycle_total
+        candidate["adaptive_cycle_total"] = 0
+        candidate["monthly_cycle_total"] = 0
         candidate["validation_new_rate"] = candidate_rate
         candidate["validation_old_rate"] = current_rate
 
@@ -1209,15 +1301,14 @@ def adaptive_retrain_if_ready(force_monthly: bool = False) -> dict:
     else:
         # Strict all-or-nothing monthly approval: no adaptive sub-layer graduates
         # independently when the candidate as a whole fails its OOS gate.
+        # Strategy-weight changes remain shadow-only unless the complete
+        # candidate passes the existing global OOS gate.
         policy["samples_at_update"] = len(completed)
-        if force_monthly:
-            policy["last_monthly_period"] = _monthly_period_key()
-            policy["last_monthly_sample_count"] = cycle_total
-            # Consume this cumulative review cycle even if the candidate is
-            # rejected; the previous approved policy remains active.
-            policy["monthly_cycle_base_samples"] = len(completed)
-            policy["monthly_cycle_total"] = 0
-            policy["monthly_cycle_initialized"] = True
+        # Consume this 100-trade review cycle even if the candidate is rejected;
+        # the previous approved policy remains active until a later cycle wins.
+        policy["adaptive_cycle_anchor_samples"] = len(completed)
+        policy["adaptive_cycle_total"] = 0
+        policy["last_monthly_sample_count"] = cycle_total
         policy["history"] = (policy.get("history", []) + [result])[-20:]
         _save_adaptive_policy(policy)
         result["status"] = "rejected"
@@ -1299,6 +1390,7 @@ def register_daily_signal(sig: DailySignal) -> str:
             "entry_type": sig.entry_type,
             "matched_entry_types": list(getattr(sig, "matched_entry_types", []) or []),
             "strategy_scores": dict(getattr(sig, "strategy_scores", {}) or {}),
+            "strategy_component_scores": dict(getattr(sig, "strategy_component_scores", {}) or {}),
             "factors": list(sig.factor_keys or []),
             "h4_state": sig.h4_state,
             "volume_ratio": float(sig.volume_ratio),
@@ -1396,6 +1488,7 @@ def record_daily_outcome(
             "entry_type": target.get("entry_type"),
             "matched_entry_types": target.get("matched_entry_types") or [target.get("entry_type")],
             "strategy_scores": target.get("strategy_scores") or {},
+            "strategy_component_scores": target.get("strategy_component_scores") or {},
             "factors": target.get("factors") or [],
             "h4_state": target.get("h4_state", "محايد"),
             "volume_ratio": target.get("volume_ratio", 0),
@@ -2494,45 +2587,138 @@ def analyze_daily(
     except Exception:
         strategy_stats = {}
 
+    strategy_ctx = locals().copy()
+
     def _strategy_strength(name: str) -> float:
-        q = 70.0
+        """Independent 100-point setup-quality score; stock quality is scored separately."""
+        def clip(x, lo=0.0, hi=100.0):
+            return max(lo, min(hi, float(x)))
+
+        c = strategy_ctx
+        price_v = float(c.get("price", 0.0) or 0.0)
+        vr = float(c.get("vol_session_ratio", c.get("vol_ratio", 1.0)) or 1.0)
+        green = bool(c.get("last_green", False))
+        mom = float(c.get("mom", 0.0) or 0.0)
+        mstate = str(c.get("m15_state", c.get("h4_state", "محايد")))
+
         if name == "اختراق مؤكد":
-            q += min(18.0, float(breakout_quality) * 0.18) + (5.0 if vol_ratio >= 1.5 else 2.0)
+            bq = clip(c.get("breakout_quality", 0.0))
+            vol = clip((vr - 0.75) / 0.75 * 100)
+            q = 0.55*bq + 0.25*vol + 0.20*(100 if green else 0)
         elif name == "اختراق نطاق الافتتاح":
-            q += min(18.0, float(orb_quality) * 0.18) + (4.0 if above_vwap else 0.0)
+            oq = clip(c.get("orb_quality", 0.0))
+            vol = clip((vr - 0.75) / 0.75 * 100)
+            q = 0.55*oq + 0.25*vol + 0.20*(100 if green else 0)
         elif name == "إعادة اختبار":
-            q += (8.0 if prior_break else 0.0) + (7.0 if near_level else 0.0) + (5.0 if above_vwap else 0.0)
+            prior = 100 if c.get("prior_break", False) else 0
+            level = float(c.get("level_high", 0.0) or 0.0)
+            dist = abs(price_v-level)/max(price_v,1e-9)*100 if level > 0 else 0.7
+            near = clip((0.7-dist)/0.7*100)
+            reclaim = clip((price_v/max(level,1e-9)-0.997)/0.004*100) if level > 0 else 0
+            q = 0.25*prior + 0.35*near + 0.25*reclaim + 0.15*clip((vr-0.8)/0.6*100)
         elif name == "ارتداد VWAP":
-            q += (10.0 if vwap_touch else 0.0) + (7.0 if trend_up else 0.0) + min(6.0, max(0.0, vol_ratio-1.0)*6.0)
+            touch = 100 if c.get("vwap_touch", False) else 0
+            vwap = float(c.get("vwap_last", 0.0) or 0.0)
+            reclaim = clip((price_v/max(vwap,1e-9)-0.998)/0.004*100) if vwap > 0 else 0
+            q = 0.30*touch + 0.30*reclaim + 0.20*(100 if green else 0) + 0.10*clip((mom-0.05)/0.20*100) + 0.10*clip((vr-0.9)/0.6*100)
         elif name == "ارتداد EMA20":
-            q += (10.0 if ema_touch else 0.0) + (7.0 if trend_up else 0.0) + (5.0 if above_vwap else 0.0)
-        elif name == "سحب سيولة مع Displacement":
-            q += (12.0 if trend_up else 0.0) + (8.0 if vol_ratio >= 1.25 else 0.0) + (5.0 if above_vwap else 0.0)
+            touch = 100 if c.get("ema_touch", False) else 0
+            ema = float(c.get("e20", 0.0) or 0.0)
+            reclaim = clip((price_v/max(ema,1e-9)-1.001)/0.004*100) if ema > 0 else 0
+            q = 0.30*touch + 0.30*reclaim + 0.20*(100 if green else 0) + 0.10*(100 if mstate == "داعم" else 0) + 0.10*clip((vr-0.9)/0.6*100)
         elif name == "سحب سيولة":
-            q += (10.0 if above_vwap else 0.0) + (8.0 if vol_ratio >= 1.25 else 0.0)
+            sweep = 100 if c.get("liquidity_sweep", False) else 0
+            q = 0.35*sweep + 0.25*clip((vr-0.9)/0.7*100) + 0.20*(100 if green else 0) + 0.20*clip((mom-0.05)/0.25*100)
+        elif name == "سحب سيولة مع Displacement":
+            sweep = 100 if c.get("liquidity_sweep", False) else 0
+            disp = 100 if c.get("liquidity_displacement", False) else 0
+            q = 0.20*sweep + 0.40*disp + 0.20*clip((vr-1.0)/0.75*100) + 0.10*clip((mom-0.08)/0.25*100) + 0.10*(100 if green else 0)
         elif name == "ضغط ثم انفجار":
-            q += (10.0 if vol_ratio >= 1.2 else 0.0) + (8.0 if trend_up else 0.0) + (5.0 if above_vwap else 0.0)
+            match = 100 if c.get("compression_expansion", False) else 0
+            q = 0.40*match + 0.25*clip((vr-1.2)/0.8*100) + 0.20*(100 if green else 0) + 0.15*clip((mom-0.05)/0.25*100)
         elif name == "استمرار الزخم":
-            q += (10.0 if trend_up else 0.0) + (8.0 if vol_ratio >= 1.2 else 0.0) + (6.0 if mom > 0.10 else 0.0)
+            q = 0.45*clip((mom-0.08)/0.50*100) + 0.30*clip((vr-1.0)/0.75*100) + 0.15*(100 if green else 0) + 0.10*(100 if mstate == "داعم" else 0)
         elif name == "علم صاعد":
-            q += (10.0 if trend_up else 0.0) + (8.0 if vol_ratio >= 1.2 else 0.0) + (5.0 if above_vwap else 0.0)
+            impulse = clip((float(c.get("impulse_gain",0.0) or 0.0)-1.0)/2.0*100)
+            flag = clip((2.0-float(c.get("flag_range",2.0) or 2.0))/1.5*100)
+            q = 0.30*impulse + 0.30*flag + 0.20*(100 if green else 0) + 0.20*clip((vr-0.9)/0.7*100)
         elif name == "استعادة مستوى":
-            q += (8.0 if key_level_near else 0.0) + (8.0 if above_vwap else 0.0) + (5.0 if trend_up else 0.0)
-        elif name == "استعادة بعد فشل ORB":
-            q += (10.0 if orb_high > 0 else 0.0) + (8.0 if above_vwap else 0.0) + (5.0 if trend_up else 0.0)
-        elif name == "استمرار ABC":
-            q += (10.0 if trend_up else 0.0) + (8.0 if above_vwap else 0.0) + (5.0 if vol_ratio >= 1.2 else 0.0)
+            match = 100 if c.get("resistance_reclaim", False) else 0
+            level = float(c.get("reclaim_level", 0.0) or 0.0)
+            dist = abs(price_v-level)/max(price_v,1e-9)*100 if level > 0 else 1.0
+            reclaim = clip((0.6-dist)/0.6*100)
+            q = 0.35*match + 0.25*reclaim + 0.20*(100 if green else 0) + 0.20*clip((vr-0.9)/0.7*100)
         elif name == "دخول بعد Opening Drive":
-            q += (10.0 if trend_up else 0.0) + (8.0 if above_vwap else 0.0) + (5.0 if vol_ratio >= 1.2 else 0.0)
-        elif name == "استعادة قمة الفترة":
-            q += (10.0 if trend_up else 0.0) + (8.0 if above_vwap else 0.0) + (5.0 if vol_ratio >= 1.2 else 0.0)
-        elif name == "دخول مبكر":
-            q += (8.0 if trend_up else 0.0) + (7.0 if above_vwap else 0.0) + (5.0 if ext_tmp <= 1.5 else 0.0)
-        stat = strategy_stats.get(name, {}) if isinstance(strategy_stats, dict) else {}
-        samples = int(stat.get("samples", 0) or 0)
-        win_rate = float(stat.get("win_rate", 0.0) or 0.0)
-        if samples >= 8:
-            q += max(-4.0, min(4.0, (win_rate - 0.50) * 8.0))
+            drive = clip((float(c.get("drive_return",0.0) or 0.0)-1.0)/2.0*100)
+            pb = float(c.get("pullback_from_high", 99.0) or 99.0)
+            pull = clip((2.5-abs(pb-1.0))/1.5*100)
+            q = 0.35*drive + 0.25*pull + 0.20*(100 if green else 0) + 0.20*clip((vr-0.9)/0.7*100)
+        elif name in {"استعادة قمة اليوم", "استعادة قمة الفترة"}:
+            match = 100 if c.get("hod_reclaim", False) else 0
+            level = float(c.get("hod_level", 0.0) or 0.0)
+            dist = abs(price_v-level)/max(price_v,1e-9)*100 if level > 0 else 1.0
+            reclaim = clip((0.6-dist)/0.6*100)
+            q = 0.35*match + 0.25*reclaim + 0.20*(100 if green else 0) + 0.20*clip((vr-0.9)/0.7*100)
+        elif name == "استعادة بعد فشل ORB":
+            failed = 100 if c.get("orb_failed_reclaim", False) else 0
+            # Failure and reclaim are structural components; do not reward merely having orb_high.
+            orbq = clip(float(c.get("orb_quality", 0.0) or 0.0))
+            orb_high = float(c.get("orb_high", 0.0) or 0.0)
+            reclaim = clip((price_v/max(orb_high,1e-9)-1.001)/0.004*100) if orb_high > 0 else 0
+            q = 0.25*failed + 0.25*orbq + 0.30*reclaim + 0.10*clip((mom-0.05)/0.25*100) + 0.10*clip((vr-0.9)/0.7*100)
+        elif name == "استمرار ABC":
+            a = clip((float(c.get("a_gain",0.0) or 0.0)-0.70)/1.5*100)
+            b = clip(100-abs(float(c.get("b_retrace",42.5) or 42.5)-42.5)/22.5*100)
+            cb = 100 if c.get("c_break", False) else 0
+            q = 0.25*a + 0.25*b + 0.30*cb + 0.10*clip((mom-0.05)/0.25*100) + 0.10*clip((vr-0.9)/0.7*100)
+        else:  # دخول مبكر
+            er = float(c.get("early_range",3.0) or 3.0)
+            early_range = clip((3.0-er)/2.0*100)
+            near = 100 if c.get("early_near_resistance", False) else 0
+            holding = 100 if c.get("early_holding", False) else 0
+            q = 0.30*early_range + 0.25*near + 0.20*holding + 0.15*clip((mom-0.05)/0.25*100) + 0.10*(100 if green else 0)
+
+        # Raw 0-100 component values are kept separate from the weighted score.
+        if name == "اختراق مؤكد":
+            components = {"breakout_quality": bq, "volume": vol, "candle": 100 if green else 0}
+        elif name == "اختراق نطاق الافتتاح":
+            components = {"orb_quality": oq, "volume": vol, "candle": 100 if green else 0}
+        elif name == "إعادة اختبار":
+            components = {"prior_break": prior, "near_level": near, "reclaim": reclaim, "volume": clip((vr-0.8)/0.6*100)}
+        elif name == "ارتداد VWAP":
+            components = {"touch": touch, "reclaim": reclaim, "candle": 100 if green else 0, "momentum": clip((mom-0.05)/0.20*100), "volume": clip((vr-0.9)/0.6*100)}
+        elif name == "ارتداد EMA20":
+            components = {"touch": touch, "reclaim": reclaim, "candle": 100 if green else 0, "higher_tf": 100 if mstate == "داعم" else 0, "volume": clip((vr-0.9)/0.6*100)}
+        elif name == "سحب سيولة":
+            components = {"sweep": sweep, "volume": clip((vr-0.9)/0.7*100), "candle": 100 if green else 0, "momentum": clip((mom-0.05)/0.25*100)}
+        elif name == "سحب سيولة مع Displacement":
+            components = {"sweep": sweep, "displacement": disp, "volume": clip((vr-1.0)/0.75*100), "momentum": clip((mom-0.08)/0.25*100), "candle": 100 if green else 0}
+        elif name == "ضغط ثم انفجار":
+            components = {"match": match, "volume": clip((vr-1.2)/0.8*100), "candle": 100 if green else 0, "momentum": clip((mom-0.05)/0.25*100)}
+        elif name == "استمرار الزخم":
+            components = {"momentum": clip((mom-0.08)/0.50*100), "volume": clip((vr-1.0)/0.75*100), "candle": 100 if green else 0, "higher_tf": 100 if mstate == "داعم" else 0}
+        elif name == "علم صاعد":
+            components = {"impulse": impulse, "flag": flag, "candle": 100 if green else 0, "volume": clip((vr-0.9)/0.7*100)}
+        elif name == "استعادة مستوى":
+            components = {"match": match, "reclaim": reclaim, "candle": 100 if green else 0, "volume": clip((vr-0.9)/0.7*100)}
+        elif name == "دخول بعد Opening Drive":
+            components = {"drive": drive, "pullback": pull, "candle": 100 if green else 0, "volume": clip((vr-0.9)/0.7*100)}
+        elif name in {"استعادة قمة اليوم", "استعادة قمة الفترة"}:
+            components = {"match": match, "reclaim": reclaim, "candle": 100 if green else 0, "volume": clip((vr-0.9)/0.7*100)}
+        elif name == "استعادة بعد فشل ORB":
+            components = {"failed_reclaim": failed, "orb_quality": orbq, "reclaim": reclaim, "momentum": clip((mom-0.05)/0.25*100), "volume": clip((vr-0.9)/0.7*100)}
+        elif name == "استمرار ABC":
+            components = {"a": a, "b": b, "c_break": cb, "momentum": clip((mom-0.05)/0.25*100), "volume": clip((vr-0.9)/0.7*100)}
+        else:
+            components = {"early_range": early_range, "near_resistance": near, "holding": holding, "momentum": clip((mom-0.05)/0.25*100), "candle": 100 if green else 0}
+
+        # Baseline remains identical until the optional Strategy Adaptive layer
+        # is explicitly OOS-approved.
+        strategy_component_scores[name] = dict(components)
+        q = _weighted_strategy_score(components, _strategy_weights_for(policy_for_strategy, name))
+
+        # Strategy performance statistics are used by the Adaptive learner;
+        # they no longer add a separate live +/-3 bias to the Strategy Score.
         return round(max(0.0, min(100.0, q)), 2)
 
     def _strategy_identity(name: str) -> float:
@@ -2564,6 +2750,7 @@ def analyze_daily(
         return round(max(0.0, min(120.0, identity.get(name, 0.0))), 2)
 
     strategy_identity_scores = {et: _strategy_identity(et) for et in matched_entry_types}
+    strategy_component_scores: dict[str, dict[str, float]] = {}
     strategy_scores = {et: _strategy_strength(et) for et in matched_entry_types}
     entry_order = {et: i for i, et in enumerate(ENTRY_TYPES)}
     # When strategies overlap, prefer the more structurally specific setup only
@@ -3179,6 +3366,7 @@ def analyze_daily(
         entry_emoji=entry_emoji,
         matched_entry_types=matched_entry_types,
         strategy_scores=strategy_scores,
+        strategy_component_scores=strategy_component_scores,
         h4_state=h4_state,
         learning_adjustment=round(total_learning_adj, 2),
         resistance_tp1=round(tp1, 4),
