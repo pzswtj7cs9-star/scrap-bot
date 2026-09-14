@@ -212,7 +212,9 @@ def _completed_learning(records: list[dict] | None = None) -> list[dict]:
         if r.get("record_type") == "outcome"
         and r.get("status") in {"tp1", "stop", "timeout"}
     ]
-    return completed[-LEARNING_LOOKBACK:]
+    # Adaptive learning uses the full accumulated history; the 100-new-trade
+    # cycle gate controls when a new generation may be trained.
+    return completed
 
 
 
@@ -1079,6 +1081,9 @@ def adaptive_retrain_if_ready(force_monthly: bool = False) -> dict:
                 -LEARNING_MAX_ADJUSTMENT,
                 min(LEARNING_MAX_ADJUSTMENT, (_rate(subset) - baseline_rate) * 10.0),
             )
+    # Preserve the learned factor-vs-overall signal inside the single
+    # Adaptive policy; it becomes live only if this candidate passes OOS.
+    candidate["legacy_factor_bias"] = legacy_factor_bias
     candidate.setdefault("interaction_weights", {})
     # Always refresh per-strategy statistics so all 16 setups are observable.
     candidate["strategy_stats"] = _strategy_stats(completed)
@@ -1247,6 +1252,7 @@ def adaptive_retrain_if_ready(force_monthly: bool = False) -> dict:
     if approved:
         candidate["approved"] = True
         candidate["last_monthly_sample_count"] = cycle_total
+        candidate["adaptive_cycle_anchor_samples"] = len(completed)
         candidate["adaptive_cycle_total"] = 0
         candidate["monthly_cycle_total"] = 0
         candidate["validation_new_rate"] = candidate_rate

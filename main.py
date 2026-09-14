@@ -1319,8 +1319,8 @@ async def monthly_learning_job(context: ContextTypes.DEFAULT_TYPE) -> None:
         daily_path = str(DAILY_ADAPTIVE_POLICY_FILE)
         intra_old = _load_adaptive_policy_snapshot(intra_path)
         daily_old = _load_adaptive_policy_snapshot(daily_path)
-        intra_cycle_before = int(intra_old.get("monthly_cycle_total", 0) or 0)
-        daily_cycle_before = int(daily_old.get("monthly_cycle_total", 0) or 0)
+        intra_cycle_before = int(intra_old.get("adaptive_cycle_total", 0) or 0)
+        daily_cycle_before = int(daily_old.get("adaptive_cycle_total", 0) or 0)
 
         # الـAnalyzer هو صاحب قرار التعلم والاعتماد؛ Main لا يغيّر Policy.
         try:

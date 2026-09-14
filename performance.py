@@ -85,13 +85,20 @@ class PerformanceLog:
             "time_to_result_min": None,
             "quote_source": getattr(sig, "quote_source", "") or "",
         }
-        # التعلم اللحظي مستقل عن السوينغ: نحفظ لقطة الإشارة عند تسجيلها.
+        # التعلم مستقل حسب نوع الإشارة: نحفظ لقطة الإشارة عند تسجيلها.
         if row["mode"] == "intraday":
             try:
                 from analyzer_intraday import register_intraday_signal
                 row["learning_id"] = register_intraday_signal(sig)
             except Exception as exc:
                 log.warning("تعذر تسجيل تعلم اللحظي %s: %s", sig.symbol, exc)
+                row["learning_id"] = row["id"]
+        else:
+            try:
+                from analyzer import register_daily_signal
+                row["learning_id"] = register_daily_signal(sig)
+            except Exception as exc:
+                log.warning("تعذر تسجيل تعلم اليومي %s: %s", sig.symbol, exc)
                 row["learning_id"] = row["id"]
 
         rows.append(row)
@@ -729,7 +736,7 @@ class PerformanceLog:
         return s
 
     @staticmethod
-    def _period_report_text(title: str, stats: dict[str, Any], intraday: bool = False) -> str:
+    def _period_report_text(title: str, stats: dict[str, Any], rows: list[dict[str, Any]] | None = None, intraday: bool = False) -> str:
         lines = [title, f"🔔 الإشارات: {stats['signals']}"]
         if intraday:
             lines.append(f"🎯 TP1: {stats['tp1']} | 🛑 وقف: {stats['stop']} | ⚪ إغلاق عادي: {stats['normal']}")
@@ -743,7 +750,7 @@ class PerformanceLog:
             f"📉 أقصى تراجع: -{stats['max_dd']:.2f}%",
         ]
 
-        best = PerformanceLog._best_strategy_stats(rows)
+        best = PerformanceLog._best_strategy_stats(rows or [])
         if best:
             best_name = PerformanceLog._strategy_name_ar(
                 best["strategy"], intraday=intraday
@@ -800,7 +807,7 @@ class PerformanceLog:
             except Exception:
                 continue
         stats = self._period_stats(selected)
-        return self._period_report_text(title, stats, intraday=(mode == "intraday"))
+        return self._period_report_text(title, stats, selected, intraday=(mode == "intraday"))
 
     def daily_report(self, day: str | None = None) -> str:
         """ملخص اليومي/السوينغ لليوم المحدد."""
@@ -816,7 +823,7 @@ class PerformanceLog:
                     row_mode = r.get("mode") or ("intraday" if "intraday" in str(r.get("source") or "") else "swing")
                     if d == day and row_mode == "swing": selected.append(r)
                 except Exception: continue
-            return self._period_report_text("🌆 ملخص اليومي — اليوم", self._period_stats(selected), intraday=False)
+            return self._period_report_text("🌆 ملخص اليومي — اليوم", self._period_stats(selected), selected, intraday=False)
         return self._report_for_period("day", "🌆 ملخص اليومي — اليوم", "swing")
 
     def weekly_swing_report(self) -> str:
@@ -839,7 +846,7 @@ class PerformanceLog:
                     row_mode = r.get("mode") or ("intraday" if "intraday" in str(r.get("source") or "") else "swing")
                     if d == day and row_mode == "intraday": selected.append(r)
                 except Exception: continue
-            return self._period_report_text("⚡ ملخص اللحظي — اليوم", self._period_stats(selected), intraday=True)
+            return self._period_report_text("⚡ ملخص اللحظي — اليوم", self._period_stats(selected), selected, intraday=True)
         return self._report_for_period("day", "⚡ ملخص اللحظي — اليوم", "intraday")
 
     def weekly_report(self) -> str:
