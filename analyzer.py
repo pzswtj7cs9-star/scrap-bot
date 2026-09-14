@@ -1741,6 +1741,23 @@ def _market_alignment(fetch_intraday) -> tuple[bool, str]:
     )
     return True, "SPY/QQQ مختلطان يوميًا"
 
+def get_daily_market_context() -> tuple[bool, str, str]:
+    """Return the exact Daily market state used by the Daily engine.
+
+    This is a read-only public wrapper for Main so display/gating does not
+    use the separate generic market.py regime.
+    Returns: (market_ok, market_state, market_condition).
+    """
+    try:
+        from market_data import fetch_intraday
+        ok, state = _market_alignment(fetch_intraday)
+        condition = _daily_market_condition(state)
+        return bool(ok), str(state), str(condition)
+    except Exception as exc:
+        log.warning("Daily market context unavailable: %s", exc)
+        return False, "بيانات SPY/QQQ غير متاحة", "غير مؤكد"
+
+
 def _daily_market_condition(market_state: str) -> str:
     """Map the benchmark state to the daily policy regime.
 
@@ -3188,8 +3205,8 @@ def format_daily_ar(sig: DailySignal, min_score: int = DAILY_MIN_SCORE) -> str:
     arrow = "▲" if sig.change_pct >= 0 else "▼"
     market_map = {
         "قوي": "🟢 قوي",
-        "إيجابي_تحت_VWAP": "🟡 إيجابي",
-        "مختلط": "🟠 مختلط",
+        "إيجابي_تحت_VWAP": "🟠 إيجابي",
+        "مختلط": "🟡 مختلط",
         "ضعيف": "🔴 ضعيف",
         "غير مؤكد": "⚪️ غير مؤكد",
     }

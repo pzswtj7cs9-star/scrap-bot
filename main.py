@@ -39,6 +39,7 @@ from analyzer import (
     scan_symbols,
     register_daily_signal,
     ADAPTIVE_POLICY_FILE as DAILY_ADAPTIVE_POLICY_FILE,
+    get_daily_market_context,
 )
 from analyzer_intraday import (
     INTRADAY_MIN_SCORE,
@@ -49,6 +50,7 @@ from analyzer_intraday import (
     monthly_self_optimization,
     get_live_entry_price,
     ADAPTIVE_POLICY_FILE as INTRADAY_ADAPTIVE_POLICY_FILE,
+    get_intraday_market_context,
 )
 from backtest import run_backtest
 from charting import build_signal_chart
@@ -370,22 +372,44 @@ def next_alert_text(state: dict) -> str:
     return f"التالي بعد نحو {wait:.0f} دقيقة (نيويورك {nxt.strftime('%H:%M')})"
 
 
+
+
+def _daily_market_display_context() -> tuple[bool, str, str, int, str]:
+    """Return the Daily analyzer market state and its exact policy floor for display."""
+    ok, state, condition = get_daily_market_context()
+    floors = {
+        "قوي": 82,
+        "إيجابي_تحت_VWAP": 85,
+        "مختلط": 86,
+        "ضعيف": 92,
+        "غير مؤكد": 92,
+    }
+    effective_min = max(MIN_SCORE, floors.get(condition, 92))
+    labels = {
+        "قوي": "🟢 قوي",
+        "إيجابي_تحت_VWAP": "🟠 إيجابي",
+        "مختلط": "🟡 مختلط",
+        "ضعيف": "🔴 ضعيف",
+        "غير مؤكد": "⚪️ غير مؤكد",
+    }
+    return bool(ok), str(state), str(condition), int(effective_min), labels.get(condition, "⚪️ غير مؤكد")
+
 def today_summary() -> str:
     state = load_state()
     sent = state["sent"]
     scores = state.get("scores", {})
-    regime = get_market_regime("SPY")
+    _, _, _, effective_min, market_label = _daily_market_display_context()
     lines = [
         "📡 " + session_label(),
-        regime_label(),
-        f"🎯 حد التنبيه الأساسي: {MIN_SCORE}/100 → المعدّل الآن: {regime['min_score_adj']}",
+        f"{market_label} | نظام السوق",
+        f"🎯 حد التنبيه الأساسي: {MIN_SCORE}/100 → المعدّل الآن: {effective_min}",
         f"⏱ إرسال: سهم واحد كل {ALERT_EVERY_MINUTES} دقيقة",
         f"📦 حصة اليوم: {len(sent)}/{DAILY_MAX}",
         f"⏳ المتبقي: {remaining_slots()}",
         f"🕒 {next_alert_text(state)}",
         f"🚫 يتجنب الإعلانات خلال {EARNINGS_DAYS} يوم",
         f"🔁 لا يكرر السهم قبل {COOLDOWN_DAYS} أيام تداول",
-        f"🤖 تنبيهات تلقائية: {'مفعّلة' if regime['allow_auto'] else 'موقوفة (سوق هابط)'}",
+        "🤖 تنبيهات تلقائية: مفعّلة",
         "",
     ]
     if sent:
@@ -658,10 +682,11 @@ async def analyze_and_reply(update: Update, symbol: str) -> None:
         near, edt = await asyncio.to_thread(is_near_earnings, symbol, EARNINGS_DAYS)
         if near:
             extra += f"\n\n🚫 قرب إعلان أرباح ({edt}) — تجنّب الدخول التلقائي."
-        regime = await asyncio.to_thread(get_market_regime, "SPY")
-        extra += f"\n\n{regime_label()}"
+        _, _, _, effective_min, market_label = await asyncio.to_thread(_daily_market_display_context)
+        extra += f"\n\n{market_label} | نظام السوق"
         sig = await asyncio.to_thread(analyze, symbol, display_name(symbol), True)
-        await msg.edit_text(format_signal_ar(sig, regime["min_score_adj"]) + extra)
+        signal_min = max(MIN_SCORE, {"قوي": 82, "إيجابي_تحت_VWAP": 85, "مختلط": 86, "ضعيف": 92, "غير مؤكد": 92}.get(str(getattr(sig, "market_condition", "غير مؤكد") or "غير مؤكد"), effective_min))
+        await msg.edit_text(format_signal_ar(sig, signal_min) + extra)
         path = await asyncio.to_thread(build_signal_chart, sig, CHART_DIR)
         if path and path.exists():
             with open(path, "rb") as f:
@@ -700,30 +725,29 @@ async def run_scan_message(target_message, symbols: list[str]) -> None:
 async def _run_scan_message_locked(target_message, symbols: list[str]) -> None:
     global LAST_DAILY_SCAN_ATTEMPT
     LAST_DAILY_SCAN_ATTEMPT = now_ny()
-    regime = await asyncio.to_thread(get_market_regime, "SPY")
+    _, _, _, effective_min, market_label = await asyncio.to_thread(_daily_market_display_context)
     status = await target_message.reply_text(
-        f"{session_label()}\n{regime_label()}\n"
-        f"جاري الترتيب (حد {regime['min_score_adj']} + بدون إعلانات قريبة)..."
+        f"{session_label()}\n{market_label} | نظام السوق\n"
+        f"جاري الترتيب (حد {MIN_SCORE} + بدون إعلانات قريبة)..."
     )
-    # Daily V2 scan API is (symbols, names, min_score, limit).
-    # The previous main.py still used the old analyzer signature, which raised
-    # a TypeError inside the Telegram handler and left /scan waiting forever.
+    # Analyzer owns the Daily market policy and adjusts the threshold itself.
     hits = await asyncio.to_thread(
         scan_symbols,
         symbols,
         HALAL_STOCKS,
-        regime["min_score_adj"],
+        MIN_SCORE,
         DAILY_MAX,
     )
     if not hits:
         await status.edit_text(
-            f"لا يوجد تأكيد {regime['min_score_adj']}+ حاليًا.\n\n{today_summary()}"
+            f"لا يوجد تأكيد {effective_min}+ حاليًا.\n\n{today_summary()}"
         )
         return
     skip_txt = ""
     await status.edit_text(f"أقوى {len(hits)} تأكيد:{skip_txt}")
     for i, sig in enumerate(hits, 1):
-        await target_message.reply_text(format_signal_ar(sig, regime["min_score_adj"]))
+        signal_min = max(MIN_SCORE, {"قوي": 82, "إيجابي_تحت_VWAP": 85, "مختلط": 86, "ضعيف": 92, "غير مؤكد": 92}.get(str(getattr(sig, "market_condition", "غير مؤكد") or "غير مؤكد"), effective_min))
+        await target_message.reply_text(format_signal_ar(sig, signal_min))
         path = await asyncio.to_thread(build_signal_chart, sig, CHART_DIR)
         if path and path.exists():
             with open(path, "rb") as f:
@@ -752,8 +776,18 @@ async def cmd_scan_intra(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         LAST_INTRADAY_SCAN_ATTEMPT = now_ny()
         hits = await asyncio.to_thread(_run)
     if not hits:
+        _, _, market_condition = await asyncio.to_thread(get_intraday_market_context)
+        market_labels = {
+            "قوي": "🟢 قوي",
+            "إيجابي_تحت_VWAP": "🟠 إيجابي",
+            "مختلط": "🟡 مختلط",
+            "ضعيف": "🔴 ضعيف",
+            "غير مؤكد": "⚪️ غير مؤكد",
+        }
+        market_label = market_labels.get(market_condition, "⚪️ غير مؤكد")
         await msg.edit_text(
             f"لا مرشحين لحظيين الآن.\n{session_label()}\n"
+            f"{market_label} | نظام السوق\n"
             f"حد {INTRADAY_MIN_SCORE} | فوق VWAP | نافذة بعد الافتتاح وقبل الإغلاق"
         )
         return
@@ -825,14 +859,9 @@ async def live_scan_job(context: ContextTypes.DEFAULT_TYPE) -> None:
 
     async with _scan_lock:
         LAST_DAILY_SCAN_ATTEMPT = now_ny()
-        # ---- فلتر نظام السوق ----
-        regime = await asyncio.to_thread(get_market_regime, "SPY")
-        if not regime.get("allow_auto", True):
-            log.info("live_scan skipped — market regime bear: %s", regime.get("detail"))
-            return
-
-        effective_min = max(MIN_SCORE, int(regime.get("min_score_adj", MIN_SCORE)))
-        effective_min = AUTO.effective_floor(effective_min)
+        # Daily analyzer owns the market state/policy. Main does not override it
+        # with the separate generic market.py regime.
+        effective_min = AUTO.effective_floor(MIN_SCORE)
 
         state = load_state()
         already = set(state["sent"])
@@ -863,10 +892,19 @@ async def live_scan_job(context: ContextTypes.DEFAULT_TYPE) -> None:
         # لا نسجل الإشارة كـ"مُرسلة" قبل نجاح Telegram فعلياً.
         # هذا يمنع ضياع التنبيه إذا فشل الإرسال.
         slot = len(state["sent"]) + 1
+        market_labels = {
+            "قوي": "🟢 قوي",
+            "إيجابي_تحت_VWAP": "🟠 إيجابي",
+            "مختلط": "🟡 مختلط",
+            "ضعيف": "🔴 ضعيف",
+            "غير مؤكد": "⚪️ غير مؤكد",
+        }
+        signal_market_condition = str(getattr(sig, "market_condition", "") or "غير مؤكد")
+        market_label = market_labels.get(signal_market_condition, "⚪️ غير مؤكد")
         header = (
             f"🔔 سوينغ/يومي — الدفعة {slot}/{DAILY_MAX}\n"
             f"{session_label()}\n"
-            f"{regime_label()}\n"
+            f"{market_label} | نظام السوق\n"
             f"النوع: يومي V2 (أسبوعي + يومي + 4س) | التالي بعد {ALERT_EVERY_MINUTES} د"
         )
         body = format_signal_ar(sig, effective_min)
@@ -971,9 +1009,19 @@ async def live_scan_intraday_job(context: ContextTypes.DEFAULT_TYPE) -> None:
         if live_entry > 0:
             sig.alert_entry_price = live_entry
         slot = len(state.get("sent_intraday") or []) + 1
+        market_labels = {
+            "قوي": "🟢 قوي",
+            "إيجابي_تحت_VWAP": "🟠 إيجابي",
+            "مختلط": "🟡 مختلط",
+            "ضعيف": "🔴 ضعيف",
+            "غير مؤكد": "⚪️ غير مؤكد",
+        }
+        signal_market_condition = str(getattr(sig, "market_condition", "") or "غير مؤكد")
+        market_label = market_labels.get(signal_market_condition, "⚪️ غير مؤكد")
         header = (
             f"⚡ لحظي — الدفعة {slot}/{INTRADAY_MAX}\n"
             f"{session_label()}\n"
+            f"{market_label} | نظام السوق\n"
             f"النوع: لحظي (ساعة + 5د)\n"
             f"{getattr(sig, 'entry_emoji', '🟢')} {getattr(sig, 'entry_type', 'دخول')}\n"
             f"فاصل {INTRADAY_EVERY_MINUTES} د | يفضّل الخروج قبل الإغلاق"

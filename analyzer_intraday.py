@@ -1589,6 +1589,18 @@ def _market_regime_from_state(market_state: str) -> str:
     return "غير مؤكد"
 
 
+def get_intraday_market_context() -> tuple[bool, str, str]:
+    """Return the exact Intraday SPY+QQQ market state used by the engine."""
+    try:
+        from market_data import fetch_intraday
+        ok, state = _market_alignment(fetch_intraday)
+        condition = _market_regime_from_state(state)
+        return bool(ok), str(state), str(condition)
+    except Exception as exc:
+        log.warning("Intraday market context unavailable: %s", exc)
+        return False, "بيانات SPY/QQQ غير متاحة", "غير مؤكد"
+
+
 def _market_relative_returns(fetch_intraday) -> tuple[float, float, float]:
     import time
     global _MARKET_RELATIVE_CACHE
@@ -3138,8 +3150,8 @@ def format_intraday_ar(sig: IntradaySignal, min_score: int = INTRADAY_MIN_SCORE)
     arrow = "▲" if sig.change_pct >= 0 else "▼"
     market_map = {
         "قوي": "🟢 قوي",
-        "إيجابي_تحت_VWAP": "🟡 إيجابي",
-        "مختلط": "🟠 مختلط",
+        "إيجابي_تحت_VWAP": "🟠 إيجابي",
+        "مختلط": "🟡 مختلط",
         "ضعيف": "🔴 ضعيف",
         "غير مؤكد": "⚪️ غير مؤكد",
     }
@@ -3150,9 +3162,9 @@ def format_intraday_ar(sig: IntradaySignal, min_score: int = INTRADAY_MIN_SCORE)
         if "داعمان" in state:
             market_label = "🟢 قوي"
         elif "إيجابيان" in state:
-            market_label = "🟡 إيجابي"
+            market_label = "🟠 إيجابي"
         elif "مختلطان" in state:
-            market_label = "🟠 مختلط"
+            market_label = "🟡 مختلط"
         elif "ضعيفان" in state:
             market_label = "🔴 ضعيف"
         else:
