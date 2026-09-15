@@ -3670,7 +3670,7 @@ def scan_daily(
                 stage2_rejects["quality"] += 1
                 qreasons = getattr(sig, "quality_reasons", None) or []
                 log.info(
-                    "DAILY QUALITY REJECT | %s | score=%s | reasons=%s | ext=%.2f%% | atr=%.2f%% | vol=%.2fx | h4=%s | market=%s | tp1R_RAW=%.10f | min_tp1_r=%.10f",
+                    "DAILY QUALITY REJECT | %s | score=%s | reasons=%s | ext=%.2f%% | atr=%.2f%% | vol=%.2fx | h4=%s | market=%s | tp1R=%.2f",
                     sig.symbol, sig.score, qreasons or ["unspecified"],
                     float(getattr(sig, "ext_sma20", 0) or 0),
                     float(getattr(sig, "atr_pct", 0) or 0),
@@ -3678,7 +3678,6 @@ def scan_daily(
                     getattr(sig, "h4_state", "?"),
                     getattr(sig, "market_state", "?"),
                     float(getattr(sig, "reward_r", 0) or 0),
-                    float(policy.get("min_tp1_r", 1.2)),
                 )
                 continue
             if sig.news_state == "negative":
