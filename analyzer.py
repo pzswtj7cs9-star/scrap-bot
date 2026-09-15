@@ -3245,8 +3245,12 @@ def analyze_daily(
             risk = price - stop
             tp1 = price + risk * 1.20
 
-    tp2 = price + risk * 2.0
-    tp3 = price + risk * 3.0
+    # Keep targets strictly ordered even when Adaptive Exit raises TP1 above 2R.
+    # This does not change strategy selection or the Adaptive TP1 rule.
+    tp2_r = max(2.0, reward_r + 1e-6)
+    tp3_r = max(3.0, tp2_r + 1e-6)
+    tp2 = price + risk * tp2_r
+    tp3 = price + risk * tp3_r
     risk_pct = risk / price * 100
     reward_r = (tp1 - price) / risk if risk else 0.0
     tp1_distance_pct = (tp1 - price) / price * 100 if price else 0.0
@@ -3702,6 +3706,23 @@ def scan_daily(
                 stage2_rejects["liquidity"] += 1
                 log.warning("DAILY LIQUIDITY CHECK FAILED | %s | %s", sig.symbol, str(exc))
                 continue
+            # DIAGNOSTIC ONLY: expose already-computed strategy decision.
+            # No matching, scoring, ranking, or selection logic is changed.
+            _audit_scores = dict(getattr(sig, "strategy_scores", {}) or {})
+            _audit_scores_text = ", ".join(
+                f"{k}={float(v):.1f}"
+                for k, v in sorted(
+                    _audit_scores.items(),
+                    key=lambda kv: (-float(kv[1]), str(kv[0]))
+                )
+            )
+            log.info(
+                "DAILY STRATEGY AUDIT | %s | primary=%s | matched=%s | scores=%s",
+                sig.symbol,
+                getattr(sig, "entry_type", ""),
+                list(getattr(sig, "matched_entry_types", []) or []),
+                _audit_scores_text or "none",
+            )
             results.append(sig)
 
     # Score distribution diagnostics only. These values are observational and
