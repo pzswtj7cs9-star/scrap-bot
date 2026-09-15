@@ -48,8 +48,14 @@ class PerformanceLog:
             "symbol": sig.symbol,
             "name": sig.name,
             "source": source,
-            "mode": getattr(sig, "mode", None)
-            or ("intraday" if "intraday" in str(source) else "swing"),
+            # توحيد نوع الإشارة لسجل الأداء: اليومي يُعرض كسوينغ،
+            # بينما اللحظي يبقى intraday.
+            "mode": (
+                "intraday"
+                if str(getattr(sig, "mode", "") or "").lower() == "intraday"
+                or "intraday" in str(source).lower()
+                else "swing"
+            ),
             "entry_type": getattr(sig, "entry_type", "") or "",
             "opened_at": _now().isoformat(),
             "entry": round(float(getattr(sig, "alert_entry_price", 0.0) or sig.price), 4),

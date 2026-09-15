@@ -2721,6 +2721,43 @@ def analyze_intraday(
             -entry_order.get(et, 999),
         ),
     )
+
+    # DIAGNOSTIC ONLY: print the already-computed strategy decision immediately
+    # after primary selection. This does not alter matching, scoring, ranking,
+    # selection, or any trading rule.
+    _audit_scores = dict(strategy_scores or {})
+    _audit_scores_text = ", ".join(
+        f"{k}={float(v):.1f}"
+        for k, v in sorted(
+            _audit_scores.items(),
+            key=lambda kv: (-float(kv[1]), str(kv[0]))
+        )
+    )
+    _audit_tiebreak_text = ", ".join(
+        f"{k}:score={float(strategy_scores.get(k, 0.0)):.1f}"
+        f"/identity={float(strategy_identity_scores.get(k, 0.0)):.1f}"
+        f"/specificity={int(strategy_specificity.get(k, 0))}"
+        f"/order={int(entry_order.get(k, 999))}"
+        for k in sorted(
+            matched_entry_types,
+            key=lambda et: (
+                -float(strategy_scores.get(et, 0.0)),
+                -float(strategy_identity_scores.get(et, 0.0)),
+                -int(strategy_specificity.get(et, 0)),
+                int(entry_order.get(et, 999)),
+            )
+        )
+    )
+    log.info(
+        "INTRADAY STRATEGY AUDIT | %s | primary=%s | matched=%s | scores=%s | "
+        "tiebreak=%s",
+        symbol,
+        entry_type,
+        list(matched_entry_types or []),
+        _audit_scores_text or "none",
+        _audit_tiebreak_text or "none",
+    )
+
     entry_emoji = "🟡" if entry_type == "إعادة اختبار" else "🟢"
 
     reasons: list[str] = []
