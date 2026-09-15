@@ -3201,7 +3201,7 @@ def analyze_daily(
     stop = max(valid_stops) if valid_stops else price * 0.985
 
     risk = price - stop
-    min_risk = price * 0.015
+    min_risk = price * 0.006
     max_risk = price * 0.10
     if risk < min_risk:
         stop = price - min_risk
@@ -3253,7 +3253,7 @@ def analyze_daily(
     if tp1_distance_pct < 0.8:
         quality_ok = False
         warnings.append("TP1 قريب جدًا من الدخول")
-    if reward_r < float(policy.get("min_tp1_r", 1.2)):
+    if reward_r + 1e-9 < float(policy.get("min_tp1_r", 1.2)):
         quality_ok = False
         warnings.append("العائد إلى TP1 ضعيف")
     if news_state == "positive_strong" and news_momentum_ok:
