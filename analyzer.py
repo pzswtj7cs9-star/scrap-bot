@@ -2795,6 +2795,26 @@ def analyze_daily(
     if entry_type == "اختراق نطاق الافتتاح":
         breakout_quality = max(breakout_quality, orb_quality)
 
+    # DIAGNOSTIC ONLY: print the already-computed strategy decision immediately
+    # after primary selection. This does not alter matching, scoring, ranking,
+    # selection, or any trading rule.
+    _audit_scores = dict(strategy_scores or {})
+    _audit_scores_text = ", ".join(
+        f"{k}={float(v):.1f}"
+        for k, v in sorted(
+            _audit_scores.items(),
+            key=lambda kv: (-float(kv[1]), str(kv[0]))
+        )
+    )
+    log.info(
+        "DAILY STRATEGY AUDIT | %s | primary=%s | matched=%s | scores=%s",
+        symbol,
+        entry_type,
+        list(matched_entry_types or []),
+        _audit_scores_text or "none",
+    )
+
+
     reasons: list[str] = []
     warnings: list[str] = []
     score = 42.0
@@ -3706,23 +3726,6 @@ def scan_daily(
                 stage2_rejects["liquidity"] += 1
                 log.warning("DAILY LIQUIDITY CHECK FAILED | %s | %s", sig.symbol, str(exc))
                 continue
-            # DIAGNOSTIC ONLY: expose already-computed strategy decision.
-            # No matching, scoring, ranking, or selection logic is changed.
-            _audit_scores = dict(getattr(sig, "strategy_scores", {}) or {})
-            _audit_scores_text = ", ".join(
-                f"{k}={float(v):.1f}"
-                for k, v in sorted(
-                    _audit_scores.items(),
-                    key=lambda kv: (-float(kv[1]), str(kv[0]))
-                )
-            )
-            log.info(
-                "DAILY STRATEGY AUDIT | %s | primary=%s | matched=%s | scores=%s",
-                sig.symbol,
-                getattr(sig, "entry_type", ""),
-                list(getattr(sig, "matched_entry_types", []) or []),
-                _audit_scores_text or "none",
-            )
             results.append(sig)
 
     # Score distribution diagnostics only. These values are observational and
