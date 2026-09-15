@@ -3678,6 +3678,7 @@ def scan_daily(
                     getattr(sig, "h4_state", "?"),
                     getattr(sig, "market_state", "?"),
                     float(getattr(sig, "reward_r", 0) or 0),
+                    float(policy.get("min_tp1_r", 1.2)),
                 )
                 continue
             if sig.news_state == "negative":
