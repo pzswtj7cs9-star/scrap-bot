@@ -2822,306 +2822,55 @@ def analyze_daily(
         )
     )
 
-    # COMPETITION AUDIT ONLY:
-    # Diagnose why each of the 16 strategies did or did not reach the
-    # competition. This block is diagnostic-only and MUST NOT alter matching,
-    # scoring, ranking, selection, alerts, exits, learning, or market filters.
-    def _competition_fail_reasons(name: str) -> list[str]:
-        reasons = []
-
-        def need(ok: bool, label: str):
-            if not bool(ok):
-                reasons.append(label)
-
-        try:
-            if name == "إعادة اختبار":
-                need(prior_break, "لا يوجد كسر سابق مؤكد")
-                need(near_level, "السعر ليس قريباً من مستوى الكسر")
-                need(price >= level_high * 0.997 if level_high > 0 else False, "السعر دون مستوى الاستعادة المطلوب")
-                need(above_vwap, "تحت VWAP")
-                need(not failed, "فلتر failed نشط")
-
-            elif name == "اختراق نطاق الافتتاح":
-                need(orb_breakout, "لا يوجد اختراق ORB صالح")
-                need(orb_breakout_ok, "جودة/متابعة اختراق ORB غير كافية")
-                need(vol_ratio >= 1.0, f"الحجم {vol_ratio:.2f}x < 1.00x")
-
-            elif name == "اختراق مؤكد":
-                need(breakout_now, "لا يوجد اختراق للمقاومة الرئيسية الآن")
-                need(breakout_ok, "جودة الاختراق/المتابعة غير كافية")
-                need(vol_ratio >= 1.0, f"الحجم {vol_ratio:.2f}x < 1.00x")
-
-            elif name == "سحب سيولة مع Displacement":
-                need(support_level > 0, "لا يوجد مستوى دعم صالح للسحب")
-                if support_level > 0:
-                    swept = bool((today_d["Low"].astype(float).iloc[-5:-1] < support_level * 0.998).any())
-                    reclaimed = price >= support_level * 1.002
-                    need(swept, "لا يوجد sweep تحت الدعم")
-                    need(reclaimed, "لم تتم استعادة مستوى الدعم")
-                    if len(today_d) >= 4:
-                        cur = today_d.iloc[-1]
-                        prev3 = today_d.iloc[-4:-1]
-                        co, cc = float(cur["Open"]), float(cur["Close"])
-                        ch, cl = float(cur["High"]), float(cur["Low"])
-                        cr = max(ch - cl, price * 0.0001)
-                        cbod = abs(cc - co)
-                        cpos = (cc - cl) / cr
-                        medr = float((prev3["High"].astype(float) - prev3["Low"].astype(float)).clip(lower=0).median())
-                        disp_ok = bool(cc > co and cbod / cr >= 0.55 and cpos >= 0.75
-                                    and (medr <= 0 or cr >= medr * 1.35) and vol_ratio >= 1.25)
-                        need(disp_ok, "الـDisplacement غير مكتمل")
-                need(trend_up, "الاتجاه العام غير صاعد")
-                need(above_vwap, "تحت VWAP")
-                need(above_open, "تحت الافتتاح")
-                need(h4_state != "معاكس", "الإطار الأعلى معاكس")
-                need(market_ok, "فلتر السوق غير داعم")
-                need(not failed, "فلتر failed نشط")
-                need(mom > 0.08, f"الزخم {mom:.3f} <= 0.08")
-                need(ext_tmp <= 6.0, f"الامتداد {ext_tmp:.2f}% > 6%")
-
-            elif name == "سحب سيولة":
-                need(support_level > 0, "لا يوجد مستوى دعم صالح للسحب")
-                if support_level > 0:
-                    swept = bool((today_d.tail(3)["Low"].astype(float) < support_level * 0.998).any())
-                    reclaimed = price >= support_level * 1.002
-                    need(swept, "لا يوجد sweep تحت الدعم")
-                    need(reclaimed, "لم تتم استعادة مستوى الدعم")
-                need(last_green, "آخر شمعة ليست خضراء")
-                need(mom > 0.05, f"الزخم {mom:.3f} <= 0.05")
-                need(vol_ratio >= 1.0, f"الحجم {vol_ratio:.2f}x < 1.00x")
-                need(h4_state != "معاكس", "الإطار الأعلى معاكس")
-                need(not failed, "فلتر failed نشط")
-                need(above_vwap, "تحت VWAP")
-
-            elif name == "ضغط ثم انفجار":
-                comp_ok = False
-                exp_ok = False
-                if len(today_d) >= 10:
-                    prev = today_d.iloc[-9:-1]
-                    cur = today_d.iloc[-1]
-                    prev_ranges = (prev["High"].astype(float) - prev["Low"].astype(float)).clip(lower=0)
-                    cur_range = max(float(cur["High"]) - float(cur["Low"]), price * 0.0001)
-                    med_range = float(prev_ranges.median()) if len(prev_ranges) else 0.0
-                    comp_width = float(prev["High"].max() - prev["Low"].min()) / max(price, 1e-9) * 100
-                    cur_body = abs(float(cur["Close"]) - float(cur["Open"]))
-                    cur_pos = (float(cur["Close"]) - float(cur["Low"])) / cur_range
-                    comp_ok = bool(comp_width <= 2.2 and med_range > 0)
-                    exp_ok = bool(cur_range >= max(med_range * 1.35, price * 0.003)
-                                  and float(cur["Close"]) > float(cur["Open"])
-                                  and cur_pos >= 0.70 and vol_ratio >= 1.20
-                                  and cur_body / cur_range >= 0.45)
-                else:
-                    reasons.append("بيانات غير كافية (أقل من 10 شموع)")
-                need(comp_ok, "لا يوجد ضغط سعري ضمن النطاق")
-                need(exp_ok, "لا يوجد Expansion مؤكد بالحجم/الشمعة")
-                need(above_vwap, "تحت VWAP")
-                need(above_open, "تحت الافتتاح")
-                need(trend_up, "الاتجاه العام غير صاعد")
-                need(h4_state != "معاكس", "الإطار الأعلى معاكس")
-                need(market_ok, "فلتر السوق غير داعم")
-                need(not failed, "فلتر failed نشط")
-                need(ext_tmp <= 7.0, f"الامتداد {ext_tmp:.2f}% > 7%")
-
-            elif name == "استمرار الزخم":
-                if len(today_d) < 4:
-                    reasons.append("بيانات غير كافية (أقل من 4 شموع)")
-                else:
-                    tail4 = today_d.tail(4)
-                    closes = tail4["Close"].astype(float)
-                    opens = tail4["Open"].astype(float)
-                    highs = tail4["High"].astype(float)
-                    lows = tail4["Low"].astype(float)
-                    rising = bool(closes.iloc[-1] > closes.iloc[-2] > closes.iloc[-3])
-                    green_now = bool(closes.iloc[-1] >= opens.iloc[-1])
-                    rng = max(float(highs.iloc[-1] - lows.iloc[-1]), price * 0.0001)
-                    body = abs(float(closes.iloc[-1] - opens.iloc[-1]))
-                    pos = (float(closes.iloc[-1]) - float(lows.iloc[-1])) / rng
-                    prior_move = (float(closes.iloc[-2]) - float(closes.iloc[-4])) / max(float(closes.iloc[-4]), 1e-9) * 100
-                    need(rising, "الإغلاق ليس في تسلسل صاعد")
-                    need(green_now, "آخر شمعة ليست خضراء")
-                    need(prior_move >= 0.35, f"الحركة السابقة {prior_move:.2f}% < 0.35%")
-                    need(body / rng >= 0.45, "جسم الشمعة ضعيف")
-                    need(pos >= 0.65, "الإغلاق ليس قريباً من أعلى النطاق")
-                need(trend_up, "الاتجاه العام غير صاعد")
-                need(above_vwap, "تحت VWAP")
-                need(above_open, "تحت الافتتاح")
-                need(not failed, "فلتر failed نشط")
-                need(h4_state != "معاكس", "الإطار الأعلى معاكس")
-                need(market_ok, "فلتر السوق غير داعم")
-                need(not breakout_now, "يوجد اختراق؛ ليست حالة Momentum continuation")
-                need(mom > 0.08, f"الزخم {mom:.3f} <= 0.08")
-                need(vol_ratio >= 1.05, f"الحجم {vol_ratio:.2f}x < 1.05x")
-                need(ext_tmp <= 6.0, f"الامتداد {ext_tmp:.2f}% > 6%")
-
-            elif name == "علم صاعد":
-                if len(today_d) < 12:
-                    reasons.append("بيانات غير كافية (أقل من 12 شمعة)")
-                else:
-                    impulse = today_d.iloc[-12:-6]
-                    flag = today_d.iloc[-6:-1]
-                    io = float(impulse["Open"].iloc[0])
-                    ih = float(impulse["High"].max())
-                    ig = (ih - io) / max(io, 1e-9) * 100
-                    fh = float(flag["High"].max())
-                    fl = float(flag["Low"].min())
-                    fr = (fh - fl) / max(fh, 1e-9) * 100
-                    bf = price >= fh * 1.001
-                    need(ig >= 1.0, f"دفعة العلم {ig:.2f}% < 1.0%")
-                    need(fr <= 2.0, f"نطاق العلم {fr:.2f}% > 2.0%")
-                    need(bf, "لا يوجد اختراق للعلم")
-                need(trend_up, "الاتجاه العام غير صاعد")
-                need(above_vwap, "تحت VWAP")
-                need(above_open, "تحت الافتتاح")
-                need(h4_state != "معاكس", "الإطار الأعلى معاكس")
-                need(market_ok, "فلتر السوق غير داعم")
-                need(not failed, "فلتر failed نشط")
-                need(last_green, "آخر شمعة ليست خضراء")
-                need(mom > 0.05, f"الزخم {mom:.3f} <= 0.05")
-                need(vol_ratio >= 1.05, f"الحجم {vol_ratio:.2f}x < 1.05x")
-                need(ext_tmp <= 6.0, f"الامتداد {ext_tmp:.2f}% > 6%")
-                need(not orb_breakout, "ORB موجود؛ ليس Bull Flag")
-
-            elif name == "استعادة مستوى":
-                need(resistance_reclaim, "لم تتحقق استعادة المقاومة البنيوية")
-                need(trend_up, "الاتجاه العام غير صاعد")
-                need(above_vwap, "تحت VWAP")
-                need(above_open, "تحت الافتتاح")
-                need(h4_state != "معاكس", "الإطار الأعلى معاكس")
-                need(market_ok, "فلتر السوق غير داعم")
-                need(not failed, "فلتر failed نشط")
-                need(last_green, "آخر شمعة ليست خضراء")
-                need(mom > 0.05, f"الزخم {mom:.3f} <= 0.05")
-                need(vol_ratio >= 1.05, f"الحجم {vol_ratio:.2f}x < 1.05x")
-                need(ext_tmp <= 6.0, f"الامتداد {ext_tmp:.2f}% > 6%")
-
-            elif name == "دخول بعد Opening Drive":
-                need(opening_drive_pullback, "لا يوجد Opening Drive + Pullback + Reclaim مكتمل")
-                need(trend_up, "الاتجاه العام غير صاعد")
-                need(above_vwap, "تحت VWAP")
-                need(above_open, "تحت الافتتاح")
-                need(h4_state != "معاكس", "الإطار الأعلى معاكس")
-                need(market_ok, "فلتر السوق غير داعم")
-                need(not failed, "فلتر failed نشط")
-                need(last_green, "آخر شمعة ليست خضراء")
-                need(mom > 0.20, f"الزخم {mom:.3f} <= 0.20")
-                need(vol_ratio >= 1.05, f"الحجم {vol_ratio:.2f}x < 1.05x")
-                need(not breakout_now, "يوجد اختراق رئيسي")
-                need(not orb_breakout, "يوجد ORB")
-                need(ext_tmp <= 6.0, f"الامتداد {ext_tmp:.2f}% > 6%")
-
-            elif name in {"استعادة قمة اليوم", "استعادة قمة الفترة"}:
-                need(hod_reclaim, "لم تحدث استعادة فعلية للقمة بعد التراجع")
-                need(above_vwap, "تحت VWAP")
-                need(above_open, "تحت الافتتاح")
-                need(trend_up, "الاتجاه العام غير صاعد")
-                need(h4_state != "معاكس", "الإطار الأعلى معاكس")
-                need(market_ok, "فلتر السوق غير داعم")
-                need(not failed, "فلتر failed نشط")
-                need(last_green, "آخر شمعة ليست خضراء")
-                need(mom > 0.05, f"الزخم {mom:.3f} <= 0.05")
-                need(vol_ratio >= 1.05, f"الحجم {vol_ratio:.2f}x < 1.05x")
-                need(ext_tmp <= 6.0, f"الامتداد {ext_tmp:.2f}% > 6%")
-
-            elif name == "استعادة بعد فشل ORB":
-                need(orb_failed_reclaim, "لا يوجد تسلسل ORB break → failure → reclaim مكتمل")
-                need(trend_up, "الاتجاه العام غير صاعد")
-                need(above_vwap, "تحت VWAP")
-                need(above_open, "تحت الافتتاح")
-                need(h4_state != "معاكس", "الإطار الأعلى معاكس")
-                need(market_ok, "فلتر السوق غير داعم")
-                need(not failed, "فلتر failed نشط")
-                need(last_green, "آخر شمعة ليست خضراء")
-                need(mom > 0.05, f"الزخم {mom:.3f} <= 0.05")
-                need(vol_ratio >= 1.05, f"الحجم {vol_ratio:.2f}x < 1.05x")
-                need(ext_tmp <= 6.0, f"الامتداد {ext_tmp:.2f}% > 6%")
-                need(not orb_breakout, "ORB ما زال نشطاً؛ يشترط عدم وجود ORB جديد")
-
-            elif name == "استمرار ABC":
-                if len(today_d) < 12:
-                    reasons.append("بيانات غير كافية (أقل من 12 شمعة)")
-                else:
-                    a = today_d.iloc[-12:-8]
-                    b = today_d.iloc[-8:-4]
-                    c = today_d.iloc[-4:]
-                    ao = float(a["Open"].iloc[0])
-                    ah = float(a["High"].max())
-                    ag = (ah - ao) / max(ao, 1e-9) * 100
-                    bl = float(b["Low"].min())
-                    br = (ah - bl) / max(ah - ao, price * 0.001) * 100
-                    ch = float(c["High"].max())
-                    cg = float(c["Close"].iloc[-1]) >= float(c["Open"].iloc[-1])
-                    cb = ch >= ah * 0.999
-                    need(ag >= 0.70, f"دفعة A {ag:.2f}% < 0.70%")
-                    need(20.0 <= br <= 65.0, f"تصحيح B {br:.1f}% خارج 20–65%")
-                    need(cb and price >= ah * 0.999, "موجة C لم تستعد قمة A")
-                    need(cg, "آخر شمعة في C ليست خضراء")
-                need(trend_up, "الاتجاه العام غير صاعد")
-                need(above_vwap, "تحت VWAP")
-                need(above_open, "تحت الافتتاح")
-                need(h4_state != "معاكس", "الإطار الأعلى معاكس")
-                need(market_ok, "فلتر السوق غير داعم")
-                need(not failed, "فلتر failed نشط")
-                need(mom > 0.05, f"الزخم {mom:.3f} <= 0.05")
-                need(vol_ratio >= 1.05, f"الحجم {vol_ratio:.2f}x < 1.05x")
-                need(ext_tmp <= 6.0, f"الامتداد {ext_tmp:.2f}% > 6%")
-
-            elif name == "ارتداد VWAP":
-                need(above_vwap, "تحت VWAP")
-                need(vwap_touch, "لم يحدث لمس VWAP خلال نافذة اللمس")
-                need(not failed, "فلتر failed نشط")
-                need(last_green, "آخر شمعة ليست خضراء")
-                need(mom > 0.05, f"الزخم {mom:.3f} <= 0.05")
-                need(vol_ratio >= 1.0, f"الحجم {vol_ratio:.2f}x < 1.00x")
-                need(trend_up, "الاتجاه العام غير صاعد")
-                need(h4_state != "معاكس", "الإطار الأعلى معاكس")
-
-            elif name == "ارتداد EMA20":
-                need(trend_up, "الاتجاه العام غير صاعد")
-                need(ema_touch, "لم يحدث لمس EMA20 خلال نافذة اللمس")
-                need(price >= e5 * 1.001 if e5 > 0 else False, "السعر لم يستعد EMA20")
-                need(last_green, "آخر شمعة ليست خضراء")
-                need(mom > 0.05, f"الزخم {mom:.3f} <= 0.05")
-                need(vol_ratio >= 1.0, f"الحجم {vol_ratio:.2f}x < 1.00x")
-                need(h4_state != "معاكس", "الإطار الأعلى معاكس")
-                need(not failed, "فلتر failed نشط")
-
-            elif name == "دخول مبكر":
-                need(trend_up, "الاتجاه العام غير صاعد")
-                need(above_vwap, "تحت VWAP")
-                need(above_open, "تحت الافتتاح")
-                need(not breakout_now, "يوجد اختراق رئيسي")
-                need(not failed, "فلتر failed نشط")
-                need(ext_tmp <= 2.2, f"الامتداد {ext_tmp:.2f}% > 2.2%")
-                # The strategy is intentionally blocked if another real setup exists.
-                need(not any([
-                    retest, orb_breakout, breakout_now, liquidity_displacement,
-                    liquidity_sweep, compression_expansion, momentum_continuation,
-                    bull_flag, resistance_reclaim, orb_failed_reclaim,
-                    abc_continuation, opening_drive_pullback, hod_reclaim,
-                    vwap_bounce, ema_pullback
-                ]), "يوجد Setup آخر مكتمل؛ Early Entry لا ينافسه")
-
-            else:
-                reasons.append("استراتيجية غير معروفة في نموذج الـ16")
-
-        except Exception as exc:
-            reasons.append(f"تعذر تشخيص السبب: {type(exc).__name__}")
-
-        # Keep the audit readable: show the first concrete blockers, not a huge dump.
-        return reasons[:6] or ["شرط مركب غير مكتمل"]
-
-    _competition_audit_parts = []
+    # COMPETITION AUDIT V2 — DIAGNOSTIC ONLY.
+    # This section evaluates ALL 16 strategies for observability and produces a
+    # partial competition score even when a strategy did not fully match.
+    # It MUST NOT change matched_entry_types, strategy_scores, entry_type,
+    # alerts, exits, adaptive learning, market filters, or any trading rule.
+    _competition_scores_all: dict[str, float] = {}
+    _competition_details: list[str] = []
     for _et in ENTRY_TYPES:
-        if _et in matched_entry_types:
-            _score = float(strategy_scores.get(_et, 0.0))
-            _competition_audit_parts.append(
-                f"{_et}:MATCH(score={_score:.1f})"
+        try:
+            _competition_scores_all[_et] = float(_strategy_strength(_et))
+        except Exception:
+            _competition_scores_all[_et] = 0.0
+
+    _competition_ranked = sorted(
+        ENTRY_TYPES,
+        key=lambda _et: (
+            _competition_scores_all.get(_et, 0.0),
+            strategy_identity_scores.get(_et, 0.0) if _et in matched_entry_types else 0.0,
+            -entry_order.get(_et, 999),
+        ),
+        reverse=True,
+    )
+
+    for _rank, _et in enumerate(_competition_ranked, 1):
+        _is_match = _et in matched_entry_types
+        _score = _competition_scores_all.get(_et, 0.0)
+        if _is_match:
+            _competition_details.append(
+                f"{_rank}. {_et}:MATCH(score={_score:.1f})"
             )
         else:
-            _why = ";".join(_competition_fail_reasons(_et))
-            _competition_audit_parts.append(
-                f"{_et}:FAIL({ _why })"
+            _why = ";".join(_competition_fail_reasons(_et)[:4])
+            _competition_details.append(
+                f"{_rank}. {_et}:FAIL(score={_score:.1f}; blockers={_why})"
             )
+
+    log.info(
+        "DAILY STRATEGY COMPETITION AUDIT V2 | %s | primary=%s | matched=%s/16 | "
+        "ranking=DIAGNOSTIC_ONLY",
+        symbol,
+        entry_type,
+        len(matched_entry_types),
+    )
+    for _detail in _competition_details:
+        log.info(
+            "DAILY STRATEGY COMPETITION DETAIL | %s | %s",
+            symbol,
+            _detail,
+        )
 
     log.info(
         "%s STRATEGY COMPETITION AUDIT | %s | primary=%s | %s",
