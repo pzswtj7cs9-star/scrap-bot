@@ -2511,13 +2511,6 @@ def analyze_intraday(
     if early:
         matched_entry_types.append("دخول مبكر")
 
-    # Failed breakout is a rejection/filter condition, not an entry strategy.
-    # إذا لم تطابق أي استراتيجية حقيقية، لا نخترع اسمًا؛ المرشح يُرفض.
-    if failed and not matched_entry_types:
-        return None
-    if not matched_entry_types:
-        return None
-
     # قوة الاستراتيجية: كل تطابق يحصل على تقييم مستقل من جودة setup الحالية.
     # هذا التقييم لا يستبدل Score النهائي؛ وظيفته اختيار أقوى استراتيجية
     # عندما تتطابق عدة استراتيجيات على السهم نفسه.
@@ -2558,7 +2551,7 @@ def analyze_intraday(
             if market:
                 add("صلاحية السوق/الإعداد غير متحققة", v("setup_market_permission", v("market_ok", False)))
             if state:
-                add("حالة الإطار ليست داعمة/معاكسة", str(v("m15_state", v("h4_state", "محايد"))) == "معاكس")
+                add("حالة الإطار معاكسة", str(v("m15_state", v("h4_state", "محايد"))) == "معاكس")
             if no_failed:
                 add("يوجد failed/rejection", not v("failed", False))
             if mom_min is not None:
@@ -2684,6 +2677,10 @@ def analyze_intraday(
             out.append("لم يكتمل trigger الاستراتيجية رغم عدم توفر blocker أدق")
         # Keep the audit readable; the caller already limits the displayed list.
         return out
+
+    # Storage is initialized before the diagnostic-only zero-match audit so
+    # _strategy_strength() can safely run for all 16 strategies.
+    strategy_component_scores: dict[str, dict[str, float]] = {}
 
     def _strategy_strength(name: str) -> float:
         """Independent 100-point setup-quality score; stock quality is scored separately."""
@@ -2816,6 +2813,41 @@ def analyze_intraday(
         # Strategy performance statistics are used by the Adaptive learner;
         # they no longer add a separate live +/-3 bias to the Strategy Score.
         return round(max(0.0, min(100.0, q)), 2)
+
+    if not matched_entry_types:
+        # DIAGNOSTIC ONLY: when all 16 canonical strategies fail, emit the same
+        # full competition detail before returning. This does not change the
+        # actual no-match behavior: the analyzer still returns None.
+        _zero_scores: dict[str, float] = {}
+        _zero_details: list[str] = []
+        for _et in ENTRY_TYPES:
+            try:
+                _zero_scores[_et] = float(_strategy_strength(_et))
+            except Exception:
+                _zero_scores[_et] = 0.0
+        _zero_ranked = sorted(
+            ENTRY_TYPES,
+            key=lambda _et: (_zero_scores.get(_et, 0.0), -ENTRY_TYPES.index(_et)),
+            reverse=True,
+        )
+        for _rank, _et in enumerate(_zero_ranked, 1):
+            _why = ";".join(_competition_fail_reasons(_et)[:4])
+            _zero_details.append(
+                f"{_rank}. {_et}:FAIL(score={_zero_scores.get(_et, 0.0):.1f}; blockers={_why})"
+            )
+        log.info(
+            "INTRADAY STRATEGY COMPETITION AUDIT V2 | %s | primary=NONE | matched=0/16 | "
+            "ranking=DIAGNOSTIC_ONLY",
+            symbol,
+        )
+        for _detail in _zero_details:
+            log.info(
+                "INTRADAY STRATEGY COMPETITION DETAIL | %s | %s",
+                symbol,
+                _detail,
+            )
+        # Preserve the original trading behavior exactly.
+        return None
 
     def _strategy_identity(name: str) -> float:
         """Structural identity score, separate from generic market quality.
