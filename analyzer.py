@@ -2621,7 +2621,7 @@ def analyze_daily(
             if market:
                 add("صلاحية السوق/الإعداد غير متحققة", v("setup_market_permission", v("market_ok", False)))
             if state:
-                add("حالة الإطار معاكسة", str(v("m15_state", v("h4_state", "محايد"))) == "معاكس")
+                add("حالة الإطار معاكسة", str(v("m15_state", v("h4_state", "محايد"))) != "معاكس")
             if no_failed:
                 add("يوجد failed/rejection", not v("failed", False))
             if mom_min is not None:
@@ -2948,7 +2948,6 @@ def analyze_daily(
         return round(max(0.0, min(120.0, identity.get(name, 0.0))), 2)
 
     strategy_identity_scores = {et: _strategy_identity(et) for et in matched_entry_types}
-    strategy_component_scores: dict[str, dict[str, float]] = {}
     strategy_scores = {et: _strategy_strength(et) for et in matched_entry_types}
     entry_order = {et: i for i, et in enumerate(ENTRY_TYPES)}
     # When strategies overlap, prefer the more structurally specific setup only
@@ -3023,7 +3022,14 @@ def analyze_daily(
     _competition_details: list[str] = []
     for _et in ENTRY_TYPES:
         try:
-            _competition_scores_all[_et] = float(_strategy_strength(_et))
+            # Reuse the score already calculated by the real selection path
+            # for matched strategies. Only unmatched strategies need a
+            # diagnostic-only strength calculation here. This avoids doing
+            # duplicate scoring work and does not change the trading decision.
+            if _et in strategy_scores:
+                _competition_scores_all[_et] = float(strategy_scores[_et])
+            else:
+                _competition_scores_all[_et] = float(_strategy_strength(_et))
         except Exception:
             _competition_scores_all[_et] = 0.0
 
