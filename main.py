@@ -37,7 +37,6 @@ from analyzer import (
     format_signal_ar,
     rank_all,
     scan_symbols,
-    register_daily_signal,
     ADAPTIVE_POLICY_FILE as DAILY_ADAPTIVE_POLICY_FILE,
     get_daily_market_context,
 )
@@ -423,11 +422,6 @@ def today_summary() -> str:
 
 async def send_signal_with_chart(chat_id: int, bot, sig, header: str, source: str = "manual") -> None:
     PERF.add_signal(sig, source=source)
-    if getattr(sig, "mode", "") == "daily":
-        try:
-            register_daily_signal(sig)
-        except Exception as exc:
-            log.warning("تعذر تسجيل التعلم اليومي %s: %s", sig.symbol, exc)
     text = header + "\n\n" + format_signal_ar(sig, MIN_SCORE)
     try:
         near, edt = await asyncio.to_thread(is_near_earnings, sig.symbol, EARNINGS_DAYS)
@@ -932,11 +926,6 @@ async def live_scan_job(context: ContextTypes.DEFAULT_TYPE) -> None:
         save_state(state)
         COOL.mark(sig.symbol)
         PERF.add_signal(sig, source="auto")
-        try:
-            register_daily_signal(sig)
-        except Exception as exc:
-            log.warning("تعذر تسجيل إشارة التعلم اليومي %s: %s", sig.symbol, exc)
-
         if len(state["sent"]) >= DAILY_MAX:
             await broadcast(
                 context.bot,
