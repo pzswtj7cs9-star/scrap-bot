@@ -3071,14 +3071,6 @@ def analyze_daily(
         )
 
     log.info(
-        "%s STRATEGY COMPETITION AUDIT | %s | primary=%s | %s",
-        "DAILY",
-        symbol,
-        entry_type,
-        " | ".join(_competition_audit_parts),
-    )
-
-    log.info(
         "DAILY STRATEGY AUDIT | %s | primary=%s | matched=%s | scores=%s | "
         "tiebreak=%s",
         symbol,

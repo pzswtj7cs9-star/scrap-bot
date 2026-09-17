@@ -2996,14 +2996,6 @@ def analyze_intraday(
         )
 
     log.info(
-        "%s STRATEGY COMPETITION AUDIT | %s | primary=%s | %s",
-        "INTRADAY",
-        symbol,
-        entry_type,
-        " | ".join(_competition_audit_parts),
-    )
-
-    log.info(
         "INTRADAY STRATEGY AUDIT | %s | primary=%s | matched=%s | scores=%s | "
         "tiebreak=%s",
         symbol,
