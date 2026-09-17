@@ -3531,14 +3531,14 @@ def analyze_daily(
             risk = price - stop
             tp1 = price + risk * 1.20
 
-    # Keep targets strictly ordered even when Adaptive Exit raises TP1 above 2R.
+    # Calculate TP1 reward before using it to enforce ordered targets.
     # This does not change strategy selection or the Adaptive TP1 rule.
+    risk_pct = risk / price * 100
+    reward_r = (tp1 - price) / risk if risk else 0.0
     tp2_r = max(2.0, reward_r + 1e-6)
     tp3_r = max(3.0, tp2_r + 1e-6)
     tp2 = price + risk * tp2_r
     tp3 = price + risk * tp3_r
-    risk_pct = risk / price * 100
-    reward_r = (tp1 - price) / risk if risk else 0.0
     tp1_distance_pct = (tp1 - price) / price * 100 if price else 0.0
     if tp1_distance_pct < 0.8:
         quality_ok = False
