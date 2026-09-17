@@ -2062,6 +2062,7 @@ def analyze_daily(
         daily = fetch_intraday(symbol, interval="1d", period="2y")
 
     if weekly is None or len(weekly) < 60 or daily is None or len(daily) < 80:
+        log.info("DAILY NO_SIGNAL | %s | reason=insufficient_or_missing_weekly_daily_data", symbol)
         return None
 
     # Daily bars can be current during regular session. The engine is deliberately
@@ -2089,6 +2090,7 @@ def analyze_daily(
 
     price = float(today_d["Close"].iloc[-1])
     if price <= 0 or price > float(MAX_AUTO_PRICE):
+        log.info("DAILY NO_SIGNAL | %s | reason=invalid_or_over_max_price | price=%.4f", symbol, price)
         return None
 
     day_open = float(today_d["Open"].iloc[-1])
@@ -2541,6 +2543,7 @@ def analyze_daily(
     # Failed breakout is a rejection/filter condition, not an entry strategy.
     # If there is no separate recovery setup below, the candidate is discarded.
     if failed and not (retest or liquidity_displacement or liquidity_sweep or orb_failed_reclaim or abc_continuation or opening_drive_pullback or hod_reclaim or vwap_bounce or ema_pullback or orb_breakout or breakout_now or compression_expansion or momentum_continuation or bull_flag or resistance_reclaim):
+        log.info("DAILY NO_SIGNAL | %s | reason=failed_breakout_without_recovery_setup", symbol)
         return None
 
     # Multi-label strategy detection: every strategy that genuinely matches is
@@ -2916,6 +2919,23 @@ def analyze_daily(
                 symbol,
                 _detail,
             )
+        # DIAGNOSTIC ONLY: summarize the most frequent blockers across all 16
+        # failed strategies. This does not change the no-match decision.
+        from collections import Counter as _Counter
+        _blocker_counts = _Counter()
+        for _et in ENTRY_TYPES:
+            try:
+                _blocker_counts.update(_competition_fail_reasons(_et))
+            except Exception:
+                pass
+        _top_blockers = ";".join(
+            f"{_reason}={_count}" for _reason, _count in _blocker_counts.most_common(6)
+        ) or "unavailable"
+        log.info(
+            "DAILY NO_SIGNAL | %s | reason=no_strategy_match | top_blockers=%s",
+            symbol,
+            _top_blockers,
+        )
         # Preserve the original trading behavior exactly.
         return None
 

@@ -2846,6 +2846,23 @@ def analyze_intraday(
                 symbol,
                 _detail,
             )
+        # DIAGNOSTIC ONLY: summarize the most frequent blockers across all 16
+        # failed strategies. This does not change the no-match decision.
+        from collections import Counter as _Counter
+        _blocker_counts = _Counter()
+        for _et in ENTRY_TYPES:
+            try:
+                _blocker_counts.update(_competition_fail_reasons(_et))
+            except Exception:
+                pass
+        _top_blockers = ";".join(
+            f"{_reason}={_count}" for _reason, _count in _blocker_counts.most_common(6)
+        ) or "unavailable"
+        log.info(
+            "INTRADAY NO_SIGNAL | %s | reason=no_strategy_match | top_blockers=%s",
+            symbol,
+            _top_blockers,
+        )
         # Preserve the original trading behavior exactly.
         return None
 
@@ -3905,7 +3922,8 @@ def scan_intraday(
                 market_context=market_context,
                 preloaded=(h1, m5),
             )
-        except Exception:
+        except Exception as exc:
+            log.warning("INTRADAY STAGE 2 EXCEPTION | %s | %s", sym, str(exc))
             return None
 
     with ThreadPoolExecutor(max_workers=workers) as pool:
