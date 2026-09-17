@@ -3627,7 +3627,7 @@ def analyze_daily(
         quality_reasons.append("invalid_tp1")
     if tp1_distance_pct < 0.8:
         quality_reasons.append("tp1_too_close")
-    if reward_r < float(policy.get("min_tp1_r", 1.2)):
+    if reward_r + 1e-9 < float(policy.get("min_tp1_r", 1.2)):
         quality_reasons.append("weak_tp1_r")
 
     return DailySignal(

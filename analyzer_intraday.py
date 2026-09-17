@@ -3444,7 +3444,7 @@ def analyze_intraday(
     if tp1_distance_pct < 0.8:
         quality_ok = False
         warnings.append("TP1 قريب جدًا من الدخول")
-    if reward_r < float(policy.get("min_tp1_r", 1.2)):
+    if reward_r + 1e-9 < float(policy.get("min_tp1_r", 1.2)):
         quality_ok = False
         warnings.append("العائد إلى TP1 ضعيف")
     if news_state == "positive_strong" and news_momentum_ok:
@@ -3505,7 +3505,7 @@ def analyze_intraday(
         diagnostic_reasons.append("chop")
     if tp1_distance_pct < 0.8:
         diagnostic_reasons.append("tp1_distance<0.8%")
-    if reward_r < float(policy.get("min_tp1_r", 1.2)):
+    if reward_r + 1e-9 < float(policy.get("min_tp1_r", 1.2)):
         diagnostic_reasons.append("tp1_r<1.20")
     if risk > price * 0.045:
         diagnostic_reasons.append("wide_stop>4.5%")
