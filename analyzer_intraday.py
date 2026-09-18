@@ -2346,29 +2346,8 @@ def analyze_intraday(
     breakout_ok, breakout_quality = _breakout_quality(today_5, level_high, price)
     orb_breakout_ok, orb_quality = _breakout_quality(today_5, orb_high, price) if orb_high > 0 else (False, 0.0)
 
-    # Strategy-specific confirmations. These no longer block Core matching; they
-    # contribute to the Strategy Score below. Safety/failed/extension remain gates.
-    strategy_confirmations = {
-        # Only confirmations that were previously hard gates and are not already
-        # represented by the existing Strategy Score components are listed here.
-        "اختراق مؤكد": [],
-        "اختراق نطاق الافتتاح": [above_vwap, m15_state != "معاكس"],
-        "إعادة اختبار": [above_vwap],
-        "ارتداد VWAP": [trend_up, m15_state != "معاكس"],
-        "ارتداد EMA20": [m15_state != "معاكس"],
-        "سحب سيولة": [m15_state != "معاكس", above_vwap],
-        "سحب سيولة مع Displacement": [trend_up, above_vwap, above_open, m15_state != "معاكس", setup_market_permission],
-        "ضغط ثم انفجار": [above_vwap, above_open, trend_up, m15_state != "معاكس", setup_market_permission],
-        "استمرار الزخم": [trend_up, above_vwap, above_open, m15_state != "معاكس", setup_market_permission, not breakout_now],
-        "علم صاعد": [trend_up, above_vwap, above_open, m15_state != "معاكس", setup_market_permission, not orb_breakout],
-        "استعادة مستوى": [trend_up, above_vwap, above_open, m15_state != "معاكس", setup_market_permission],
-        "دخول بعد Opening Drive": [trend_up, above_vwap, above_open, m15_state != "معاكس", setup_market_permission, not breakout_now, not orb_breakout],
-        "استعادة قمة اليوم": [above_vwap, above_open, trend_up, m15_state != "معاكس", setup_market_permission],
-        "استعادة بعد فشل ORB": [trend_up, above_vwap, above_open, m15_state != "معاكس", setup_market_permission, not orb_breakout],
-        "استمرار ABC": [trend_up, above_vwap, above_open, m15_state != "معاكس", setup_market_permission],
-        "دخول مبكر": [trend_up, above_vwap, above_open, m15_state != "معاكس", setup_market_permission],
-    }
-
+    # Strategy-specific confirmations are defined once inside _strategy_strength.
+    # They affect the 30% Confirmation block and never block Core matching.
 
     # Preserve the original interaction rule for Early Entry: it is only eligible
     # when no other structural setup is already present.
@@ -2432,28 +2411,9 @@ def analyze_intraday(
         and m15_state == "داعم" and not failed
     )
 
-    # Early Entry is itself a structural setup, not a score fallback:
-    # pre-breakout compression/holding under a meaningful resistance, with
-    # improving price action and no already-confirmed strategy trigger.
-    early = False
-    try:
-        recent3 = today_5.tail(3)
-        early_range = (float(recent3["High"].max()) - float(recent3["Low"].min())) / max(price, 1e-9) * 100
-        early_near_resistance = level_high > 0 and abs(price - level_high) / max(price, 1e-9) * 100 <= 1.5
-        early_holding = float(recent3["Close"].iloc[-1]) >= float(recent3["Close"].iloc[0])
-        early = bool(
-            trend_up and above_vwap and above_open and not breakout_now and not failed
-            and early_near_resistance and early_range <= 1.5 and early_holding
-            and last_green and mom > 0.03 and vol_session_ratio >= 0.95 and ext_tmp <= 2.2
-            and m15_state != "معاكس" and setup_market_permission
-            and not (retest or orb_breakout or breakout_now or liquidity_displacement
-                     or liquidity_sweep or compression_expansion or momentum_continuation
-                     or bull_flag or resistance_reclaim or orb_failed_reclaim
-                     or abc_continuation or opening_drive_pullback or hod_reclaim
-                     or vwap_bounce or ema_pullback)
-        )
-    except Exception:
-        early = False
+    # Early Entry Core was already defined above; do not redefine it here with
+    # confirmation/safety conditions, otherwise those conditions would become
+    # hidden Core gates again.
 
     breakout_ok, breakout_quality = _breakout_quality(today_5, level_high, price)
     orb_breakout_ok, orb_quality = _breakout_quality(today_5, orb_high, price) if orb_high > 0 else (False, 0.0)
