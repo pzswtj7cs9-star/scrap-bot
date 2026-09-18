@@ -2124,7 +2124,7 @@ def analyze_intraday(
         vwap_touch = bool((recent4["Low"].astype(float) <= vwap_last * 1.006).any())
     except Exception:
         vwap_touch = False
-    vwap_bounce = vwap_touch and above_vwap
+    vwap_bounce = vwap_touch
 
     ema_touch = False
     try:
@@ -2415,44 +2415,6 @@ def analyze_intraday(
     # confirmation/safety conditions, otherwise those conditions would become
     # hidden Core gates again.
 
-    breakout_ok, breakout_quality = _breakout_quality(today_5, level_high, price)
-    orb_breakout_ok, orb_quality = _breakout_quality(today_5, orb_high, price) if orb_high > 0 else (False, 0.0)
-    # كل استراتيجية لها بوابة مستقلة. لا نستخدم "دخول مبكر" كـ fallback.
-    matched_entry_types: list[str] = []
-    if retest:
-        matched_entry_types.append("إعادة اختبار")
-    if orb_breakout:
-        matched_entry_types.append("اختراق نطاق الافتتاح")
-        breakout_quality = max(breakout_quality, orb_quality)
-    if breakout_now:
-        matched_entry_types.append("اختراق مؤكد")
-    if liquidity_displacement:
-        matched_entry_types.append("سحب سيولة مع Displacement")
-    if liquidity_sweep:
-        matched_entry_types.append("سحب سيولة")
-    if compression_expansion:
-        matched_entry_types.append("ضغط ثم انفجار")
-    if momentum_continuation:
-        matched_entry_types.append("استمرار الزخم")
-    if bull_flag:
-        matched_entry_types.append("علم صاعد")
-    if resistance_reclaim:
-        matched_entry_types.append("استعادة مستوى")
-    if orb_failed_reclaim:
-        matched_entry_types.append("استعادة بعد فشل ORB")
-    if abc_continuation:
-        matched_entry_types.append("استمرار ABC")
-    if opening_drive_pullback:
-        matched_entry_types.append("دخول بعد Opening Drive")
-    if hod_reclaim:
-        matched_entry_types.append("استعادة قمة اليوم")
-    if vwap_bounce:
-        matched_entry_types.append("ارتداد VWAP")
-    if ema_pullback:
-        matched_entry_types.append("ارتداد EMA20")
-    if early:
-        matched_entry_types.append("دخول مبكر")
-
     # قوة الاستراتيجية: كل تطابق يحصل على تقييم مستقل من جودة setup الحالية.
     # هذا التقييم لا يستبدل Score النهائي؛ وظيفته اختيار أقوى استراتيجية
     # عندما تتطابق عدة استراتيجيات على السهم نفسه.
@@ -2579,8 +2541,7 @@ def analyze_intraday(
                 "استعادة مستوى":"resistance_reclaim",
                 "دخول بعد Opening Drive":"opening_drive_pullback",
                 "استعادة قمة اليوم":"hod_reclaim",
-                "استعادة قمة الفترة":"hod_reclaim",
-                "استعادة بعد فشل ORB":"orb_failed_reclaim",
+                                "استعادة بعد فشل ORB":"orb_failed_reclaim",
                 "استمرار ABC":"abc_continuation",
             }.get(name)
             if trigger:
@@ -2604,7 +2565,7 @@ def analyze_intraday(
                 common(mom_min=0.05 if "m15_state" in c else 0.20, vol_min=1.05, opening=True, ext_max=3.5 if "m15_state" in c else 6.0)
                 add("يوجد breakout_now", not v("breakout_now", False))
                 add("يوجد ORB breakout", not v("orb_breakout", False))
-            elif name in {"استعادة قمة اليوم", "استعادة قمة الفترة"}:
+            elif name in {"استعادة قمة اليوم"}:
                 common(mom_min=0.05, vol_min=1.05, opening=True, ext_max=3.5 if "m15_state" in c else 6.0)
             elif name == "استعادة بعد فشل ORB":
                 common(mom_min=0.05, vol_min=1.05, opening=True, ext_max=3.5 if "m15_state" in c else 6.0)
@@ -2685,7 +2646,7 @@ def analyze_intraday(
             pb = float(c.get("pullback_from_high", 99.0) or 99.0)
             pull = clip((2.5-abs(pb-1.0))/1.5*100)
             q = 0.35*drive + 0.25*pull + 0.20*(100 if green else 0) + 0.20*clip((vr-0.9)/0.7*100)
-        elif name in {"استعادة قمة اليوم", "استعادة قمة الفترة"}:
+        elif name in {"استعادة قمة اليوم"}:
             match = 100 if c.get("hod_reclaim", False) else 0
             level = float(c.get("hod_level", 0.0) or 0.0)
             dist = abs(price_v-level)/max(price_v,1e-9)*100 if level > 0 else 1.0
@@ -2735,7 +2696,7 @@ def analyze_intraday(
             components = {"match": match, "reclaim": reclaim, "candle": 100 if green else 0, "volume": clip((vr-0.9)/0.7*100)}
         elif name == "دخول بعد Opening Drive":
             components = {"drive": drive, "pullback": pull, "candle": 100 if green else 0, "volume": clip((vr-0.9)/0.7*100)}
-        elif name in {"استعادة قمة اليوم", "استعادة قمة الفترة"}:
+        elif name in {"استعادة قمة اليوم"}:
             components = {"match": match, "reclaim": reclaim, "candle": 100 if green else 0, "volume": clip((vr-0.9)/0.7*100)}
         elif name == "استعادة بعد فشل ORB":
             components = {"failed_reclaim": failed, "orb_quality": orbq, "reclaim": reclaim, "momentum": clip((mom-0.05)/0.25*100), "volume": clip((vr-0.9)/0.7*100)}
@@ -2761,8 +2722,7 @@ def analyze_intraday(
             "استعادة مستوى": {"match", "reclaim"},
             "دخول بعد Opening Drive": {"drive", "pullback"},
             "استعادة قمة اليوم": {"match", "reclaim"},
-            "استعادة قمة الفترة": {"match", "reclaim"},
-            "استعادة بعد فشل ORB": {"failed_reclaim", "orb_quality", "reclaim"},
+                        "استعادة بعد فشل ORB": {"failed_reclaim", "orb_quality", "reclaim"},
             "استمرار ABC": {"a", "b", "c_break"},
             "دخول مبكر": {"early_range", "near_resistance", "holding"},
         }.get(name, set())
@@ -2788,7 +2748,6 @@ def analyze_intraday(
             "استعادة مستوى": {"trend": .15, "above_vwap": .15, "above_open": .10, "m15": .10, "market": .10, "volume": .15, "candle": .15},
             "دخول بعد Opening Drive": {"trend": .15, "above_vwap": .15, "above_open": .10, "m15": .10, "market": .10, "volume": .15, "candle": .10, "no_breakout": .075, "no_orb": .075},
             "استعادة قمة اليوم": {"above_vwap": .15, "above_open": .10, "trend": .15, "m15": .10, "market": .10, "volume": .15, "candle": .15},
-            "استعادة قمة الفترة": {"above_vwap": .15, "above_open": .10, "trend": .15, "m15": .10, "market": .10, "volume": .15, "candle": .15},
             "استعادة بعد فشل ORB": {"trend": .15, "above_vwap": .15, "above_open": .10, "m15": .10, "market": .10, "volume": .15, "candle": .10, "no_orb": .15},
             "استمرار ABC": {"trend": .15, "above_vwap": .15, "above_open": .10, "m15": .10, "market": .10, "volume": .15, "candle": .10, "momentum": .15},
             "دخول مبكر": {"trend": .15, "above_vwap": .15, "above_open": .10, "m15": .10, "market": .10, "volume": .15, "candle": .15},
@@ -2911,7 +2870,6 @@ def analyze_intraday(
         "إعادة اختبار": 8,
         "سحب سيولة": 7,
         "استعادة قمة اليوم": 6,
-        "استعادة قمة الفترة": 6,
         "استعادة مستوى": 5,
         "ارتداد VWAP": 4,
         "ارتداد EMA20": 3,

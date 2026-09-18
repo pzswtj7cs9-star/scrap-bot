@@ -53,7 +53,7 @@ LEARNING_ALERT_FILE = Path("/var/data/daily_v2_learning_alert.json")
 ENTRY_TYPES = (
     "اختراق مؤكد", "إعادة اختبار", "دخول مبكر", "ارتداد VWAP", "ارتداد EMA20",
     "سحب سيولة", "اختراق نطاق الافتتاح", "استمرار الزخم", "ضغط ثم انفجار",
-    "علم صاعد", "استعادة مستوى", "دخول بعد Opening Drive", "استعادة قمة الفترة",
+    "علم صاعد", "استعادة مستوى", "دخول بعد Opening Drive", "استعادة قمة اليوم",
     "استعادة بعد فشل ORB", "استمرار ABC", "سحب سيولة مع Displacement",
 )
 PREFILTER_MAX_CANDIDATES = 50
@@ -231,7 +231,7 @@ def _default_adaptive_policy() -> dict:
             "ema_pullback": 1.0, "liquidity_sweep": 1.0, "liquidity_displacement": 1.0, "orb": 1.0, "momentum_continuation": 1.0, "compression_expansion": 1.0, "bull_flag": 1.0, "resistance_reclaim": 1.0, "opening_drive_pullback": 1.0, "hod_reclaim": 1.0, "orb_failed_reclaim": 1.0, "abc_continuation": 1.0, "vwap_weekly_confluence": 1.0, "multi_level_confluence": 1.0, "early": 1.0,
             "news_momentum": 1.0,
         },
-        "entry_limits": {"دخول مبكر": 94, "إعادة اختبار": 95, "ارتداد VWAP": 96, "ارتداد EMA20": 96, "سحب سيولة": 97, "ضغط ثم انفجار": 98, "استمرار الزخم": 97, "اختراق نطاق الافتتاح": 99, "اختراق مؤكد": 100, "علم صاعد": 98, "استعادة مستوى": 98, "دخول بعد Opening Drive": 98, "استعادة قمة الفترة": 98, "استعادة بعد فشل ORB": 99, "استمرار ABC": 98, "سحب سيولة مع Displacement": 99},
+        "entry_limits": {"دخول مبكر": 94, "إعادة اختبار": 95, "ارتداد VWAP": 96, "ارتداد EMA20": 96, "سحب سيولة": 97, "ضغط ثم انفجار": 98, "استمرار الزخم": 97, "اختراق نطاق الافتتاح": 99, "اختراق مؤكد": 100, "علم صاعد": 98, "استعادة مستوى": 98, "دخول بعد Opening Drive": 98, "استعادة قمة اليوم": 98, "استعادة بعد فشل ORB": 99, "استمرار ABC": 98, "سحب سيولة مع Displacement": 99},
         "strategy_stats": {et: {"samples": 0, "wins": 0, "win_rate": 0.0} for et in ENTRY_TYPES},
         "strategy_weights": {},
         "strategy_weights_active": False,
@@ -405,28 +405,24 @@ def _rate(rows: list[dict]) -> float:
 
 
 def _strategy_weight_defaults() -> dict:
-    """Baseline weights for structural/Core components only.
-
-    Confirmation components are scored separately in the fixed 30% Confirmation
-    block, so they are intentionally not part of the adaptive Core weights.
-    """
+    """Baseline component weights for the 16 strategy-quality scores."""
     return {
-        "اختراق مؤكد": {"breakout_quality": 1.0},
-        "اختراق نطاق الافتتاح": {"orb_quality": 1.0},
-        "إعادة اختبار": {"prior_break": .30, "near_level": .40, "reclaim": .30},
-        "ارتداد VWAP": {"touch": .50, "reclaim": .50},
-        "ارتداد EMA20": {"touch": .50, "reclaim": .50},
-        "سحب سيولة": {"sweep": 1.0},
-        "سحب سيولة مع Displacement": {"sweep": .35, "displacement": .65},
-        "ضغط ثم انفجار": {"match": 1.0},
-        "استمرار الزخم": {"momentum": 1.0},
-        "علم صاعد": {"impulse": .50, "flag": .50},
-        "استعادة مستوى": {"match": .60, "reclaim": .40},
-        "دخول بعد Opening Drive": {"drive": .60, "pullback": .40},
-        "استعادة قمة الفترة": {"match": .60, "reclaim": .40},
-        "استعادة بعد فشل ORB": {"failed_reclaim": .35, "orb_quality": .25, "reclaim": .40},
-        "استمرار ABC": {"a": .30, "b": .30, "c_break": .40},
-        "دخول مبكر": {"early_range": .40, "near_resistance": .30, "holding": .30},
+        "اختراق مؤكد": {"breakout_quality": .55, "volume": .25, "candle": .20},
+        "اختراق نطاق الافتتاح": {"orb_quality": .55, "volume": .25, "candle": .20},
+        "إعادة اختبار": {"prior_break": .25, "near_level": .35, "reclaim": .25, "volume": .15},
+        "ارتداد VWAP": {"touch": .30, "reclaim": .30, "candle": .20, "momentum": .10, "volume": .10},
+        "ارتداد EMA20": {"touch": .30, "reclaim": .30, "candle": .20, "higher_tf": .10, "volume": .10},
+        "سحب سيولة": {"sweep": .35, "volume": .25, "candle": .20, "momentum": .20},
+        "سحب سيولة مع Displacement": {"sweep": .20, "displacement": .40, "volume": .20, "momentum": .10, "candle": .10},
+        "ضغط ثم انفجار": {"match": .40, "volume": .25, "candle": .20, "momentum": .15},
+        "استمرار الزخم": {"momentum": .45, "volume": .30, "candle": .15, "higher_tf": .10},
+        "علم صاعد": {"impulse": .30, "flag": .30, "candle": .20, "volume": .20},
+        "استعادة مستوى": {"match": .35, "reclaim": .25, "candle": .20, "volume": .20},
+        "دخول بعد Opening Drive": {"drive": .35, "pullback": .25, "candle": .20, "volume": .20},
+        "استعادة قمة اليوم": {"match": .35, "reclaim": .25, "candle": .20, "volume": .20},
+        "استعادة بعد فشل ORB": {"failed_reclaim": .25, "orb_quality": .25, "reclaim": .30, "momentum": .10, "volume": .10},
+        "استمرار ABC": {"a": .25, "b": .25, "c_break": .30, "momentum": .10, "volume": .10},
+        "دخول مبكر": {"early_range": .30, "near_resistance": .25, "holding": .20, "momentum": .15, "candle": .10},
     }
 
 
@@ -1126,7 +1122,7 @@ def adaptive_retrain_if_ready(force_monthly: bool = False) -> dict:
             candidate["interaction_weights"][key] = max(1.0 - ADAPTIVE_MAX_CHANGE, w - 0.05)
 
     # نوع الدخول
-    for et in ("دخول مبكر", "إعادة اختبار", "ارتداد VWAP", "ارتداد EMA20", "سحب سيولة", "سحب سيولة مع Displacement", "ضغط ثم انفجار", "استمرار الزخم", "اختراق نطاق الافتتاح", "اختراق مؤكد", "علم صاعد", "استعادة مستوى", "دخول بعد Opening Drive", "استعادة قمة الفترة", "استعادة بعد فشل ORB", "استمرار ABC"):
+    for et in ("دخول مبكر", "إعادة اختبار", "ارتداد VWAP", "ارتداد EMA20", "سحب سيولة", "سحب سيولة مع Displacement", "ضغط ثم انفجار", "استمرار الزخم", "اختراق نطاق الافتتاح", "اختراق مؤكد", "علم صاعد", "استعادة مستوى", "دخول بعد Opening Drive", "استعادة قمة اليوم", "استعادة بعد فشل ORB", "استمرار ABC"):
         subset = [
             r for r in train
             if str(r.get("entry_type") or "") == et
@@ -2186,7 +2182,7 @@ def analyze_daily(
         vwap_touch = bool((recent4["Low"].astype(float) <= vwap_last * 1.006).any())
     except Exception:
         vwap_touch = False
-    vwap_bounce = vwap_touch and above_vwap
+    vwap_bounce = vwap_touch
 
     # 2) EMA20 Pullback: ترند صاعد + تصحيح صحي إلى EMA20 + استعادة.
     ema_touch = False
@@ -2228,6 +2224,7 @@ def analyze_daily(
             displacement = bool(
                 cur_c > cur_o and cur_body / cur_range >= 0.55 and close_pos >= 0.75
                 and (med_range <= 0 or cur_range >= med_range * 1.35)
+                and vol_ratio >= 1.25
             )
             liquidity_displacement = bool(swept and reclaimed and displacement)
     except Exception:
@@ -2284,7 +2281,11 @@ def analyze_daily(
             expansion = cur_range >= max(med_range * 1.35, price * 0.003)
             compression = comp_width_pct <= 2.2 and med_range > 0
             compression_expansion = bool(
-                compression and expansion
+                compression and expansion and float(cur["Close"]) > float(cur["Open"])
+                and cur_pos >= 0.70 and vol_ratio >= 1.20
+                and above_vwap and above_open and trend_up
+                and h4_state != "معاكس" and market_ok and not failed
+                and cur_body / cur_range >= 0.45 and ext_tmp <= 7.0
             )
     except Exception:
         compression_expansion = False
@@ -2367,7 +2368,7 @@ def analyze_daily(
     except Exception:
         opening_drive_pullback = False
 
-    # 8) Period-High Reclaim: استعادة قمة الفترة (20 يومًا).
+    # 8) Period-High Reclaim: استعادة قمة اليوم (20 يومًا).
     # بعد تسجيل قمة يومية، يحصل تراجع تحت القمة ثم استعادة فعلية لها.
     # هذا ليس ORB: المستوى هنا هو HOD المتكوّن خلال الجلسة، وليس أول 15 دقيقة.
     hod_reclaim = False
@@ -2495,7 +2496,7 @@ def analyze_daily(
     if opening_drive_pullback:
         matched_entry_types.append("دخول بعد Opening Drive")
     if hod_reclaim:
-        matched_entry_types.append("استعادة قمة الفترة")
+        matched_entry_types.append("استعادة قمة اليوم")
     if vwap_bounce:
         matched_entry_types.append("ارتداد VWAP")
     if ema_pullback:
@@ -2633,7 +2634,6 @@ def analyze_daily(
                 "استعادة مستوى":"resistance_reclaim",
                 "دخول بعد Opening Drive":"opening_drive_pullback",
                 "استعادة قمة اليوم":"hod_reclaim",
-                "استعادة قمة الفترة":"hod_reclaim",
                 "استعادة بعد فشل ORB":"orb_failed_reclaim",
                 "استمرار ABC":"abc_continuation",
             }.get(name)
@@ -2658,7 +2658,7 @@ def analyze_daily(
                 common(mom_min=0.05 if "m15_state" in c else 0.20, vol_min=1.05, opening=True, ext_max=3.5 if "m15_state" in c else 6.0)
                 add("يوجد breakout_now", not v("breakout_now", False))
                 add("يوجد ORB breakout", not v("orb_breakout", False))
-            elif name in {"استعادة قمة اليوم", "استعادة قمة الفترة"}:
+            elif name in {"استعادة قمة اليوم", "استعادة قمة اليوم"}:
                 common(mom_min=0.05, vol_min=1.05, opening=True, ext_max=3.5 if "m15_state" in c else 6.0)
             elif name == "استعادة بعد فشل ORB":
                 common(mom_min=0.05, vol_min=1.05, opening=True, ext_max=3.5 if "m15_state" in c else 6.0)
@@ -2691,12 +2691,12 @@ def analyze_daily(
         if name == "اختراق مؤكد":
             bq = clip(c.get("breakout_quality", 0.0))
             vol = clip((vr - 0.75) / 0.75 * 100)
-            q = 0.55*bq + 0.25*vol + 0.20*(100 if green else 0)
+            q = bq
             components = {"breakout_quality": bq, "volume": vol, "candle": 100 if green else 0}
         elif name == "اختراق نطاق الافتتاح":
             oq = clip(c.get("orb_quality", 0.0))
             vol = clip((vr - 0.75) / 0.75 * 100)
-            q = 0.55*oq + 0.25*vol + 0.20*(100 if green else 0)
+            q = oq
             components = {"orb_quality": oq, "volume": vol, "candle": 100 if green else 0}
         elif name == "إعادة اختبار":
             prior = 100 if c.get("prior_break", False) else 0
@@ -2753,7 +2753,7 @@ def analyze_daily(
             pull = clip((8.0-abs(pb-2.0))/7.5*100)
             q = 0.60*drive + 0.40*pull
             components = {"drive": drive, "pullback": pull}
-        elif name == "استعادة قمة الفترة":
+        elif name == "استعادة قمة اليوم":
             match = 100 if c.get("hod_reclaim", False) else 0
             level = float(c.get("hod_level", 0.0) or 0.0)
             dist = abs(price_v-level)/max(price_v,1e-9)*100 if level > 0 else 1.0
@@ -2781,33 +2781,6 @@ def analyze_daily(
             q = 0.40*early_range + 0.30*near + 0.30*holding
             components = {"early_range": early_range, "near_resistance": near, "holding": holding}
 
-        # Core score uses only structural components. Generic context such as
-        # volume/candle/higher-TF is counted only once in the 30% Confirmation block.
-        core_keys = {
-            "اختراق مؤكد": {"breakout_quality"},
-            "اختراق نطاق الافتتاح": {"orb_quality"},
-            "إعادة اختبار": {"prior_break", "near_level", "reclaim"},
-            "ارتداد VWAP": {"touch", "reclaim"},
-            "ارتداد EMA20": {"touch", "reclaim"},
-            "سحب سيولة": {"sweep"},
-            "سحب سيولة مع Displacement": {"sweep", "displacement"},
-            "ضغط ثم انفجار": {"match"},
-            "استمرار الزخم": {"momentum"},
-            "علم صاعد": {"impulse", "flag"},
-            "استعادة مستوى": {"match", "reclaim"},
-            "دخول بعد Opening Drive": {"drive", "pullback"},
-            "استعادة قمة الفترة": {"match", "reclaim"},
-            "استعادة بعد فشل ORB": {"failed_reclaim", "orb_quality", "reclaim"},
-            "استمرار ABC": {"a", "b", "c_break"},
-            "دخول مبكر": {"early_range", "near_resistance", "holding"},
-        }.get(name, set())
-        core_values = {k: float(components.get(k, 0.0) or 0.0) for k in core_keys}
-        all_weights = _strategy_weights_for(policy_for_strategy, name)
-        core_weights = {k: float(w) for k, w in all_weights.items() if k in core_values}
-        total_core = sum(max(0.0, w) for w in core_weights.values()) or 1.0
-        core_weights = {k: max(0.0, w) / total_core for k, w in core_weights.items()}
-        core_score = sum(core_values[k] * core_weights.get(k, 0.0) for k in core_values)
-
         # 30% Confirmation block: daily-specific context, not Core.
         confirmation_weights = {
             "اختراق مؤكد": {"volume": .60, "candle": .40},
@@ -2822,7 +2795,7 @@ def analyze_daily(
             "علم صاعد": {"trend": .15, "above_vwap": .15, "above_open": .10, "h4": .10, "market": .10, "volume": .15, "candle": .10, "no_orb": .15},
             "استعادة مستوى": {"trend": .15, "above_vwap": .15, "above_open": .10, "h4": .10, "market": .10, "volume": .15, "candle": .15},
             "دخول بعد Opening Drive": {"trend": .15, "above_vwap": .15, "above_open": .10, "h4": .10, "market": .10, "volume": .15, "candle": .10, "no_breakout": .075, "no_orb": .075},
-            "استعادة قمة الفترة": {"above_vwap": .15, "above_open": .10, "trend": .15, "h4": .10, "market": .10, "volume": .15, "candle": .15},
+            "استعادة قمة اليوم": {"above_vwap": .15, "above_open": .10, "trend": .15, "h4": .10, "market": .10, "volume": .15, "candle": .15},
             "استعادة بعد فشل ORB": {"trend": .15, "above_vwap": .15, "above_open": .10, "h4": .10, "market": .10, "volume": .15, "candle": .10, "no_orb": .15},
             "استمرار ABC": {"trend": .15, "above_vwap": .15, "above_open": .10, "h4": .10, "market": .10, "volume": .15, "candle": .10, "momentum": .15},
             "دخول مبكر": {"trend": .15, "above_vwap": .15, "above_open": .10, "h4": .10, "market": .10, "volume": .15, "candle": .15},
@@ -2842,8 +2815,32 @@ def analyze_daily(
         }
         confirmation_score = sum(confirmation_values[k] * w for k, w in confirmation_weights.items())
 
-        # Apply the fixed 70/30 split exactly once.
-        final_q = 0.70 * core_score + 0.30 * confirmation_score
+        # Core score uses only structural components. Generic confirmation
+        # factors are excluded here so they are counted once, in the 30% block.
+        core_keys = {
+            "اختراق مؤكد": {"breakout_quality"},
+            "اختراق نطاق الافتتاح": {"orb_quality"},
+            "إعادة اختبار": {"prior_break", "near_level", "reclaim"},
+            "ارتداد VWAP": {"touch", "reclaim"},
+            "ارتداد EMA20": {"touch", "reclaim"},
+            "سحب سيولة": {"sweep"},
+            "سحب سيولة مع Displacement": {"sweep", "displacement"},
+            "ضغط ثم انفجار": {"match"},
+            "استمرار الزخم": {"momentum"},
+            "علم صاعد": {"impulse", "flag"},
+            "استعادة مستوى": {"match", "reclaim"},
+            "دخول بعد Opening Drive": {"drive", "pullback"},
+            "استعادة قمة اليوم": {"match", "reclaim"},
+            "استعادة بعد فشل ORB": {"failed_reclaim", "orb_quality", "reclaim"},
+            "استمرار ABC": {"a", "b", "c_break"},
+            "دخول مبكر": {"early_range", "near_resistance", "holding"},
+        }.get(name, set())
+        all_weights = _strategy_weights_for(policy_for_strategy, name)
+        core_weights = {k: w for k, w in all_weights.items() if k in core_keys}
+        total_core = sum(core_weights.values()) or 1.0
+        core_weights = {k: w / total_core for k, w in core_weights.items()}
+        base_q = _weighted_strategy_score(components, core_weights)
+        final_q = 0.70 * clip(base_q) + 0.30 * confirmation_score
 
         # Store the components for the existing Adaptive learner/OOS engine.
         strategy_component_scores[name] = dict(components)
@@ -2909,7 +2906,7 @@ def analyze_daily(
             "استعادة بعد فشل ORB": 100.0 if orb_failed_reclaim else 0.0,
             "استمرار ABC": 100.0 if abc_continuation else 0.0,
             "دخول بعد Opening Drive": 100.0 if opening_drive_pullback else 0.0,
-            "استعادة قمة الفترة": 100.0 if hod_reclaim else 0.0,
+            "استعادة قمة اليوم": 100.0 if hod_reclaim else 0.0,
             "دخول مبكر": 45.0,
         }
         return round(max(0.0, min(120.0, identity.get(name, 0.0))), 2)
@@ -2934,7 +2931,6 @@ def analyze_daily(
         "إعادة اختبار": 8,
         "سحب سيولة": 7,
         "استعادة قمة اليوم": 6,
-        "استعادة قمة الفترة": 6,
         "استعادة مستوى": 5,
         "ارتداد VWAP": 4,
         "ارتداد EMA20": 3,
@@ -3179,8 +3175,8 @@ def analyze_daily(
     elif entry_type == "دخول بعد Opening Drive":
         reasons.append("دفعة افتتاحية قوية ثم تراجع منظم واستعادة")
         factors.append("opening_drive_pullback")
-    elif entry_type == "استعادة قمة الفترة":
-        reasons.append("استعادة قمة الفترة بعد تراجع تحتها")
+    elif entry_type == "استعادة قمة اليوم":
+        reasons.append("استعادة قمة اليوم بعد تراجع تحتها")
         factors.append("hod_reclaim")
     else:
         reasons.append("دخول مبكر فوق VWAP")
@@ -3300,8 +3296,8 @@ def analyze_daily(
         score = min(score, float(limits.get("استمرار ABC", 98.0)))
     elif entry_type == "دخول بعد Opening Drive":
         score = min(score, float(limits.get("دخول بعد Opening Drive", 98.0)))
-    elif entry_type == "استعادة قمة الفترة":
-        score = min(score, float(limits.get("استعادة قمة الفترة", 98.0)))
+    elif entry_type == "استعادة قمة اليوم":
+        score = min(score, float(limits.get("استعادة قمة اليوم", 98.0)))
     elif entry_type == "اختراق نطاق الافتتاح":
         score = min(score, float(limits.get("اختراق نطاق الافتتاح", 99.0)))
     elif entry_type == "اختراق مؤكد":
@@ -3344,7 +3340,7 @@ def analyze_daily(
     strong_for_grade = (
         score_i >= 95
         and strong_alignment
-        and entry_type in {"اختراق مؤكد", "اختراق نطاق الافتتاح", "إعادة اختبار", "ارتداد VWAP", "ارتداد EMA20", "سحب سيولة", "ضغط ثم انفجار", "استمرار الزخم", "علم صاعد", "استعادة مستوى", "دخول بعد Opening Drive", "استعادة قمة الفترة", "استعادة بعد فشل ORB", "استمرار ABC", "سحب سيولة مع Displacement"}
+        and entry_type in {"اختراق مؤكد", "اختراق نطاق الافتتاح", "إعادة اختبار", "ارتداد VWAP", "ارتداد EMA20", "سحب سيولة", "ضغط ثم انفجار", "استمرار الزخم", "علم صاعد", "استعادة مستوى", "دخول بعد Opening Drive", "استعادة قمة اليوم", "استعادة بعد فشل ORB", "استمرار ABC", "سحب سيولة مع Displacement"}
         and h4_state != "معاكس"
     )
 
@@ -3404,7 +3400,7 @@ def analyze_daily(
         stop_candidates.append(float(today_d["Low"].tail(4).min()) * 0.997)
     elif entry_type == "دخول بعد Opening Drive":
         stop_candidates.append(drive_level * 0.997 if drive_level > 0 else recent_low * 0.997)
-    elif entry_type == "استعادة قمة الفترة":
+    elif entry_type == "استعادة قمة اليوم":
         stop_candidates.append(hod_level * 0.997 if hod_level > 0 else recent_low * 0.997)
     elif entry_type in {"ضغط ثم انفجار", "استمرار الزخم"}:
         stop_candidates.append(float(today_d["Low"].tail(5).min()) * 0.997)
@@ -3683,7 +3679,7 @@ def _daily_strategy_route_scores(*, price: float, trend: bool, above_vwap: bool,
     scores["اختراق مؤكد"]=(35 if breakout else 0)+20*(1 if above_vwap else 0)+min(20,max(0,mom)*4)+min(15,max(0,vol_ratio-1)*10)
     scores["إعادة اختبار"]=(35 if pullback else 0)+(20 if near_high else 0)+(15 if above_vwap else 0)+(10 if trend else 0)
     scores["دخول مبكر"]=(30 if above_vwap and above_open else 0)+(20 if trend else 0)+min(20,max(0,2.5-mom)*8)
-    scores["ارتداد VWAP"]=(40 if near_vwap else 0)+(20 if above_vwap else 0)+(15 if trend else 0)
+    scores["ارتداد VWAP"]=(35 if near_vwap else 0)+(20 if above_vwap else 0)+(15 if trend else 0)
     scores["ارتداد EMA20"]=(40 if near_ema else 0)+(20 if trend else 0)+(10 if above_vwap else 0)
     scores["سحب سيولة"]=(45 if sweep else 0)+(15 if above_vwap else 0)+min(20,max(0,vol_ratio-1)*10)
     scores["اختراق نطاق الافتتاح"]=(45 if orb else 0)+(15 if above_vwap else 0)+min(20,max(0,mom)*4)
@@ -3692,7 +3688,7 @@ def _daily_strategy_route_scores(*, price: float, trend: bool, above_vwap: bool,
     scores["علم صاعد"]=(40 if flag else 0)+(15 if trend else 0)+(15 if above_vwap else 0)
     scores["استعادة مستوى"]=(40 if reclaim or near_high else 0)+(20 if above_vwap else 0)+(15 if trend else 0)
     scores["دخول بعد Opening Drive"]=(45 if drive else 0)+(20 if above_vwap else 0)+min(15,max(0,mom)*3)
-    scores["استعادة قمة الفترة"]=(45 if near_high and price>=last_high*0.995 else 0)+(20 if above_vwap else 0)+(10 if trend else 0)
+    scores["استعادة قمة اليوم"]=(45 if near_high and price>=last_high*0.995 else 0)+(20 if above_vwap else 0)+(10 if trend else 0)
     scores["استعادة بعد فشل ORB"]=(45 if failed_orb else 0)+(20 if above_vwap else 0)+(10 if trend else 0)
     scores["استمرار ABC"]=(40 if abc else 0)+(20 if trend else 0)+min(15,max(0,mom)*3)
     scores["سحب سيولة مع Displacement"]=(45 if sweep and mom>0.5 else 0)+(20 if vol_ratio>=1.2 else 0)+(10 if trend else 0)
