@@ -405,25 +405,28 @@ def _rate(rows: list[dict]) -> float:
 
 
 def _strategy_weight_defaults() -> dict:
-    """Baseline component weights for the 16 strategy-quality scores."""
+    """Baseline weights for structural/Core components only.
+
+    Confirmation components are scored separately in the fixed 30% Confirmation
+    block, so they are intentionally not part of the adaptive Core weights.
+    """
     return {
-        "اختراق مؤكد": {"breakout_quality": .55, "volume": .25, "candle": .20},
-        "اختراق نطاق الافتتاح": {"orb_quality": .55, "volume": .25, "candle": .20},
-        "إعادة اختبار": {"prior_break": .25, "near_level": .35, "reclaim": .25, "volume": .15},
-        "ارتداد VWAP": {"touch": .30, "reclaim": .30, "candle": .20, "momentum": .10, "volume": .10},
-        "ارتداد EMA20": {"touch": .30, "reclaim": .30, "candle": .20, "higher_tf": .10, "volume": .10},
-        "سحب سيولة": {"sweep": .35, "volume": .25, "candle": .20, "momentum": .20},
-        "سحب سيولة مع Displacement": {"sweep": .20, "displacement": .40, "volume": .20, "momentum": .10, "candle": .10},
-        "ضغط ثم انفجار": {"match": .40, "volume": .25, "candle": .20, "momentum": .15},
-        "استمرار الزخم": {"momentum": .45, "volume": .30, "candle": .15, "higher_tf": .10},
-        "علم صاعد": {"impulse": .30, "flag": .30, "candle": .20, "volume": .20},
-        "استعادة مستوى": {"match": .35, "reclaim": .25, "candle": .20, "volume": .20},
-        "دخول بعد Opening Drive": {"drive": .35, "pullback": .25, "candle": .20, "volume": .20},
-        "استعادة قمة الفترة": {"match": .35, "reclaim": .25, "candle": .20, "volume": .20},
-        "استعادة قمة اليوم": {"match": .35, "reclaim": .25, "candle": .20, "volume": .20},
-        "استعادة بعد فشل ORB": {"failed_reclaim": .25, "orb_quality": .25, "reclaim": .30, "momentum": .10, "volume": .10},
-        "استمرار ABC": {"a": .25, "b": .25, "c_break": .30, "momentum": .10, "volume": .10},
-        "دخول مبكر": {"early_range": .30, "near_resistance": .25, "holding": .20, "momentum": .15, "candle": .10},
+        "اختراق مؤكد": {"breakout_quality": 1.0},
+        "اختراق نطاق الافتتاح": {"orb_quality": 1.0},
+        "إعادة اختبار": {"prior_break": .30, "near_level": .40, "reclaim": .30},
+        "ارتداد VWAP": {"touch": .50, "reclaim": .50},
+        "ارتداد EMA20": {"touch": .50, "reclaim": .50},
+        "سحب سيولة": {"sweep": 1.0},
+        "سحب سيولة مع Displacement": {"sweep": .35, "displacement": .65},
+        "ضغط ثم انفجار": {"match": 1.0},
+        "استمرار الزخم": {"momentum": 1.0},
+        "علم صاعد": {"impulse": .50, "flag": .50},
+        "استعادة مستوى": {"match": .60, "reclaim": .40},
+        "دخول بعد Opening Drive": {"drive": .60, "pullback": .40},
+        "استعادة قمة الفترة": {"match": .60, "reclaim": .40},
+        "استعادة بعد فشل ORB": {"failed_reclaim": .35, "orb_quality": .25, "reclaim": .40},
+        "استمرار ABC": {"a": .30, "b": .30, "c_break": .40},
+        "دخول مبكر": {"early_range": .40, "near_resistance": .30, "holding": .30},
     }
 
 
@@ -2062,7 +2065,6 @@ def analyze_daily(
         daily = fetch_intraday(symbol, interval="1d", period="2y")
 
     if weekly is None or len(weekly) < 60 or daily is None or len(daily) < 80:
-        log.info("DAILY NO_SIGNAL | %s | reason=insufficient_or_missing_weekly_daily_data", symbol)
         return None
 
     # Daily bars can be current during regular session. The engine is deliberately
@@ -2090,7 +2092,6 @@ def analyze_daily(
 
     price = float(today_d["Close"].iloc[-1])
     if price <= 0 or price > float(MAX_AUTO_PRICE):
-        log.info("DAILY NO_SIGNAL | %s | reason=invalid_or_over_max_price | price=%.4f", symbol, price)
         return None
 
     day_open = float(today_d["Open"].iloc[-1])
@@ -2104,16 +2105,14 @@ def analyze_daily(
     vwap_note = "فوق VWAP 20 يوم" if above_vwap else "تحت VWAP 20 يوم"
     above_open = price >= day_open
 
-    vol_today = float(today_d["Volume"].sum())
-    bars = max(len(today_d), 1)
-    avg_bar_today = vol_today / bars
+    current_day_volume = float(today_d["Volume"].iloc[-1])
     hist_5 = daily[daily.index.date < last_day].tail(120)
     vol_hist = (
         float(hist_5["Volume"].mean())
         if not hist_5.empty
         else float(daily["Volume"].tail(60).mean() or 1)
     )
-    vol_ratio = avg_bar_today / vol_hist if vol_hist else 1.0
+    vol_ratio = current_day_volume / vol_hist if vol_hist else 1.0
     vol_ok = vol_ratio >= 0.90
 
     hc = weekly["Close"]
@@ -2178,7 +2177,7 @@ def analyze_daily(
         and price < level_high * 0.997
         and not above_vwap
     ) or (dump and not above_vwap)
-    retest = prior_break and near_level and price >= level_high * 0.997 and above_vwap and not failed
+    retest = prior_break and near_level and price >= level_high * 0.997
 
     # 1) VWAP Bounce/Reclaim: رجوع منظم إلى VWAP ثم استعادة المستوى.
     recent4 = today_d.tail(4)
@@ -2187,12 +2186,7 @@ def analyze_daily(
         vwap_touch = bool((recent4["Low"].astype(float) <= vwap_last * 1.006).any())
     except Exception:
         vwap_touch = False
-    vwap_bounce = (
-        above_vwap and vwap_touch and not failed
-        and last_green and (mom > 0.05)
-        and vol_ratio >= 1.0
-        and trend_up and h4_state != "معاكس"
-    )
+    vwap_bounce = vwap_touch and above_vwap
 
     # 2) EMA20 Pullback: ترند صاعد + تصحيح صحي إلى EMA20 + استعادة.
     ema_touch = False
@@ -2200,12 +2194,7 @@ def analyze_daily(
         ema_touch = bool((recent4["Low"].astype(float) <= e5 * 1.006).any())
     except Exception:
         ema_touch = False
-    ema_pullback = (
-        trend_up and ema_touch and price >= e5 * 1.001
-        and last_green and mom > 0.05
-        and vol_ratio >= 1.0
-        and h4_state != "معاكس" and not failed
-    )
+    ema_pullback = ema_touch and price >= e5 * 1.001
 
     # 3) Liquidity Sweep + Reclaim: كسر قاع قريب ثم استعادة المستوى بسرعة.
     support_level = 0.0
@@ -2217,11 +2206,7 @@ def analyze_daily(
             recent3 = today_d.tail(3)
             swept = (recent3["Low"].astype(float) < support_level * 0.998).any()
             reclaimed = price >= support_level * 1.002
-            liquidity_sweep = bool(
-                swept and reclaimed and last_green and mom > 0.05
-                and vol_ratio >= 1.0 and h4_state != "معاكس"
-                and not failed and above_vwap
-            )
+            liquidity_sweep = bool(swept and reclaimed)
     except Exception:
         liquidity_sweep = False
 
@@ -2243,13 +2228,8 @@ def analyze_daily(
             displacement = bool(
                 cur_c > cur_o and cur_body / cur_range >= 0.55 and close_pos >= 0.75
                 and (med_range <= 0 or cur_range >= med_range * 1.35)
-                and vol_ratio >= 1.25
             )
-            liquidity_displacement = bool(
-                swept and reclaimed and displacement and trend_up and above_vwap and above_open
-                and h4_state != "معاكس" and market_ok and not failed
-                and mom > 0.08 and ext_tmp <= 6.0
-            )
+            liquidity_displacement = bool(swept and reclaimed and displacement)
     except Exception:
         liquidity_displacement = False
 
@@ -2265,11 +2245,7 @@ def analyze_daily(
     orb_breakout = False
     try:
         prior_orb = float(daily["Close"].iloc[-2]) < orb_high * 1.001 if orb_high > 0 and len(daily) >= 2 else False
-        orb_breakout = bool(
-            orb_high > 0 and price >= orb_high * 1.001 and prior_orb and last_green
-            and vol_ratio >= 1.0 and above_vwap
-            and h4_state != "معاكس" and not failed
-        )
+        orb_breakout = bool(orb_high > 0 and price >= orb_high * 1.001 and prior_orb)
     except Exception:
         orb_breakout = False
 
@@ -2288,14 +2264,7 @@ def analyze_daily(
             range_now = max(highs.iloc[-1] - lows.iloc[-1], price * 0.0001)
             close_pos = (closes.iloc[-1] - lows.iloc[-1]) / range_now
             prior_move = (closes.iloc[-2] - closes.iloc[-4]) / max(closes.iloc[-4], 1e-9) * 100
-            momentum_continuation = bool(
-                trend_up and above_vwap and above_open and not failed and not breakout_now
-                and h4_state != "معاكس" and market_ok
-                and rising and green_now and prior_move >= 0.35
-                and mom > 0.08 and vol_ratio >= 1.05
-                and body_now / range_now >= 0.45 and close_pos >= 0.65
-                and ext_tmp <= 6.0
-            )
+            momentum_continuation = bool(rising and green_now and prior_move >= 0.35 and mom > 0.08)
     except Exception:
         momentum_continuation = False
 
@@ -2315,11 +2284,7 @@ def analyze_daily(
             expansion = cur_range >= max(med_range * 1.35, price * 0.003)
             compression = comp_width_pct <= 2.2 and med_range > 0
             compression_expansion = bool(
-                compression and expansion and float(cur["Close"]) > float(cur["Open"])
-                and cur_pos >= 0.70 and vol_ratio >= 1.20
-                and above_vwap and above_open and trend_up
-                and h4_state != "معاكس" and market_ok and not failed
-                and cur_body / cur_range >= 0.45 and ext_tmp <= 7.0
+                compression and expansion
             )
     except Exception:
         compression_expansion = False
@@ -2359,17 +2324,7 @@ def analyze_daily(
             flag_low = float(flag["Low"].min())
             flag_range = (flag_high - flag_low) / max(flag_high, 1e-9) * 100
             breakout_flag = price >= flag_high * 1.001
-            bull_flag = bool(
-                impulse_gain >= 1.0
-                and flag_range <= 2.0
-                and breakout_flag
-                and trend_up and above_vwap and above_open
-                and h4_state != "معاكس" and market_ok and not failed
-                and last_green and mom > 0.05
-                and vol_ratio >= 1.05
-                and ext_tmp <= 6.0
-                and not orb_breakout
-            )
+            bull_flag = bool(impulse_gain >= 1.0 and flag_range <= 2.0 and breakout_flag)
     except Exception:
         bull_flag = False
 
@@ -2386,15 +2341,7 @@ def analyze_daily(
             resistance_was_lost = prev_close < reclaim_level * 0.999
             reclaimed = price >= reclaim_level * 1.001
             touches = int((prior["High"] >= reclaim_level * 0.995).sum())
-            resistance_reclaim = bool(
-                touches >= 2
-                and resistance_was_lost and reclaimed
-                and trend_up and above_vwap and above_open
-                and h4_state != "معاكس" and market_ok and not failed
-                and last_green and mom > 0.05
-                and vol_ratio >= 1.05
-                and ext_tmp <= 6.0
-            )
+            resistance_reclaim = bool(touches >= 2 and resistance_was_lost and reclaimed)
     except Exception:
         resistance_reclaim = False
 
@@ -2416,13 +2363,7 @@ def analyze_daily(
                 reclaim_drive = price >= drive_high * 0.999
                 controlled_pullback = 0.50 <= pullback_from_high <= 8.0
                 not_chasing = ext_tmp <= 6.0
-                opening_drive_pullback = bool(
-                    trend_up and above_vwap and above_open
-                    and h4_state != "معاكس" and market_ok and not failed
-                    and drive_return >= 2.0 and controlled_pullback and reclaim_drive
-                    and last_green and mom > 0.20 and vol_ratio >= 1.05
-                    and not breakout_now and not orb_breakout and not_chasing
-                )
+                opening_drive_pullback = bool(drive_return >= 2.0 and controlled_pullback and reclaim_drive)
     except Exception:
         opening_drive_pullback = False
 
@@ -2439,14 +2380,7 @@ def analyze_daily(
                 pullback_below_hod = float(today_d["Close"].iloc[-2]) < hod_level * 0.999
                 reclaimed_hod = price >= hod_level * 1.001
                 had_hod = float(prior["High"].max()) >= hod_level * 0.999
-                hod_reclaim = bool(
-                    had_hod and pullback_below_hod and reclaimed_hod
-                    and above_vwap and above_open and trend_up
-                    and h4_state != "معاكس" and market_ok and not failed
-                    and last_green and mom > 0.05
-                    and vol_ratio >= 1.05
-                    and ext_tmp <= 6.0
-                )
+                hod_reclaim = bool(had_hod and pullback_below_hod and reclaimed_hod)
     except Exception:
         hod_reclaim = False
 
@@ -2459,15 +2393,7 @@ def analyze_daily(
             broke = bool((post_orb["High"].astype(float) >= orb_high * 1.002).any())
             failure = bool((post_orb["Close"].astype(float) <= orb_high * 0.998).any())
             reclaim = price >= orb_high * 1.001
-            orb_failed_reclaim = bool(
-                broke and failure and reclaim
-                and trend_up and above_vwap and above_open
-                and h4_state != "معاكس" and market_ok and not failed
-                and last_green and mom > 0.05
-                and vol_ratio >= 1.05
-                and ext_tmp <= 6.0
-                and not orb_breakout
-            )
+            orb_failed_reclaim = bool(broke and failure and reclaim)
     except Exception:
         orb_failed_reclaim = False
 
@@ -2492,10 +2418,7 @@ def analyze_daily(
                 a_gain >= 0.70
                 and 20.0 <= b_retrace <= 65.0
                 and c_break and price >= a_high * 0.999
-                and c_last_green and trend_up and above_vwap and above_open
-                and h4_state != "معاكس" and market_ok and not failed
-                and mom > 0.05 and vol_ratio >= 1.05
-                and ext_tmp <= 6.0
+                and c_last_green
             )
     except Exception:
         abc_continuation = False
@@ -2525,10 +2448,8 @@ def analyze_daily(
         early_near_resistance = level_high > 0 and abs(price - level_high) / max(price, 1e-9) * 100 <= 1.5
         early_holding = float(recent3["Close"].iloc[-1]) >= float(recent3["Close"].iloc[0])
         early = bool(
-            trend_up and above_vwap and above_open and not breakout_now and not failed
+            not breakout_now
             and early_near_resistance and early_range <= 3.0 and early_holding
-            and last_green and mom > 0.03 and vol_ratio >= 0.95 and ext_tmp <= 2.2
-            and h4_state != "معاكس" and market_ok
             and not (retest or orb_breakout or breakout_now or liquidity_displacement
                      or liquidity_sweep or compression_expansion or momentum_continuation
                      or bull_flag or resistance_reclaim or orb_failed_reclaim
@@ -2543,7 +2464,6 @@ def analyze_daily(
     # Failed breakout is a rejection/filter condition, not an entry strategy.
     # If there is no separate recovery setup below, the candidate is discarded.
     if failed and not (retest or liquidity_displacement or liquidity_sweep or orb_failed_reclaim or abc_continuation or opening_drive_pullback or hod_reclaim or vwap_bounce or ema_pullback or orb_breakout or breakout_now or compression_expansion or momentum_continuation or bull_flag or resistance_reclaim):
-        log.info("DAILY NO_SIGNAL | %s | reason=failed_breakout_without_recovery_setup", symbol)
         return None
 
     # Multi-label strategy detection: every strategy that genuinely matches is
@@ -2552,9 +2472,9 @@ def analyze_daily(
     matched_entry_types = []
     if retest:
         matched_entry_types.append("إعادة اختبار")
-    if orb_breakout and orb_breakout_ok:
+    if orb_breakout:
         matched_entry_types.append("اختراق نطاق الافتتاح")
-    if breakout_now and breakout_ok and vol_ratio >= 1.0:
+    if breakout_now:
         matched_entry_types.append("اختراق مؤكد")
     if liquidity_displacement:
         matched_entry_types.append("سحب سيولة مع Displacement")
@@ -2624,7 +2544,7 @@ def analyze_daily(
             if market:
                 add("صلاحية السوق/الإعداد غير متحققة", v("setup_market_permission", v("market_ok", False)))
             if state:
-                add("حالة الإطار معاكسة", str(v("m15_state", v("h4_state", "محايد"))) != "معاكس")
+                add("حالة الإطار معاكسة", str(v("m15_state", v("h4_state", "محايد"))) == "معاكس")
             if no_failed:
                 add("يوجد failed/rejection", not v("failed", False))
             if mom_min is not None:
@@ -2756,7 +2676,7 @@ def analyze_daily(
     strategy_component_scores: dict[str, dict[str, float]] = {}
 
     def _strategy_strength(name: str) -> float:
-        """Independent 100-point setup-quality score; stock quality is scored separately."""
+        """Independent 100-point strategy score: 70% structural Core + 30% Confirmation."""
         def clip(x, lo=0.0, hi=100.0):
             return max(lo, min(hi, float(x)))
 
@@ -2765,127 +2685,171 @@ def analyze_daily(
         vr = float(c.get("vol_session_ratio", c.get("vol_ratio", 1.0)) or 1.0)
         green = bool(c.get("last_green", False))
         mom = float(c.get("mom", 0.0) or 0.0)
-        mstate = str(c.get("m15_state", c.get("h4_state", "محايد")))
+        mstate = str(c.get("h4_state", "محايد"))
 
+        # Structural/Core components. These define the setup itself.
         if name == "اختراق مؤكد":
             bq = clip(c.get("breakout_quality", 0.0))
             vol = clip((vr - 0.75) / 0.75 * 100)
             q = 0.55*bq + 0.25*vol + 0.20*(100 if green else 0)
+            components = {"breakout_quality": bq, "volume": vol, "candle": 100 if green else 0}
         elif name == "اختراق نطاق الافتتاح":
             oq = clip(c.get("orb_quality", 0.0))
             vol = clip((vr - 0.75) / 0.75 * 100)
             q = 0.55*oq + 0.25*vol + 0.20*(100 if green else 0)
+            components = {"orb_quality": oq, "volume": vol, "candle": 100 if green else 0}
         elif name == "إعادة اختبار":
             prior = 100 if c.get("prior_break", False) else 0
             level = float(c.get("level_high", 0.0) or 0.0)
             dist = abs(price_v-level)/max(price_v,1e-9)*100 if level > 0 else 0.7
             near = clip((0.7-dist)/0.7*100)
             reclaim = clip((price_v/max(level,1e-9)-0.997)/0.004*100) if level > 0 else 0
-            q = 0.25*prior + 0.35*near + 0.25*reclaim + 0.15*clip((vr-0.8)/0.6*100)
+            q = 0.25*prior + 0.35*near + 0.25*reclaim
+            components = {"prior_break": prior, "near_level": near, "reclaim": reclaim}
         elif name == "ارتداد VWAP":
             touch = 100 if c.get("vwap_touch", False) else 0
             vwap = float(c.get("vwap_last", 0.0) or 0.0)
             reclaim = clip((price_v/max(vwap,1e-9)-0.998)/0.004*100) if vwap > 0 else 0
-            q = 0.30*touch + 0.30*reclaim + 0.20*(100 if green else 0) + 0.10*clip((mom-0.05)/0.20*100) + 0.10*clip((vr-0.9)/0.6*100)
+            q = 0.50*touch + 0.50*reclaim
+            components = {"touch": touch, "reclaim": reclaim}
         elif name == "ارتداد EMA20":
             touch = 100 if c.get("ema_touch", False) else 0
-            ema = float(c.get("e20", 0.0) or 0.0)
+            ema = float(c.get("e5", c.get("e20", 0.0)) or 0.0)
             reclaim = clip((price_v/max(ema,1e-9)-1.001)/0.004*100) if ema > 0 else 0
-            q = 0.30*touch + 0.30*reclaim + 0.20*(100 if green else 0) + 0.10*(100 if mstate == "داعم" else 0) + 0.10*clip((vr-0.9)/0.6*100)
+            q = 0.50*touch + 0.50*reclaim
+            components = {"touch": touch, "reclaim": reclaim}
         elif name == "سحب سيولة":
             sweep = 100 if c.get("liquidity_sweep", False) else 0
-            q = 0.35*sweep + 0.25*clip((vr-0.9)/0.7*100) + 0.20*(100 if green else 0) + 0.20*clip((mom-0.05)/0.25*100)
+            q = sweep
+            components = {"sweep": sweep}
         elif name == "سحب سيولة مع Displacement":
             sweep = 100 if c.get("liquidity_sweep", False) else 0
             disp = 100 if c.get("liquidity_displacement", False) else 0
-            q = 0.20*sweep + 0.40*disp + 0.20*clip((vr-1.0)/0.75*100) + 0.10*clip((mom-0.08)/0.25*100) + 0.10*(100 if green else 0)
+            q = 0.35*sweep + 0.65*disp
+            components = {"sweep": sweep, "displacement": disp}
         elif name == "ضغط ثم انفجار":
             match = 100 if c.get("compression_expansion", False) else 0
-            q = 0.40*match + 0.25*clip((vr-1.2)/0.8*100) + 0.20*(100 if green else 0) + 0.15*clip((mom-0.05)/0.25*100)
+            q = match
+            components = {"match": match}
         elif name == "استمرار الزخم":
-            q = 0.45*clip((mom-0.08)/0.50*100) + 0.30*clip((vr-1.0)/0.75*100) + 0.15*(100 if green else 0) + 0.10*(100 if mstate == "داعم" else 0)
+            mom_core = clip((mom-0.08)/0.50*100)
+            q = mom_core
+            components = {"momentum": mom_core}
         elif name == "علم صاعد":
             impulse = clip((float(c.get("impulse_gain",0.0) or 0.0)-1.0)/2.0*100)
             flag = clip((2.0-float(c.get("flag_range",2.0) or 2.0))/1.5*100)
-            q = 0.30*impulse + 0.30*flag + 0.20*(100 if green else 0) + 0.20*clip((vr-0.9)/0.7*100)
+            q = 0.50*impulse + 0.50*flag
+            components = {"impulse": impulse, "flag": flag}
         elif name == "استعادة مستوى":
             match = 100 if c.get("resistance_reclaim", False) else 0
             level = float(c.get("reclaim_level", 0.0) or 0.0)
             dist = abs(price_v-level)/max(price_v,1e-9)*100 if level > 0 else 1.0
             reclaim = clip((0.6-dist)/0.6*100)
-            q = 0.35*match + 0.25*reclaim + 0.20*(100 if green else 0) + 0.20*clip((vr-0.9)/0.7*100)
+            q = 0.60*match + 0.40*reclaim
+            components = {"match": match, "reclaim": reclaim}
         elif name == "دخول بعد Opening Drive":
-            drive = clip((float(c.get("drive_return",0.0) or 0.0)-1.0)/2.0*100)
+            drive = clip((float(c.get("drive_return",0.0) or 0.0)-2.0)/2.0*100)
             pb = float(c.get("pullback_from_high", 99.0) or 99.0)
-            pull = clip((2.5-abs(pb-1.0))/1.5*100)
-            q = 0.35*drive + 0.25*pull + 0.20*(100 if green else 0) + 0.20*clip((vr-0.9)/0.7*100)
-        elif name in {"استعادة قمة اليوم", "استعادة قمة الفترة"}:
+            pull = clip((8.0-abs(pb-2.0))/7.5*100)
+            q = 0.60*drive + 0.40*pull
+            components = {"drive": drive, "pullback": pull}
+        elif name == "استعادة قمة الفترة":
             match = 100 if c.get("hod_reclaim", False) else 0
             level = float(c.get("hod_level", 0.0) or 0.0)
             dist = abs(price_v-level)/max(price_v,1e-9)*100 if level > 0 else 1.0
             reclaim = clip((0.6-dist)/0.6*100)
-            q = 0.35*match + 0.25*reclaim + 0.20*(100 if green else 0) + 0.20*clip((vr-0.9)/0.7*100)
+            q = 0.60*match + 0.40*reclaim
+            components = {"match": match, "reclaim": reclaim}
         elif name == "استعادة بعد فشل ORB":
-            failed = 100 if c.get("orb_failed_reclaim", False) else 0
-            # Failure and reclaim are structural components; do not reward merely having orb_high.
+            failed_reclaim = 100 if c.get("orb_failed_reclaim", False) else 0
             orbq = clip(float(c.get("orb_quality", 0.0) or 0.0))
             orb_high = float(c.get("orb_high", 0.0) or 0.0)
             reclaim = clip((price_v/max(orb_high,1e-9)-1.001)/0.004*100) if orb_high > 0 else 0
-            q = 0.25*failed + 0.25*orbq + 0.30*reclaim + 0.10*clip((mom-0.05)/0.25*100) + 0.10*clip((vr-0.9)/0.7*100)
+            q = 0.35*failed_reclaim + 0.25*orbq + 0.40*reclaim
+            components = {"failed_reclaim": failed_reclaim, "orb_quality": orbq, "reclaim": reclaim}
         elif name == "استمرار ABC":
             a = clip((float(c.get("a_gain",0.0) or 0.0)-0.70)/1.5*100)
             b = clip(100-abs(float(c.get("b_retrace",42.5) or 42.5)-42.5)/22.5*100)
             cb = 100 if c.get("c_break", False) else 0
-            q = 0.25*a + 0.25*b + 0.30*cb + 0.10*clip((mom-0.05)/0.25*100) + 0.10*clip((vr-0.9)/0.7*100)
+            q = 0.30*a + 0.30*b + 0.40*cb
+            components = {"a": a, "b": b, "c_break": cb}
         else:  # دخول مبكر
             er = float(c.get("early_range",3.0) or 3.0)
             early_range = clip((3.0-er)/2.0*100)
             near = 100 if c.get("early_near_resistance", False) else 0
             holding = 100 if c.get("early_holding", False) else 0
-            q = 0.30*early_range + 0.25*near + 0.20*holding + 0.15*clip((mom-0.05)/0.25*100) + 0.10*(100 if green else 0)
+            q = 0.40*early_range + 0.30*near + 0.30*holding
+            components = {"early_range": early_range, "near_resistance": near, "holding": holding}
 
-        # Raw 0-100 component values are kept separate from the weighted score.
-        if name == "اختراق مؤكد":
-            components = {"breakout_quality": bq, "volume": vol, "candle": 100 if green else 0}
-        elif name == "اختراق نطاق الافتتاح":
-            components = {"orb_quality": oq, "volume": vol, "candle": 100 if green else 0}
-        elif name == "إعادة اختبار":
-            components = {"prior_break": prior, "near_level": near, "reclaim": reclaim, "volume": clip((vr-0.8)/0.6*100)}
-        elif name == "ارتداد VWAP":
-            components = {"touch": touch, "reclaim": reclaim, "candle": 100 if green else 0, "momentum": clip((mom-0.05)/0.20*100), "volume": clip((vr-0.9)/0.6*100)}
-        elif name == "ارتداد EMA20":
-            components = {"touch": touch, "reclaim": reclaim, "candle": 100 if green else 0, "higher_tf": 100 if mstate == "داعم" else 0, "volume": clip((vr-0.9)/0.6*100)}
-        elif name == "سحب سيولة":
-            components = {"sweep": sweep, "volume": clip((vr-0.9)/0.7*100), "candle": 100 if green else 0, "momentum": clip((mom-0.05)/0.25*100)}
-        elif name == "سحب سيولة مع Displacement":
-            components = {"sweep": sweep, "displacement": disp, "volume": clip((vr-1.0)/0.75*100), "momentum": clip((mom-0.08)/0.25*100), "candle": 100 if green else 0}
-        elif name == "ضغط ثم انفجار":
-            components = {"match": match, "volume": clip((vr-1.2)/0.8*100), "candle": 100 if green else 0, "momentum": clip((mom-0.05)/0.25*100)}
-        elif name == "استمرار الزخم":
-            components = {"momentum": clip((mom-0.08)/0.50*100), "volume": clip((vr-1.0)/0.75*100), "candle": 100 if green else 0, "higher_tf": 100 if mstate == "داعم" else 0}
-        elif name == "علم صاعد":
-            components = {"impulse": impulse, "flag": flag, "candle": 100 if green else 0, "volume": clip((vr-0.9)/0.7*100)}
-        elif name == "استعادة مستوى":
-            components = {"match": match, "reclaim": reclaim, "candle": 100 if green else 0, "volume": clip((vr-0.9)/0.7*100)}
-        elif name == "دخول بعد Opening Drive":
-            components = {"drive": drive, "pullback": pull, "candle": 100 if green else 0, "volume": clip((vr-0.9)/0.7*100)}
-        elif name in {"استعادة قمة اليوم", "استعادة قمة الفترة"}:
-            components = {"match": match, "reclaim": reclaim, "candle": 100 if green else 0, "volume": clip((vr-0.9)/0.7*100)}
-        elif name == "استعادة بعد فشل ORB":
-            components = {"failed_reclaim": failed, "orb_quality": orbq, "reclaim": reclaim, "momentum": clip((mom-0.05)/0.25*100), "volume": clip((vr-0.9)/0.7*100)}
-        elif name == "استمرار ABC":
-            components = {"a": a, "b": b, "c_break": cb, "momentum": clip((mom-0.05)/0.25*100), "volume": clip((vr-0.9)/0.7*100)}
-        else:
-            components = {"early_range": early_range, "near_resistance": near, "holding": holding, "momentum": clip((mom-0.05)/0.25*100), "candle": 100 if green else 0}
+        # Core score uses only structural components. Generic context such as
+        # volume/candle/higher-TF is counted only once in the 30% Confirmation block.
+        core_keys = {
+            "اختراق مؤكد": {"breakout_quality"},
+            "اختراق نطاق الافتتاح": {"orb_quality"},
+            "إعادة اختبار": {"prior_break", "near_level", "reclaim"},
+            "ارتداد VWAP": {"touch", "reclaim"},
+            "ارتداد EMA20": {"touch", "reclaim"},
+            "سحب سيولة": {"sweep"},
+            "سحب سيولة مع Displacement": {"sweep", "displacement"},
+            "ضغط ثم انفجار": {"match"},
+            "استمرار الزخم": {"momentum"},
+            "علم صاعد": {"impulse", "flag"},
+            "استعادة مستوى": {"match", "reclaim"},
+            "دخول بعد Opening Drive": {"drive", "pullback"},
+            "استعادة قمة الفترة": {"match", "reclaim"},
+            "استعادة بعد فشل ORB": {"failed_reclaim", "orb_quality", "reclaim"},
+            "استمرار ABC": {"a", "b", "c_break"},
+            "دخول مبكر": {"early_range", "near_resistance", "holding"},
+        }.get(name, set())
+        core_values = {k: float(components.get(k, 0.0) or 0.0) for k in core_keys}
+        all_weights = _strategy_weights_for(policy_for_strategy, name)
+        core_weights = {k: float(w) for k, w in all_weights.items() if k in core_values}
+        total_core = sum(max(0.0, w) for w in core_weights.values()) or 1.0
+        core_weights = {k: max(0.0, w) / total_core for k, w in core_weights.items()}
+        core_score = sum(core_values[k] * core_weights.get(k, 0.0) for k in core_values)
 
-        # Baseline remains identical until the optional Strategy Adaptive layer
-        # is explicitly OOS-approved.
+        # 30% Confirmation block: daily-specific context, not Core.
+        confirmation_weights = {
+            "اختراق مؤكد": {"volume": .60, "candle": .40},
+            "اختراق نطاق الافتتاح": {"above_vwap": .30, "h4": .20, "volume": .30, "candle": .20},
+            "إعادة اختبار": {"above_vwap": .40, "volume": .25, "candle": .15, "h4": .20},
+            "ارتداد VWAP": {"trend": .25, "h4": .20, "candle": .15, "momentum": .20, "volume": .20},
+            "ارتداد EMA20": {"h4": .20, "candle": .15, "volume": .20, "momentum": .20, "trend": .25},
+            "سحب سيولة": {"h4": .20, "above_vwap": .20, "candle": .15, "momentum": .20, "volume": .25},
+            "سحب سيولة مع Displacement": {"trend": .15, "above_vwap": .15, "above_open": .10, "h4": .10, "market": .10, "momentum": .15, "volume": .15, "candle": .10},
+            "ضغط ثم انفجار": {"above_vwap": .15, "above_open": .10, "trend": .15, "h4": .10, "market": .10, "volume": .20, "candle": .10, "momentum": .10},
+            "استمرار الزخم": {"trend": .15, "above_vwap": .15, "above_open": .10, "h4": .10, "market": .10, "volume": .15, "candle": .10, "no_breakout": .15},
+            "علم صاعد": {"trend": .15, "above_vwap": .15, "above_open": .10, "h4": .10, "market": .10, "volume": .15, "candle": .10, "no_orb": .15},
+            "استعادة مستوى": {"trend": .15, "above_vwap": .15, "above_open": .10, "h4": .10, "market": .10, "volume": .15, "candle": .15},
+            "دخول بعد Opening Drive": {"trend": .15, "above_vwap": .15, "above_open": .10, "h4": .10, "market": .10, "volume": .15, "candle": .10, "no_breakout": .075, "no_orb": .075},
+            "استعادة قمة الفترة": {"above_vwap": .15, "above_open": .10, "trend": .15, "h4": .10, "market": .10, "volume": .15, "candle": .15},
+            "استعادة بعد فشل ORB": {"trend": .15, "above_vwap": .15, "above_open": .10, "h4": .10, "market": .10, "volume": .15, "candle": .10, "no_orb": .15},
+            "استمرار ABC": {"trend": .15, "above_vwap": .15, "above_open": .10, "h4": .10, "market": .10, "volume": .15, "candle": .10, "momentum": .15},
+            "دخول مبكر": {"trend": .15, "above_vwap": .15, "above_open": .10, "h4": .10, "market": .10, "volume": .15, "candle": .15},
+        }.get(name, {})
+
+        confirmation_values = {
+            "trend": 100.0 if bool(c.get("trend_up", False)) else 0.0,
+            "above_vwap": 100.0 if bool(c.get("above_vwap", False)) else 0.0,
+            "above_open": 100.0 if bool(c.get("above_open", False)) else 0.0,
+            "h4": 100.0 if mstate != "معاكس" else 0.0,
+            "market": 100.0 if bool(c.get("market_ok", False)) else 0.0,
+            "volume": clip((vr - 0.90) / 0.60 * 100),
+            "momentum": clip((mom - 0.05) / 0.25 * 100),
+            "candle": 100.0 if green else 0.0,
+            "no_breakout": 100.0 if not bool(c.get("breakout_now", False)) else 0.0,
+            "no_orb": 100.0 if not bool(c.get("orb_breakout", False)) else 0.0,
+        }
+        confirmation_score = sum(confirmation_values[k] * w for k, w in confirmation_weights.items())
+
+        # Apply the fixed 70/30 split exactly once.
+        final_q = 0.70 * core_score + 0.30 * confirmation_score
+
+        # Store the components for the existing Adaptive learner/OOS engine.
         strategy_component_scores[name] = dict(components)
-        q = _weighted_strategy_score(components, _strategy_weights_for(policy_for_strategy, name))
+        strategy_component_scores[name]["confirmation_score"] = confirmation_score
 
-        # Strategy performance statistics are used by the Adaptive learner;
-        # they no longer add a separate live +/-3 bias to the Strategy Score.
-        return round(max(0.0, min(100.0, q)), 2)
+        return round(max(0.0, min(100.0, final_q)), 2)
 
     if not matched_entry_types:
         # DIAGNOSTIC ONLY: when all 16 canonical strategies fail, emit the same
@@ -2909,7 +2873,7 @@ def analyze_daily(
                 f"{_rank}. {_et}:FAIL(score={_zero_scores.get(_et, 0.0):.1f}; blockers={_why})"
             )
         log.info(
-            "DAILY STRATEGY COMPETITION AUDIT V2 | %s | primary=NONE | matched=0/16 | "
+            "DAILY STRATEGY COMPETITION AUDIT V3 | %s | primary=NONE | matched=0/16 | "
             "ranking=DIAGNOSTIC_ONLY",
             symbol,
         )
@@ -2919,23 +2883,6 @@ def analyze_daily(
                 symbol,
                 _detail,
             )
-        # DIAGNOSTIC ONLY: summarize the most frequent blockers across all 16
-        # failed strategies. This does not change the no-match decision.
-        from collections import Counter as _Counter
-        _blocker_counts = _Counter()
-        for _et in ENTRY_TYPES:
-            try:
-                _blocker_counts.update(_competition_fail_reasons(_et))
-            except Exception:
-                pass
-        _top_blockers = ";".join(
-            f"{_reason}={_count}" for _reason, _count in _blocker_counts.most_common(6)
-        ) or "unavailable"
-        log.info(
-            "DAILY NO_SIGNAL | %s | reason=no_strategy_match | top_blockers=%s",
-            symbol,
-            _top_blockers,
-        )
         # Preserve the original trading behavior exactly.
         return None
 
@@ -2968,6 +2915,7 @@ def analyze_daily(
         return round(max(0.0, min(120.0, identity.get(name, 0.0))), 2)
 
     strategy_identity_scores = {et: _strategy_identity(et) for et in matched_entry_types}
+    strategy_component_scores: dict[str, dict[str, float]] = {}
     strategy_scores = {et: _strategy_strength(et) for et in matched_entry_types}
     entry_order = {et: i for i, et in enumerate(ENTRY_TYPES)}
     # When strategies overlap, prefer the more structurally specific setup only
@@ -3042,14 +2990,7 @@ def analyze_daily(
     _competition_details: list[str] = []
     for _et in ENTRY_TYPES:
         try:
-            # Reuse the score already calculated by the real selection path
-            # for matched strategies. Only unmatched strategies need a
-            # diagnostic-only strength calculation here. This avoids doing
-            # duplicate scoring work and does not change the trading decision.
-            if _et in strategy_scores:
-                _competition_scores_all[_et] = float(strategy_scores[_et])
-            else:
-                _competition_scores_all[_et] = float(_strategy_strength(_et))
+            _competition_scores_all[_et] = float(_strategy_strength(_et))
         except Exception:
             _competition_scores_all[_et] = 0.0
 
@@ -3077,7 +3018,7 @@ def analyze_daily(
             )
 
     log.info(
-        "DAILY STRATEGY COMPETITION AUDIT V2 | %s | primary=%s | matched=%s/16 | "
+        "DAILY STRATEGY COMPETITION AUDIT V3 | %s | primary=%s | matched=%s/16 | "
         "ranking=DIAGNOSTIC_ONLY",
         symbol,
         entry_type,
@@ -3091,7 +3032,15 @@ def analyze_daily(
         )
 
     log.info(
-        "DAILY STRATEGY AUDIT | %s | primary=%s | matched=%s | scores=%s | "
+        "%s STRATEGY COMPETITION AUDIT | %s | primary=%s | %s",
+        "DAILY",
+        symbol,
+        entry_type,
+        " | ".join(_competition_audit_parts),
+    )
+
+    log.info(
+        "DAILY STRATEGY AUDIT V3 | %s | primary=%s | matched=%s | scores=%s | "
         "tiebreak=%s",
         symbol,
         entry_type,
@@ -3103,69 +3052,57 @@ def analyze_daily(
 
     reasons: list[str] = []
     warnings: list[str] = []
-    score = 42.0
+    # Final score starts from the selected Strategy Score (70% Core + 30% Confirmation).
+    # Generic confirmation factors below are diagnostic/context only and are not
+    # added again, preventing double counting.
+    score = float(strategy_scores.get(entry_type, 0.0))
     factors: list[str] = []
 
     if trend_up:
-        score += 18
         reasons.append("اتجاه الأسبوعي صاعد")
         factors.append("weekly_trend")
     else:
         warnings.append("اتجاه الأسبوعي غير مؤكد")
-        score -= 8
 
     if above_vwap:
-        score += 10
         reasons.append("فوق VWAP اليوم")
         factors.append("vwap")
     else:
         warnings.append("تحت VWAP اليوم")
-        score -= 12
 
     if above_open:
-        score += 6
         reasons.append("فوق افتتاح اليوم")
         factors.append("above_open")
     else:
         warnings.append("تحت افتتاح اليوم")
-        score -= 4
 
     if live_ok:
-        score += 12
         reasons.append("تأكيد يومي")
         factors.append("daily")
     else:
         warnings.append("لا تأكيد يومي كافٍ")
-        score -= 10
 
     if vol_ok:
-        score += 6
         reasons.append(f"حجم جلسة {vol_ratio:.2f}x")
         factors.append("vol_session")
     else:
         warnings.append("حجم الجلسة ضعيف نسبياً")
-        score -= 6
 
     if market_ok:
-        score += 3
         factors.append("market")
         reasons.append(market_state)
     else:
-        score -= 7
         warnings.append(market_state)
 
     if chop:
-        score -= 12
         warnings.append("السوق اليومي متذبذب (Chop)")
         factors.append("chop")
 
     if breakout_now:
         if breakout_ok:
-            score += 6
             factors.append("breakout_candle")
             reasons.append(f"قوة شمعة الاختراق {breakout_quality:.0f}/100")
         else:
-            score -= 9
             warnings.append("اختراق بدون إغلاق/متابعة كافية")
             factors.append("weak_breakout")
     else:
@@ -3173,98 +3110,76 @@ def analyze_daily(
 
     if news_state == "negative":
         if NEWS_BLOCK_NEGATIVE:
-            score -= 25
             warnings.append("خبر سلبي عالي المخاطر")
             factors.append("news_negative")
     elif news_state == "positive_strong":
         # لا نمنع الاستحواذ/الاندماج؛ نرفع المتطلبات بدل ذلك.
-        score += 3
         factors.append("news_momentum")
         reasons.append("خبر إيجابي جوهري — وضع NEWS MOMENTUM")
     elif news_state == "positive":
-        score += 1
         factors.append("news_positive")
 
     if h4_state == "داعم":
-        score += h4_points
         reasons.append("4 ساعات داعمة")
         factors.append("h4")
     elif h4_state == "معاكس":
-        score += h4_points
         warnings.append("4 ساعات معاكسة")
     else:
         reasons.append("4 ساعات محايدة")
         factors.append("h4_neutral")
 
     if 48 <= h_rsi <= 68:
-        score += 5
         factors.append("rsi_weekly")
 
     if dump:
         warnings.append("سقوط من قمة الفترة")
-        score -= 20
 
     if entry_type == "اختراق مؤكد":
-        score += 8
         reasons.append("اختراق مؤكد")
         factors.append("breakout")
     elif entry_type == "اختراق نطاق الافتتاح":
-        score += 8
         reasons.append("اختراق نطاق الافتتاح ORB")
         factors.append("orb")
         factors.append("breakout")
     elif entry_type == "إعادة اختبار":
-        score += 5
         reasons.append("إعادة اختبار مستوى")
         factors.append("retest")
     elif entry_type == "ارتداد VWAP":
-        score += 6
         reasons.append("ارتداد واستعادة VWAP")
         factors.append("vwap_bounce")
     elif entry_type == "ارتداد EMA20":
-        score += 6
         reasons.append("تصحيح صحي إلى EMA20")
         factors.append("ema_pullback")
     elif entry_type == "سحب سيولة مع Displacement":
-        score += 10
         reasons.append("سحب سيولة ثم Displacement واستعادة قوية")
         factors.append("liquidity_sweep")
         factors.append("liquidity_displacement")
     elif entry_type == "سحب سيولة":
-        score += 7
         reasons.append("سحب سيولة ثم استعادة المستوى")
         factors.append("liquidity_sweep")
     elif entry_type == "ضغط ثم انفجار":
-        score += 8
         reasons.append("ضغط سعري ثم توسع بالحجم")
         factors.append("compression_expansion")
     elif entry_type == "استمرار الزخم":
-        score += 7
         reasons.append("استمرار زخم بعد دفعة صاعدة")
         factors.append("momentum_continuation")
     elif entry_type == "علم صاعد":
-        score += 9
         reasons.append("علم صاعد بعد دفعة قوية ثم استمرار")
         factors.append("bull_flag")
     elif entry_type == "استعادة مستوى":
-        score += 9
         reasons.append("استعادة مقاومة بعد كسرها")
         factors.append("resistance_reclaim")
     elif entry_type == "استعادة بعد فشل ORB":
-        score += 10
         reasons.append("فشل اختراق ORB ثم استعادة مؤكدة")
         factors.append("orb_failed_reclaim")
         factors.append("orb")
     elif entry_type == "استمرار ABC":
-        score += 9
         reasons.append("بنية A/B/C: دفعة ثم تصحيح منظم ثم استمرار")
         factors.append("abc_continuation")
     elif entry_type == "دخول بعد Opening Drive":
-        score += 9
         reasons.append("دفعة افتتاحية قوية ثم تراجع منظم واستعادة")
         factors.append("opening_drive_pullback")
     elif entry_type == "استعادة قمة الفترة":
-        score += 9
         reasons.append("استعادة قمة الفترة بعد تراجع تحتها")
         factors.append("hod_reclaim")
     else:
@@ -3276,18 +3191,15 @@ def analyze_daily(
         reasons.append("قرب مستوى سعري مهم")
 
     if vwap_weekly_confluence:
-        score += 3
         factors.append("vwap_weekly_confluence")
         reasons.append("Confluence: VWAP + اتجاه الأسبوعي + 4س")
     if multi_level_confluence:
-        score += 2.0
         factors.append("multi_level_confluence")
         reasons.append("تجمع مستويات: " + "/".join(confluence_levels[:4]))
 
     ext = (price - e20) / e20 * 100 if e20 else 0
     if ext > 4.0:
         warnings.append("امتداد عن متوسط الأسبوعي")
-        score -= 8
         factors.append("extended")
 
     atr = float(_atr(weekly, 14).iloc[-1] or price * 0.01)
@@ -3300,7 +3212,6 @@ def analyze_daily(
     )
     if atr_pct > 8.0:
         warnings.append("تذبذب عالي")
-        score -= 5
 
     # Legacy learning remains available for historical research only.
     # The new Adaptive layer is the sole learning modifier for live scoring.
@@ -3551,9 +3462,9 @@ def analyze_daily(
             risk = price - stop
             tp1 = price + risk * 1.20
 
-    # Calculate TP1 reward before using it to enforce ordered targets.
+    # Keep targets strictly ordered even when Adaptive Exit raises TP1 above 2R.
     # This does not change strategy selection or the Adaptive TP1 rule.
-    risk_pct = risk / price * 100
+    risk_pct = risk / price * 100 if price else 0.0
     reward_r = (tp1 - price) / risk if risk else 0.0
     tp2_r = max(2.0, reward_r + 1e-6)
     tp3_r = max(3.0, tp2_r + 1e-6)
@@ -3647,7 +3558,7 @@ def analyze_daily(
         quality_reasons.append("invalid_tp1")
     if tp1_distance_pct < 0.8:
         quality_reasons.append("tp1_too_close")
-    if reward_r + 1e-9 < float(policy.get("min_tp1_r", 1.2)):
+    if reward_r < float(policy.get("min_tp1_r", 1.2)):
         quality_reasons.append("weak_tp1_r")
 
     return DailySignal(
@@ -3809,9 +3720,9 @@ def _prefilter_daily(symbol: str) -> tuple[float, dict[str, float], pd.DataFrame
         above_vwap = price >= vw * 0.995
         above_open = price >= float(daily["Open"].iloc[-1]) * 0.995
         hist = daily.iloc[:-1].tail(120)
-        avg_cur = float(daily["Volume"].tail(5).mean())
+        current_day_volume = float(daily["Volume"].iloc[-1])
         avg_hist = float(hist["Volume"].mean()) if not hist.empty else 1.0
-        vol_ratio = avg_cur / avg_hist if avg_hist else 1.0
+        vol_ratio = current_day_volume / avg_hist if avg_hist else 1.0
         mom = (price - float(dc.iloc[-6])) / max(float(dc.iloc[-6]),1e-9) * 100 if len(dc)>=6 else 0.0
         route = 0.0
         route += 3.0 if trend else 0.0
@@ -3845,8 +3756,8 @@ def _prefilter_daily_from_frames(symbol: str, weekly: pd.DataFrame, daily: pd.Da
         above_vwap = price >= vw * 0.995
         above_open = price >= float(daily["Open"].iloc[-1]) * 0.995
         hist = daily.iloc[:-1].tail(120)
-        avg_cur = float(daily["Volume"].tail(5).mean()); avg_hist = float(hist["Volume"].mean()) if not hist.empty else 1.0
-        vol_ratio = avg_cur / avg_hist if avg_hist else 1.0
+        current_day_volume = float(daily["Volume"].iloc[-1]); avg_hist = float(hist["Volume"].mean()) if not hist.empty else 1.0
+        vol_ratio = current_day_volume / avg_hist if avg_hist else 1.0
         mom = (price - float(dc.iloc[-6])) / max(float(dc.iloc[-6]),1e-9) * 100 if len(dc)>=6 else 0.0
         route = (3.0 if trend else 0.0) + (2.0 if above_vwap else 0.0) + (1.5 if above_open else 0.0)
         route += min(2.5,max(0.0,mom)) + min(2.0,max(0.0,vol_ratio-0.75)*2.0) + (1.0 if we20 > we50 else 0.0)
