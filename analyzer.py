@@ -84,6 +84,10 @@ EXIT_SL_MAX_MULT = 1.10
 EXIT_MIN_EDGE = 0.04
 EXIT_MIN_COVERAGE = 0.45
 
+# Final daily risk safety band: keep aligned with the documented 0.60%–4.50% policy.
+DAILY_MIN_RISK_PCT = 0.60
+DAILY_MAX_RISK_PCT = 4.50
+
 # Trade Intelligence / Reason Engine.
 # Shadow-only at first: classifies why a trade worked/failed and learns
 # conditional patterns without changing the core trading rules.
@@ -173,7 +177,6 @@ class DailySignal:
     interaction_keys: list | None = None
     spread_pct: float = 0.0
     expected_slippage_pct: float = 0.0
-    dollar_volume_3m: float = 0.0
     liquidity_ok: bool = True
     quality_reasons: list[str] | None = None
 
@@ -405,24 +408,27 @@ def _rate(rows: list[dict]) -> float:
 
 
 def _strategy_weight_defaults() -> dict:
-    """Baseline component weights for the 16 strategy-quality scores."""
+    """Baseline weights for structural/Core components only.
+
+    Confirmation is separate and contributes only through the fixed 30% block.
+    """
     return {
-        "اختراق مؤكد": {"breakout_quality": .55, "volume": .25, "candle": .20},
-        "اختراق نطاق الافتتاح": {"orb_quality": .55, "volume": .25, "candle": .20},
-        "إعادة اختبار": {"prior_break": .25, "near_level": .35, "reclaim": .25, "volume": .15},
-        "ارتداد VWAP": {"touch": .30, "reclaim": .30, "candle": .20, "momentum": .10, "volume": .10},
-        "ارتداد EMA20": {"touch": .30, "reclaim": .30, "candle": .20, "higher_tf": .10, "volume": .10},
-        "سحب سيولة": {"sweep": .35, "volume": .25, "candle": .20, "momentum": .20},
-        "سحب سيولة مع Displacement": {"sweep": .20, "displacement": .40, "volume": .20, "momentum": .10, "candle": .10},
-        "ضغط ثم انفجار": {"match": .40, "volume": .25, "candle": .20, "momentum": .15},
-        "استمرار الزخم": {"momentum": .45, "volume": .30, "candle": .15, "higher_tf": .10},
-        "علم صاعد": {"impulse": .30, "flag": .30, "candle": .20, "volume": .20},
-        "استعادة مستوى": {"match": .35, "reclaim": .25, "candle": .20, "volume": .20},
-        "دخول بعد Opening Drive": {"drive": .35, "pullback": .25, "candle": .20, "volume": .20},
-        "استعادة قمة اليوم": {"match": .35, "reclaim": .25, "candle": .20, "volume": .20},
-        "استعادة بعد فشل ORB": {"failed_reclaim": .25, "orb_quality": .25, "reclaim": .30, "momentum": .10, "volume": .10},
-        "استمرار ABC": {"a": .25, "b": .25, "c_break": .30, "momentum": .10, "volume": .10},
-        "دخول مبكر": {"early_range": .30, "near_resistance": .25, "holding": .20, "momentum": .15, "candle": .10},
+        "اختراق مؤكد": {"breakout_quality": 1.0},
+        "اختراق نطاق الافتتاح": {"orb_quality": 1.0},
+        "إعادة اختبار": {"prior_break": .30, "near_level": .40, "reclaim": .30},
+        "ارتداد VWAP": {"touch": .50, "reclaim": .50},
+        "ارتداد EMA20": {"touch": .50, "reclaim": .50},
+        "سحب سيولة": {"sweep": 1.0},
+        "سحب سيولة مع Displacement": {"sweep": .35, "displacement": .65},
+        "ضغط ثم انفجار": {"match": 1.0},
+        "استمرار الزخم": {"momentum": 1.0},
+        "علم صاعد": {"impulse": .50, "flag": .50},
+        "استعادة مستوى": {"match": .60, "reclaim": .40},
+        "دخول بعد Opening Drive": {"drive": .60, "pullback": .40},
+        "استعادة قمة اليوم": {"match": .60, "reclaim": .40},
+        "استعادة بعد فشل ORB": {"failed_reclaim": .35, "orb_quality": .25, "reclaim": .40},
+        "استمرار ABC": {"a": .30, "b": .30, "c_break": .40},
+        "دخول مبكر": {"early_range": .40, "near_resistance": .30, "holding": .30},
     }
 
 
@@ -685,8 +691,8 @@ def _rollback_if_needed() -> dict:
                 "from_generation": p.get("generation"),
                 "to_generation": best["policy"].get("generation", 0),
             }
-    except Exception:
-        pass
+    except Exception as exc:
+        log.debug("DAILY non-critical fallback exception: %s", exc)
     return {"status": "keep"}
 
 
@@ -936,7 +942,7 @@ def _apply_adaptive_exit(sig_price: float, structural_stop: float, regime: str,
         return float(structural_stop), float(sig_price), 1.20
     entry = float(sig_price)
     stop = float(structural_stop)
-    risk = max(entry - stop, entry * 0.006)
+    risk = max(entry - stop, entry * (DAILY_MIN_RISK_PCT / 100.0))
     tp1_r = 1.20
     sl_mult = 1.00
 
@@ -951,9 +957,9 @@ def _apply_adaptive_exit(sig_price: float, structural_stop: float, regime: str,
 
     # Move the structural stop modestly around the original structural point.
     # Never cross entry and never exceed the global risk ceiling.
-    base_gap = max(entry - stop, entry * 0.006)
+    base_gap = max(entry - stop, entry * (DAILY_MIN_RISK_PCT / 100.0))
     new_gap = base_gap * sl_mult
-    new_gap = max(entry * 0.006, min(entry * 0.045, new_gap))
+    new_gap = max(entry * (DAILY_MIN_RISK_PCT / 100.0), min(entry * (DAILY_MAX_RISK_PCT / 100.0), new_gap))
     new_stop = entry - new_gap
 
     tp1 = entry + new_gap * max(EXIT_TP_MIN_R, min(EXIT_TP_MAX_R, tp1_r))
@@ -1245,8 +1251,8 @@ def adaptive_retrain_if_ready(force_monthly: bool = False) -> dict:
     try:
         with ADAPTIVE_SHADOW_FILE.open("a", encoding="utf-8") as f:
             f.write(json.dumps(result, ensure_ascii=False) + "\n")
-    except Exception:
-        pass
+    except Exception as exc:
+        log.debug("DAILY non-critical fallback exception: %s", exc)
 
     if approved:
         candidate["approved"] = True
@@ -1291,8 +1297,8 @@ def adaptive_retrain_if_ready(force_monthly: bool = False) -> dict:
                     }, ensure_ascii=False, indent=2),
                     encoding="utf-8",
                 )
-        except Exception:
-            pass
+        except Exception as exc:
+            log.debug("DAILY non-critical nested fallback exception: %s", exc)
 
         result["status"] = "approved"
         result["message"] = (
@@ -1340,8 +1346,8 @@ def adaptive_retrain_if_ready(force_monthly: bool = False) -> dict:
             json.dumps(result, ensure_ascii=False, indent=2),
             encoding="utf-8",
         )
-    except Exception:
-        pass
+    except Exception as exc:
+        log.debug("DAILY non-critical fallback exception: %s", exc)
 
     return result
 
@@ -1734,8 +1740,8 @@ def _period_days(period: str, default: int = 5) -> int:
             return max(1, int(float(raw[:-1])))
         if raw.endswith("wk"):
             return max(1, int(float(raw[:-2]) * 7))
-    except Exception:
-        pass
+    except Exception as exc:
+        log.debug("DAILY non-critical fallback exception: %s", exc)
     return int(default)
 
 
@@ -1746,12 +1752,13 @@ DAILY_POSITIVE_EMA50_BUFFER_PCT = 0.50
 
 def _market_alignment(fetch_intraday) -> tuple[bool, str]:
     """
-    Daily SPY/QQQ market regime:
-      قوي    = كلاهما فوق EMA20 و EMA20 >= EMA50
-      إيجابي = كلاهما فوق EMA50، لكن ليسا قويين بالكامل
-      مختلط  = أحدهما قوي/إيجابي والآخر ضعيف
-      ضعيف   = كلاهما ضعيف
-      غير مؤكد = بيانات غير مكتملة
+    Daily SPY/QQQ market regime with an explicit positive-below-VWAP state:
+      قوي               = كلاهما فوق EMA20 و EMA20 >= EMA50
+      إيجابي_تحت_VWAP  = كلاهما إيجابيان سعريًا لكن كلاهما تحت VWAP اليومي
+      إيجابي            = كلاهما إيجابيان سعريًا، لكن ليسا كلاهما تحت VWAP
+      مختلط             = أحدهما قوي/إيجابي والآخر ضعيف، أو حالات إيجابية غير متطابقة
+      ضعيف              = كلاهما ضعيف
+      غير مؤكد          = بيانات غير مكتملة
     """
     states = []
 
@@ -1768,19 +1775,26 @@ def _market_alignment(fetch_intraday) -> tuple[bool, str]:
 
                 if d is None:
                     raise ValueError("market data is None")
-                if "Close" not in d.columns:
-                    raise ValueError("Close column missing")
+                if not {"Close", "High", "Low", "Volume"}.issubset(d.columns):
+                    raise ValueError("required OHLCV columns missing")
 
-                c = pd.to_numeric(d["Close"], errors="coerce").dropna()
-                if len(c) < 50:
-                    raise ValueError(f"insufficient daily closes: {len(c)} < 50")
+                c = pd.to_numeric(d["Close"], errors="coerce")
+                h = pd.to_numeric(d["High"], errors="coerce")
+                l = pd.to_numeric(d["Low"], errors="coerce")
+                vol = pd.to_numeric(d["Volume"], errors="coerce")
+                valid = pd.concat([c, h, l, vol], axis=1).dropna()
+                if len(valid) < 50:
+                    raise ValueError(f"insufficient daily OHLCV rows: {len(valid)} < 50")
 
+                c = valid["Close"]
                 e20 = float(_ema(c, 20).iloc[-1])
                 e50 = float(_ema(c, 50).iloc[-1])
                 p = float(c.iloc[-1])
+                vwap_series = _vwap(valid)
+                vwap = float(vwap_series.iloc[-1])
 
-                if not (np.isfinite(e20) and np.isfinite(e50) and np.isfinite(p)):
-                    raise ValueError("non-finite market values")
+                if not all(np.isfinite(x) for x in (e20, e50, p, vwap)) or vwap <= 0:
+                    raise ValueError("non-finite market values or VWAP")
 
                 strong = bool(p >= e20 and e20 >= e50)
                 positive = bool(
@@ -1788,12 +1802,19 @@ def _market_alignment(fetch_intraday) -> tuple[bool, str]:
                     and p >= e50 * (1.0 - DAILY_POSITIVE_EMA50_BUFFER_PCT / 100.0)
                 )
 
-                state = "داعم" if strong else "إيجابي" if positive else "ضعيف"
+                if strong:
+                    state = "داعم"
+                elif positive and p < vwap:
+                    state = "إيجابي_تحت_VWAP"
+                elif positive:
+                    state = "إيجابي"
+                else:
+                    state = "ضعيف"
 
                 log.info(
-                    "DAILY MARKET RESULT | %s | attempt %d/%d | close=%.4f | ema20=%.4f | ema50=%.4f | state=%s",
+                    "DAILY MARKET RESULT | %s | attempt %d/%d | close=%.4f | ema20=%.4f | ema50=%.4f | vwap20=%.4f | state=%s",
                     sym, attempt_no, DAILY_MARKET_RETRY_ATTEMPTS,
-                    p, e20, e50, state,
+                    p, e20, e50, vwap, state,
                 )
                 break
 
@@ -1822,17 +1843,17 @@ def _market_alignment(fetch_intraday) -> tuple[bool, str]:
         log.info("DAILY MARKET FINAL | SPY=داعم | QQQ=داعم | ok=True | state=SPY+QQQ داعمان يوميًا")
         return True, "SPY+QQQ داعمان يوميًا"
 
-    if states[0] in {"داعم", "إيجابي"} and states[1] in {"داعم", "إيجابي"}:
-        log.info(
-            "DAILY MARKET FINAL | SPY=%s | QQQ=%s | ok=True | state=SPY+QQQ إيجابيان يوميًا",
-            states[0], states[1],
-        )
-        return True, "SPY+QQQ إيجابيان يوميًا"
-
     if states[0] == "ضعيف" and states[1] == "ضعيف":
         log.info("DAILY MARKET FINAL | SPY=ضعيف | QQQ=ضعيف | ok=False | state=SPY+QQQ ضعيفان يوميًا")
         return False, "SPY+QQQ ضعيفان يوميًا"
 
+    if states[0] == "إيجابي_تحت_VWAP" and states[1] == "إيجابي_تحت_VWAP":
+        log.info("DAILY MARKET FINAL | SPY/QQQ إيجابيان وتحت VWAP | ok=True")
+        return True, "SPY+QQQ إيجابيان وتحت VWAP يوميًا"
+
+    # Any other combination, including one positive benchmark above VWAP, is
+    # deliberately treated as mixed. This keeps the daily policy to the five
+    # explicit regimes: strong / positive-below-VWAP / mixed / weak / unknown.
     log.info(
         "DAILY MARKET FINAL | SPY=%s | QQQ=%s | ok=True | state=SPY/QQQ مختلطان يوميًا",
         states[0], states[1],
@@ -1866,8 +1887,10 @@ def _daily_market_condition(market_state: str) -> str:
     state = str(market_state or "")
     if "داعمان" in state:
         return "قوي"
-    if "إيجابيان" in state:
+    if "إيجابيان وتحت VWAP" in state:
         return "إيجابي_تحت_VWAP"
+    if "إيجابيان" in state:
+        return "إيجابي"
     if "ضعيفان" in state:
         return "ضعيف"
     if "مختلطان" in state:
@@ -1945,8 +1968,8 @@ def _find_prior_resistance(
                     and price * 1.008 <= v <= price * 1.07
                 ):
                     candidates.append((v, "قمة يومي سابقة"))
-    except Exception:
-        pass
+    except Exception as exc:
+        log.debug("DAILY non-critical fallback exception: %s", exc)
 
     try:
         x = weekly.iloc[:-1].tail(30)
@@ -1962,8 +1985,8 @@ def _find_prior_resistance(
                     and price * 1.008 <= v <= price * 1.07
                 ):
                     candidates.append((v, "قمة أسبوعية سابقة"))
-    except Exception:
-        pass
+    except Exception as exc:
+        log.debug("DAILY non-critical fallback exception: %s", exc)
 
     if not candidates:
         return 0.0, "هدف مخاطر احتياطي"
@@ -1972,9 +1995,8 @@ def _find_prior_resistance(
 
 _QUOTE_CACHE: dict[str, tuple[datetime, dict]] = {}
 QUOTE_CACHE_SECONDS = 30
-MAX_SPREAD_PCT = 1.20
-HARD_MAX_SPREAD_PCT = 2.00
-MIN_DOLLAR_VOLUME_3M = 10_000_000.0
+MAX_SPREAD_PCT = 0.80
+HARD_MAX_SPREAD_PCT = 1.20
 
 def _quote_liquidity(symbol: str, price: float) -> dict:
     """يومي: Bid/Ask من Alpaca فقط؛ لا نستخدم Yahoo كبديل للتنفيذ اليومي."""
@@ -1986,7 +2008,6 @@ def _quote_liquidity(symbol: str, price: float) -> dict:
         "ok": False,
         "spread_pct": 0.0,
         "slippage_pct": 0.0,
-        "dollar_volume": 0.0,
         "quote_source": "none",
         "quote_age_min": float("inf"),
     }
@@ -2006,8 +2027,8 @@ def _quote_liquidity(symbol: str, price: float) -> dict:
             result["slippage_pct"] = spread / 2.0
             result["ok"] = spread <= HARD_MAX_SPREAD_PCT
             result["quote_source"] = "alpaca-" + str(q.get("feed") or "unknown")
-    except Exception:
-        pass
+    except Exception as exc:
+        log.debug("DAILY non-critical fallback exception: %s", exc)
     _QUOTE_CACHE[symbol] = (now, result)
     return result
 
@@ -2221,23 +2242,24 @@ def analyze_daily(
             med_range = float(prior_ranges.median()) if len(prior_ranges) else 0.0
             swept = bool((today_d["Low"].astype(float).iloc[-5:-1] < support_level * 0.998).any())
             reclaimed = price >= support_level * 1.002
+            # Core displacement is price structure only. Volume is a
+            # confirmation factor and is scored separately in the 30% block.
             displacement = bool(
                 cur_c > cur_o and cur_body / cur_range >= 0.55 and close_pos >= 0.75
                 and (med_range <= 0 or cur_range >= med_range * 1.35)
-                and vol_ratio >= 1.25
             )
             liquidity_displacement = bool(swept and reclaimed and displacement)
     except Exception:
         liquidity_displacement = False
 
-    # Daily equivalent of ORB: first 3 sessions of the current calendar month.
-    # This preserves the tactic (range -> break -> follow-through) without pretending
-    # that a 5-minute opening range exists on a daily chart.
+    # Daily timeframe adaptation of ORB: first 3 completed sessions of the current
+    # month form the opening range. The current session is excluded from the range.
     month_d = daily[daily.index.to_period("M") == daily.index[-1].to_period("M")] if isinstance(daily.index, pd.DatetimeIndex) else daily.tail(22)
-    opening_range_high = float(month_d["High"].head(3).max()) if len(month_d) >= 3 else 0.0
-    opening_range_low = float(month_d["Low"].head(3).min()) if len(month_d) >= 3 else 0.0
+    completed_month = month_d.iloc[:-1] if len(month_d) >= 2 else month_d.iloc[0:0]
+    opening_range_high = float(completed_month["High"].head(3).max()) if len(completed_month) >= 3 else 0.0
+    opening_range_low = float(completed_month["Low"].head(3).min()) if len(completed_month) >= 3 else 0.0
 
-    # 5) Opening Range Breakout (ORB): اختراق نطاق بداية الشهر مع متابعة.
+    # 5) Opening Range Breakout (ORB): monthly opening-range breakout on daily timeframe.
     orb_high = opening_range_high
     orb_breakout = False
     try:
@@ -2280,12 +2302,14 @@ def analyze_daily(
             cur_pos = (float(cur["Close"]) - float(cur["Low"])) / cur_range
             expansion = cur_range >= max(med_range * 1.35, price * 0.003)
             compression = comp_width_pct <= 2.2 and med_range > 0
+            # Core = the structural compression -> expansion event only.
+            # Volume/VWAP/open/trend/HTF/market/extension remain confirmations
+            # or final safety gates and must not prevent Core matching.
             compression_expansion = bool(
-                compression and expansion and float(cur["Close"]) > float(cur["Open"])
-                and cur_pos >= 0.70 and vol_ratio >= 1.20
-                and above_vwap and above_open and trend_up
-                and h4_state != "معاكس" and market_ok and not failed
-                and cur_body / cur_range >= 0.45 and ext_tmp <= 7.0
+                compression and expansion
+                and float(cur["Close"]) > float(cur["Open"])
+                and cur_pos >= 0.70
+                and cur_body / cur_range >= 0.45
             )
     except Exception:
         compression_expansion = False
@@ -2300,8 +2324,8 @@ def analyze_daily(
             prev_day_high = float(prev["High"].max())
             prev_day_low = float(prev["Low"].min())
             prev_close_level = float(daily["Close"].iloc[-2])
-    except Exception:
-        pass
+    except Exception as exc:
+        log.debug("DAILY non-critical fallback exception: %s", exc)
 
     key_level_near = any(
         lvl > 0 and abs(price - lvl) / max(price, 1e-9) * 100 <= 0.60
@@ -2346,7 +2370,8 @@ def analyze_daily(
     except Exception:
         resistance_reclaim = False
 
-    # 7) Opening Drive → Pullback: دفعة قوية في بداية الشهر ثم تصحيح منظم واستعادة.
+    # 7) Opening Drive → Pullback: timeframe-adapted monthly opening drive
+    # (first completed sessions of the month), then controlled pullback/reclaim.
     opening_drive_pullback = False
     drive_level = 0.0
     try:
@@ -2431,8 +2456,8 @@ def analyze_daily(
         try:
             if lvl > 0 and abs(price - float(lvl)) / max(price, 1e-9) * 100 <= 0.60:
                 confluence_levels.append(label)
-        except Exception:
-            pass
+        except Exception as exc:
+            log.debug("DAILY non-critical nested fallback exception: %s", exc)
     multi_level_confluence = len(set(confluence_levels)) >= 3
     vwap_weekly_confluence = bool(
         trend_up and above_vwap and e20 > e50
@@ -2723,8 +2748,25 @@ def analyze_daily(
             q = sweep
             components = {"sweep": sweep}
         elif name == "سحب سيولة مع Displacement":
+            # Core = sweep + independent displacement quality. The composite
+            # liquidity_displacement flag is never scored as a second trigger.
             sweep = 100 if c.get("liquidity_sweep", False) else 0
-            disp = 100 if c.get("liquidity_displacement", False) else 0
+            disp = 0.0
+            try:
+                _df = c.get("today_d")
+                if _df is not None and len(_df) >= 8:
+                    _cur = _df.iloc[-1]
+                    _prev = _df.iloc[-4:-1]
+                    _rng = max(float(_cur["High"]) - float(_cur["Low"]), price_v * 0.0001)
+                    _body_ratio = abs(float(_cur["Close"]) - float(_cur["Open"])) / _rng
+                    _close_pos = (float(_cur["Close"]) - float(_cur["Low"])) / _rng
+                    _med_rng = float((_prev["High"].astype(float) - _prev["Low"].astype(float)).median()) if len(_prev) else 0.0
+                    _range_exp = (_rng / _med_rng) if _med_rng > 0 else 1.0
+                    disp = (0.45 * clip(_body_ratio / 0.55 * 100.0)
+                            + 0.25 * clip(_close_pos / 0.75 * 100.0)
+                            + 0.30 * clip((_range_exp - 1.0) / 0.35 * 100.0))
+            except Exception:
+                disp = 0.0
             q = 0.35*sweep + 0.65*disp
             components = {"sweep": sweep, "displacement": disp}
         elif name == "ضغط ثم انفجار":
@@ -2741,9 +2783,23 @@ def analyze_daily(
             q = 0.50*impulse + 0.50*flag
             components = {"impulse": impulse, "flag": flag}
         elif name == "استعادة مستوى":
-            match = 100 if c.get("resistance_reclaim", False) else 0
+            # Core scores the repeated-test structure and prior loss depth, not
+            # the composite resistance_reclaim boolean. Reclaim is separate.
             level = float(c.get("reclaim_level", 0.0) or 0.0)
-            dist = abs(price_v-level)/max(price_v,1e-9)*100 if level > 0 else 1.0
+            match = 0.0
+            try:
+                _df = c.get("today_d")
+                if _df is not None and len(_df) >= 10 and level > 0:
+                    _prior = _df.iloc[-10:-2]
+                    _touches = int((_prior["High"].astype(float) >= level * 0.995).sum())
+                    _prev_close = float(_df["Close"].iloc[-2])
+                    _touch_q = 50.0 + min(50.0, max(0.0, _touches - 2) * (50.0 / 3.0))
+                    _loss_depth = max(0.0, (level - _prev_close) / max(level, 1e-9) * 100.0)
+                    _loss_q = clip(_loss_depth / 0.75 * 100.0)
+                    match = 0.70 * _touch_q + 0.30 * _loss_q
+            except Exception:
+                match = 0.0
+            dist = abs(price_v-level)/max(price_v,1e-9)*100 if level > 0 else 0.6
             reclaim = clip((0.6-dist)/0.6*100)
             q = 0.60*match + 0.40*reclaim
             components = {"match": match, "reclaim": reclaim}
@@ -2754,16 +2810,39 @@ def analyze_daily(
             q = 0.60*drive + 0.40*pull
             components = {"drive": drive, "pullback": pull}
         elif name == "استعادة قمة اليوم":
-            match = 100 if c.get("hod_reclaim", False) else 0
+            # Core scores prior rejection depth independently from the current
+            # reclaim distance; the composite hod_reclaim flag is not scored.
             level = float(c.get("hod_level", 0.0) or 0.0)
-            dist = abs(price_v-level)/max(price_v,1e-9)*100 if level > 0 else 1.0
+            match = 0.0
+            try:
+                _df = c.get("today_d")
+                if _df is not None and len(_df) >= 8 and level > 0:
+                    _prev_close = float(_df["Close"].iloc[-2])
+                    _pullback = max(0.0, (level - _prev_close) / max(level, 1e-9) * 100.0)
+                    match = clip(_pullback / 0.75 * 100.0)
+            except Exception:
+                match = 0.0
+            dist = abs(price_v-level)/max(price_v,1e-9)*100 if level > 0 else 0.6
             reclaim = clip((0.6-dist)/0.6*100)
             q = 0.60*match + 0.40*reclaim
             components = {"match": match, "reclaim": reclaim}
         elif name == "استعادة بعد فشل ORB":
-            failed_reclaim = 100 if c.get("orb_failed_reclaim", False) else 0
+            # Core scores failure depth, ORB quality and reclaim separately; the
+            # composite orb_failed_reclaim boolean is not scored as one item.
+            failed_reclaim = 0.0
             orbq = clip(float(c.get("orb_quality", 0.0) or 0.0))
             orb_high = float(c.get("orb_high", 0.0) or 0.0)
+            try:
+                _df = c.get("today_d")
+                if _df is not None and len(_df) >= 8 and orb_high > 0:
+                    _post = _df.iloc[3:-1]
+                    _closes = _post["Close"].astype(float)
+                    _failed_closes = _closes[_closes <= orb_high * 0.998]
+                    if len(_failed_closes):
+                        _depth = max(0.0, (orb_high - float(_failed_closes.min())) / orb_high * 100.0)
+                        failed_reclaim = clip((_depth - 0.20) / 0.80 * 100.0)
+            except Exception:
+                failed_reclaim = 0.0
             reclaim = clip((price_v/max(orb_high,1e-9)-1.001)/0.004*100) if orb_high > 0 else 0
             q = 0.35*failed_reclaim + 0.25*orbq + 0.40*reclaim
             components = {"failed_reclaim": failed_reclaim, "orb_quality": orbq, "reclaim": reclaim}
@@ -2781,39 +2860,364 @@ def analyze_daily(
             q = 0.40*early_range + 0.30*near + 0.30*holding
             components = {"early_range": early_range, "near_resistance": near, "holding": holding}
 
-        # 30% Confirmation block: daily-specific context, not Core.
-        confirmation_weights = {
-            "اختراق مؤكد": {"volume": .60, "candle": .40},
-            "اختراق نطاق الافتتاح": {"above_vwap": .30, "h4": .20, "volume": .30, "candle": .20},
-            "إعادة اختبار": {"above_vwap": .40, "volume": .25, "candle": .15, "h4": .20},
-            "ارتداد VWAP": {"trend": .25, "h4": .20, "candle": .15, "momentum": .20, "volume": .20},
-            "ارتداد EMA20": {"h4": .20, "candle": .15, "volume": .20, "momentum": .20, "trend": .25},
-            "سحب سيولة": {"h4": .20, "above_vwap": .20, "candle": .15, "momentum": .20, "volume": .25},
-            "سحب سيولة مع Displacement": {"trend": .15, "above_vwap": .15, "above_open": .10, "h4": .10, "market": .10, "momentum": .15, "volume": .15, "candle": .10},
-            "ضغط ثم انفجار": {"above_vwap": .15, "above_open": .10, "trend": .15, "h4": .10, "market": .10, "volume": .20, "candle": .10, "momentum": .10},
-            "استمرار الزخم": {"trend": .15, "above_vwap": .15, "above_open": .10, "h4": .10, "market": .10, "volume": .15, "candle": .10, "no_breakout": .15},
-            "علم صاعد": {"trend": .15, "above_vwap": .15, "above_open": .10, "h4": .10, "market": .10, "volume": .15, "candle": .10, "no_orb": .15},
-            "استعادة مستوى": {"trend": .15, "above_vwap": .15, "above_open": .10, "h4": .10, "market": .10, "volume": .15, "candle": .15},
-            "دخول بعد Opening Drive": {"trend": .15, "above_vwap": .15, "above_open": .10, "h4": .10, "market": .10, "volume": .15, "candle": .10, "no_breakout": .075, "no_orb": .075},
-            "استعادة قمة اليوم": {"above_vwap": .15, "above_open": .10, "trend": .15, "h4": .10, "market": .10, "volume": .15, "candle": .15},
-            "استعادة بعد فشل ORB": {"trend": .15, "above_vwap": .15, "above_open": .10, "h4": .10, "market": .10, "volume": .15, "candle": .10, "no_orb": .15},
-            "استمرار ABC": {"trend": .15, "above_vwap": .15, "above_open": .10, "h4": .10, "market": .10, "volume": .15, "candle": .10, "momentum": .15},
-            "دخول مبكر": {"trend": .15, "above_vwap": .15, "above_open": .10, "h4": .10, "market": .10, "volume": .15, "candle": .15},
-        }.get(name, {})
+        # 30% Confirmation block: independent evidence only.
+        # A Core component is NEVER reused in Confirmation. Confirmation can
+        # validate the quality of the already-matched setup, but it cannot
+        # award points again for the event that created the match.
+        def _bar_quality(df):
+            try:
+                if df is None or len(df) < 1:
+                    return 0.0, 0.0
+                b = df.iloc[-1]
+                o, h, l, cc = map(float, (b["Open"], b["High"], b["Low"], b["Close"]))
+                rng = max(h - l, 1e-9)
+                body = abs(cc - o) / rng
+                close_pos = (cc - l) / rng
+                return clip(body * 0.55 + close_pos * 0.45), clip(close_pos * 100.0)
+            except Exception:
+                return 0.0, 0.0
 
-        confirmation_values = {
-            "trend": 100.0 if bool(c.get("trend_up", False)) else 0.0,
-            "above_vwap": 100.0 if bool(c.get("above_vwap", False)) else 0.0,
-            "above_open": 100.0 if bool(c.get("above_open", False)) else 0.0,
-            "h4": 100.0 if mstate != "معاكس" else 0.0,
-            "market": 100.0 if bool(c.get("market_ok", False)) else 0.0,
-            "volume": clip((vr - 0.90) / 0.60 * 100),
-            "momentum": clip((mom - 0.05) / 0.25 * 100),
-            "candle": 100.0 if green else 0.0,
-            "no_breakout": 100.0 if not bool(c.get("breakout_now", False)) else 0.0,
-            "no_orb": 100.0 if not bool(c.get("orb_breakout", False)) else 0.0,
-        }
-        confirmation_score = sum(confirmation_values[k] * w for k, w in confirmation_weights.items())
+        _df = c.get("today_d")
+        _bar_q, _close_pos = _bar_quality(_df)
+        _vol = clip((vr - 0.90) / 0.60 * 100)
+        _trend = 100.0 if bool(c.get("trend_up", False)) else 0.0
+        _vwap = 100.0 if bool(c.get("above_vwap", False)) else 0.0
+        _mtf = 100.0 if mstate != "معاكس" else 0.0
+        _mom = clip((mom - 0.05) / 0.25 * 100)
+        _candle = 100.0 if green else 0.0
+
+        # Lower-wick rejection is independent of the structural sweep itself.
+        _lower_wick = 0.0
+        try:
+            b = _df.iloc[-1] if _df is not None and len(_df) else None
+            if b is not None:
+                o, h, l, cc = map(float, (b["Open"], b["High"], b["Low"], b["Close"]))
+                rng = max(h - l, 1e-9)
+                lower_wick = max(min(o, cc) - l, 0.0) / rng
+                _lower_wick = clip(lower_wick / 0.50 * 100.0)
+        except Exception:
+            _lower_wick = 0.0
+
+        # None of the confirmation keys below belongs to the strategy Core.
+        # The same structural event therefore cannot receive points twice.
+        # 30% Confirmation: strategy-specific evidence only.
+        # Confirmation never reuses a Core boolean/component. It measures the
+        # QUALITY of the already-matched setup using independent price/volume
+        # behaviour (stability, efficiency, relative volume, segment structure).
+        _df = c.get("today_5") if c.get("today_5") is not None else c.get("today_d")
+
+        def _s(col):
+            try:
+                return _df[col].astype(float) if _df is not None and col in _df.columns else None
+            except Exception:
+                return None
+
+        def _clip(x):
+            try: return clip(float(x))
+            except Exception: return 0.0
+
+        def _bar_quality():
+            try:
+                if _df is None or len(_df) < 1: return 0.0,0.0,0.0,0.0
+                b=_df.iloc[-1]; o,h,l,cc=map(float,(b["Open"],b["High"],b["Low"],b["Close"]))
+                r=max(h-l,1e-9); body=abs(cc-o)/r; cp=(cc-l)/r
+                lw=max(min(o,cc)-l,0.0)/r; uw=max(h-max(o,cc),0.0)/r
+                return _clip(body*100),_clip(cp*100),_clip(lw/0.5*100),_clip(uw/0.5*100)
+            except Exception: return 0.0,0.0,0.0,0.0
+
+        def _median_range(n=8):
+            try:
+                h,l=_s("High"),_s("Low")
+                if h is None or l is None or len(h)<n: return 0.0
+                return max(float((h-l).iloc[-n:].median()),1e-9)
+            except Exception: return 0.0
+
+        def _relative_volume(recent=1, base=6):
+            try:
+                v=_s("Volume")
+                if v is None or len(v)<base+recent: return 50.0
+                cur=float(v.iloc[-recent:].mean()); ref=float(v.iloc[-base-recent:-recent].median())
+                return _clip((cur/max(ref,1e-9)-0.70)/1.10*100)
+            except Exception: return 50.0
+
+        def _segment_volume(a,b):
+            try:
+                v=_s("Volume")
+                if v is None or len(v)<max(abs(a),abs(b),8): return 50.0
+                seg=v.iloc[a:b] if b is not None else v.iloc[a:]
+                if len(seg)<2: return 50.0
+                return float(seg.mean())
+            except Exception: return 0.0
+
+        def _efficiency(a,b=None):
+            try:
+                cl=_s("Close")
+                if cl is None: return 0.0
+                seg=cl.iloc[a:b] if b is not None else cl.iloc[a:]
+                if len(seg)<3: return 0.0
+                net=abs(float(seg.iloc[-1])-float(seg.iloc[0])); path=float(seg.diff().abs().sum())
+                return _clip(net/max(path,1e-9)*100)
+            except Exception: return 0.0
+
+        def _slope(a=3,b=7):
+            try:
+                cl=_s("Close")
+                if cl is None or len(cl)<b+1: return 50.0
+                s=(float(cl.iloc[-1])-float(cl.iloc[-a]))/max(abs(float(cl.iloc[-a])),1e-9)*100
+                l=(float(cl.iloc[-1])-float(cl.iloc[-b]))/max(abs(float(cl.iloc[-b])),1e-9)*100
+                return _clip(50+s*18+(s-l)*10)
+            except Exception: return 50.0
+
+        def _range_contraction(recent=3,base=6):
+            try:
+                h,l=_s("High"),_s("Low")
+                if h is None or l is None or len(h)<recent+base: return 50.0
+                rr=h-l; cur=float(rr.iloc[-recent:].median()); ref=float(rr.iloc[-recent-base:-recent].median())
+                return _clip((1-cur/max(ref,1e-9))*100)
+            except Exception: return 50.0
+
+        def _pre_break_contraction(recent=4,base=8):
+            try:
+                h,l=_s("High"),_s("Low")
+                if h is None or l is None or len(h)<recent+base+1: return 50.0
+                rr=h-l
+                cur=float(rr.iloc[-1-recent:-1].median())
+                ref=float(rr.iloc[-1-recent-base:-1-recent].median())
+                return _clip((1-cur/max(ref,1e-9))*100)
+            except Exception: return 50.0
+
+        def _post_break_hold(level,bars=3):
+            try:
+                cl=_s("Close")
+                if cl is None or level<=0 or len(cl)<bars: return 0.0
+                seg=cl.iloc[-bars:]
+                above=float((seg>=level).mean())*70.0
+                dist=float((seg.iloc[-1]-level)/max(_median_range(8),1e-9))*30.0
+                return _clip(above+dist)
+            except Exception: return 0.0
+
+        def _level_stability(level,bars=4):
+            try:
+                cl=_s("Close"); atr=_median_range(8)
+                if cl is None or level<=0 or len(cl)<bars or atr<=0: return 0.0
+                dev=float((cl.iloc[-bars:]-level).abs().mean())/atr
+                return _clip((1.0-dev/1.5)*100)
+            except Exception: return 0.0
+
+        def _level_pressure(level,bars=4):
+            try:
+                h,l,cl=_s("High"),_s("Low"),_s("Close")
+                if h is None or l is None or cl is None or level<=0 or len(cl)<bars: return 0.0
+                # Measures repeated pressure toward the level, not the breakout/reclaim event.
+                dist=((level-cl.iloc[-bars:])/max(level,1e-9))*100
+                q=float((dist<=0.8).mean())*70.0 + _clip((float(cl.iloc[-1])-float(cl.iloc[-bars]))/max(level,1e-9)*100*30.0)
+                return _clip(q)
+            except Exception: return 0.0
+
+        def _relative_to_segment(level, a, b):
+            try:
+                cl=_s("Close")
+                if cl is None or level<=0: return 0.0
+                seg=cl.iloc[a:b] if b is not None else cl.iloc[a:]
+                if len(seg)<2: return 0.0
+                mean_dev=float((seg-level).abs().mean())/max(_median_range(8),1e-9)
+                return _clip((1.0-mean_dev/2.0)*100)
+            except Exception: return 0.0
+
+        def _segment_recovery(level, start=-5):
+            try:
+                cl=_s("Close")
+                if cl is None or level<=0 or len(cl)<abs(start)+1: return 0.0
+                seg=cl.iloc[start:]
+                first=float(seg.iloc[0]); last=float(seg.iloc[-1])
+                move=(last-first)/max(_median_range(8),1e-9)
+                return _clip(50+move*18)
+            except Exception: return 50.0
+
+        body,close_pos,lower_wick,upper_wick=_bar_quality()
+        rel_vol=_relative_volume()
+        short_slope=_slope(3,7)
+        path_eff=_efficiency(-7,None)
+        contract=_range_contraction()
+        atr=_median_range(8)
+        level=float(c.get("level_high",0.0) or 0.0)
+        vwap_level=float(c.get("vwap_last",0.0) or 0.0)
+        ema_level=float(c.get("e20",c.get("e5",0.0)) or 0.0)
+        orb_level=float(c.get("orb_high",0.0) or 0.0)
+        hod_level=float(c.get("hod_level",0.0) or 0.0)
+        support_level=float(c.get("support_level",0.0) or 0.0)
+
+        # Strategy-specific confirmation map. We intentionally replace only the
+        # confirmation layer; Core/Match/Safety logic is untouched.
+        confirmation_weights = {
+            "اختراق مؤكد": {"volume_expansion":.30,"range_expansion":.20,"pre_break_compression":.25,"post_break_hold":.25},
+            "اختراق نطاق الافتتاح": {"opening_volume":.30,"opening_range_quality":.25,"opening_close_strength":.25,"opening_hold":.20},
+            "إعادة اختبار": {"retest_stability":.30,"retest_rejection":.25,"retest_volume_vs_break":.20,"retest_duration":.15,"retest_follow_through":.10},
+            "ارتداد VWAP": {"vwap_rejection":.30,"bounce_efficiency":.20,"bounce_volume":.15,"vwap_reclaim_persistence":.25,"vwap_post_bounce_slope":.10},
+            "ارتداد EMA20": {"ema_rejection":.30,"ema_pullback_efficiency":.20,"ema_volume":.15,"ema_reclaim_persistence":.25,"ema_post_bounce_slope":.10},
+            "سحب سيولة": {"sweep_wick":.30,"sweep_depth_quality":.25,"recovery_quality":.20,"sweep_volume":.15,"sweep_reclaim_persistence":.10},
+            "سحب سيولة مع Displacement": {"displacement_body":.25,"displacement_range":.25,"displacement_close":.20,"displacement_volume":.20,"follow_through":.10},
+            "ضغط ثم انفجار": {"compression_quality":.30,"expansion_efficiency":.25,"volume_shift":.20,"wick_balance":.15,"post_expansion_slope":.10},
+            "استمرار الزخم": {"acceleration_quality":.30,"pullback_control":.20,"continuation_volume":.20,"higher_low_sequence":.20,"continuation_efficiency":.10},
+            "علم صاعد": {"impulse_efficiency":.25,"flag_contraction":.25,"flag_volume_contraction":.20,"follow_through":.20,"close_strength":.10},
+            "استعادة مستوى": {"level_test_quality":.30,"post_reclaim_slope":.25,"post_reclaim_stability":.20,"rejection_quality":.15,"volume_support":.10},
+            "دخول بعد Opening Drive": {"drive_efficiency":.25,"pullback_control":.25,"pullback_volume":.15,"drive_recovery":.20,"close_strength":.15},
+            "استعادة قمة اليوم": {"post_reclaim_slope":.30,"post_reclaim_stability":.25,"rejection_quality":.15,"volume_support":.15,"trend_alignment":.15},
+            "استعادة بعد فشل ORB": {"failure_depth":.25,"time_below_orb":.20,"recovery_quality":.25,"reclaim_volume":.15,"close_strength":.15},
+            "استمرار ABC": {"b_structure_quality":.25,"c_acceleration":.25,"c_volume":.20,"c_close_strength":.15,"c_range_expansion":.15},
+            "دخول مبكر": {"range_contraction":.30,"volume_stability":.20,"resistance_pressure":.20,"holding_quality":.20,"pressure_persistence":.10},
+        }.get(name,{})
+
+        # Independent metrics. No metric reads the strategy Core booleans or Core scores.
+        vals={}
+        vals["volume_expansion"]=_relative_volume()
+        vals["range_expansion"]=_clip(((float((_s("High")- _s("Low")).iloc[-1])/max(atr,1e-9))-1.0)/1.0*100) if _s("High") is not None and _s("Low") is not None and atr>0 else 0.0
+        vals["pre_break_compression"]=_pre_break_contraction(4,8)
+        vals["post_break_hold"]=_post_break_hold(level,3)
+
+        # Opening range: quality of the bars after the opening range, not the ORB trigger itself.
+        vals["opening_volume"]=_relative_volume(2,5)
+        vals["opening_range_quality"]=_efficiency(-4,None)
+        vals["opening_close_strength"]=_clip(float((_s("Close").iloc[-3:].mean()-_s("Low").iloc[-3:].mean())/max(atr,1e-9))*25) if _s("Close") is not None and _s("Low") is not None and atr>0 else 0.0
+        vals["opening_hold"]=_level_stability(orb_level,3)
+
+        # Retest: compare stability/volume/duration of the retest segment rather than re-scoring prior_break/near_level/reclaim.
+        vals["retest_stability"]=_level_stability(level,4)
+        vals["retest_rejection"]=lower_wick*0.75 + close_pos*0.25
+        vals["retest_volume_vs_break"]=_relative_volume(2,5)
+        vals["retest_duration"]=_clip((float((_s("Close").iloc[-4:]>=level*0.997).sum())/4.0)*100) if _s("Close") is not None and level>0 else 0.0
+        vals["retest_follow_through"]=_slope(2,5)
+
+        vals["vwap_proximity_quality"]=_level_stability(vwap_level,3)
+        vals["vwap_rejection"]=lower_wick*0.60 + close_pos*0.40
+        vals["bounce_efficiency"]=_efficiency(-4,None)
+        vals["bounce_volume"]=_relative_volume(2,5)
+        vals["vwap_distance_dummy"]=0.0
+        try:
+            cl=_s("Close")
+            vals["vwap_reclaim_persistence"]=_clip(float((cl.iloc[-4:]>=vwap_level).mean())*100) if cl is not None and vwap_level>0 and len(cl)>=4 else 0.0
+        except Exception: vals["vwap_reclaim_persistence"]=0.0
+        vals["vwap_post_bounce_slope"]=_slope(2,5)
+
+        vals["ema_proximity_quality"]=_level_stability(ema_level,3)
+        vals["ema_rejection"]=lower_wick*0.60 + close_pos*0.40
+        vals["ema_pullback_efficiency"]=_efficiency(-5,None)
+        vals["ema_volume"]=_relative_volume(2,5)
+        try:
+            cl=_s("Close")
+            vals["ema_reclaim_persistence"]=_clip(float((cl.iloc[-4:]>=ema_level).mean())*100) if cl is not None and ema_level>0 and len(cl)>=4 else 0.0
+        except Exception: vals["ema_reclaim_persistence"]=0.0
+        vals["ema_post_bounce_slope"]=_slope(2,5)
+
+        vals["sweep_wick"]=lower_wick
+        vals["sweep_depth_quality"]=_clip(max(0.0,(support_level-float(_s("Low").iloc[-4:].min()))/max(atr,1e-9))/1.5*100) if _s("Low") is not None and support_level>0 and atr>0 else 0.0
+        vals["recovery_quality"]=_segment_recovery(support_level,-5)
+        vals["sweep_volume"]=_relative_volume(2,5)
+        try:
+            cl=_s("Close")
+            vals["sweep_reclaim_persistence"]=_clip(float((cl.iloc[-4:]>=support_level).mean())*100) if cl is not None and support_level>0 and len(cl)>=4 else 0.0
+        except Exception: vals["sweep_reclaim_persistence"]=0.0
+
+        vals["displacement_body"]=body
+        vals["displacement_range"]=_clip((float((_s("High")-_s("Low")).iloc[-1])/max(atr,1e-9)-1.0)/1.0*100) if _s("High") is not None and _s("Low") is not None and atr>0 else 0.0
+        vals["displacement_close"]=close_pos
+        vals["displacement_volume"]=_relative_volume()
+        vals["follow_through"]=_slope(2,5)
+
+        vals["compression_quality"]=_range_contraction(4,8)
+        vals["expansion_efficiency"]=_efficiency(-4,None)
+        vals["volume_shift"]=_relative_volume(1,8)
+        vals["wick_balance"]=_clip(100.0-abs(lower_wick-upper_wick))
+        vals["post_expansion_slope"]=_slope(2,5)
+
+        vals["acceleration_quality"]=_clip(50.0+(_slope(2,5)-_slope(5,9)))
+        vals["pullback_control"]=_efficiency(-5,None)
+        vals["continuation_volume"]=_relative_volume(2,5)
+        try:
+            cl=_s("Close")
+            lo=_s("Low")
+            if lo is not None and len(lo)>=5:
+                diffs=lo.iloc[-5:].diff().dropna()
+                vals["higher_low_sequence"]=_clip(float((diffs>0).mean())*100)
+            else: vals["higher_low_sequence"]=0.0
+        except Exception: vals["higher_low_sequence"]=0.0
+        try:
+            cl=_s("Close")
+            if cl is not None and len(cl)>=7:
+                diffs=cl.iloc[-7:].diff().dropna()
+                vals["continuation_efficiency"]=_clip(float((diffs>0).mean())*100)
+            else: vals["continuation_efficiency"]=50.0
+        except Exception: vals["continuation_efficiency"]=50.0
+
+        # Bull flag: compare flag segment with impulse segment, not generic current Volume.
+        vals["impulse_efficiency"]=_efficiency(-11,-5)
+        vals["flag_contraction"]=_range_contraction(5,5)
+        try:
+            v=_s("Volume"); flag_v=float(v.iloc[-5:].mean()); imp_v=float(v.iloc[-11:-5].mean()) if v is not None and len(v)>=11 else flag_v
+            vals["flag_volume_contraction"]=_clip((1.25-flag_v/max(imp_v,1e-9))/0.75*100)
+        except Exception: vals["flag_volume_contraction"]=50.0
+        vals["follow_through"] = vals.get("follow_through", _slope(2,5))
+
+        vals["level_test_quality"]=_level_pressure(level,5)
+        vals["post_reclaim_slope"]=_slope(3,6)
+        vals["post_reclaim_stability"]=_level_stability(level,4)
+        vals["rejection_quality"]=lower_wick*0.70 + (100.0-upper_wick)*0.30
+        vals["volume_support"]=_relative_volume(2,5)
+
+        vals["drive_efficiency"]=_efficiency(-7,-1)
+        vals["pullback_control"]=_efficiency(-5,None)
+        vals["pullback_volume"]=_relative_volume(2,5)
+        vals["drive_recovery"]=_slope(3,7)
+
+        vals["post_reclaim_slope"]=_slope(3,6)
+        vals["post_reclaim_stability"]=_level_stability(hod_level,4)
+
+        vals["failure_depth"]=_clip(max(0.0,(orb_level-float(_s("Low").iloc[-6:].min()))/max(atr,1e-9))/1.5*100) if _s("Low") is not None and orb_level>0 and atr>0 else 0.0
+        try:
+            cl=_s("Close")
+            vals["time_below_orb"]=_clip(float((cl.iloc[-8:]<orb_level*0.998).mean())*100) if cl is not None and orb_level>0 and len(cl)>=8 else 0.0
+        except Exception: vals["time_below_orb"]=0.0
+        vals["reclaim_volume"]=_relative_volume(2,5)
+
+        # ABC: explicitly measure the middle B segment and final C acceleration.
+        try:
+            cl=_s("Close"); hi=_s("High"); lo=_s("Low")
+            if cl is not None and hi is not None and lo is not None and len(cl)>=12:
+                aa=cl.iloc[-12:-8]; bb=cl.iloc[-8:-4]; cc=cl.iloc[-4:]
+                a_hi=float(aa.max()); a_lo=float(aa.min()); b_lo=float(bb.min()); b_hi=float(bb.max())
+                b_depth=(a_hi-b_lo)/max(a_hi-a_lo,atr,1e-9); b_width=(b_hi-b_lo)/max(atr,1e-9)
+                vals["b_structure_quality"]=_clip((1.0-abs(b_depth-0.40)/0.40)*70 + (1.0-min(b_width/3.0,1.0))*30)
+                vals["c_acceleration"]=_clip(50.0+(_slope(2,4)-_slope(4,7)))
+            else:
+                vals["b_structure_quality"]=0.0; vals["c_acceleration"]=0.0
+        except Exception:
+            vals["b_structure_quality"]=0.0; vals["c_acceleration"]=0.0
+        vals["c_volume"]=_relative_volume(2,5)
+        vals["c_close_strength"]=close_pos
+        try:
+            hi=_s("High"); lo=_s("Low")
+            if hi is not None and lo is not None and len(hi)>=8 and atr>0:
+                c_rng=float((hi.iloc[-4:]-lo.iloc[-4:]).mean())
+                b_rng=float((hi.iloc[-8:-4]-lo.iloc[-8:-4]).mean())
+                vals["c_range_expansion"]=_clip((c_rng/max(b_rng,1e-9)-1.0)*100)
+            else: vals["c_range_expansion"]=0.0
+        except Exception: vals["c_range_expansion"]=0.0
+
+        vals["range_contraction"]=_range_contraction(3,6)
+        try:
+            v=_s("Volume")
+            if v is not None and len(v)>=6:
+                ratios=v.iloc[-3:]/max(float(v.iloc[-6:-3].median()),1e-9)
+                vals["volume_stability"]=_clip(100.0-float(ratios.std())*100.0)
+            else: vals["volume_stability"]=50.0
+        except Exception: vals["volume_stability"]=50.0
+        vals["resistance_pressure"]=_level_pressure(level,4)
+        vals["holding_quality"]=_slope(3,6)
+        vals["pressure_persistence"]=_level_pressure(level,6)
+
+        confirmation_score=sum(_clip(vals.get(k,0.0))*float(w) for k,w in confirmation_weights.items())
+        confirmation_score=_clip(confirmation_score)
+
 
         # Core score uses only structural components. Generic confirmation
         # factors are excluded here so they are counted once, in the 30% block.
@@ -3026,14 +3430,6 @@ def analyze_daily(
             symbol,
             _detail,
         )
-
-    log.info(
-        "%s STRATEGY COMPETITION AUDIT | %s | primary=%s | %s",
-        "DAILY",
-        symbol,
-        entry_type,
-        " | ".join(_competition_audit_parts),
-    )
 
     log.info(
         "DAILY STRATEGY AUDIT V3 | %s | primary=%s | matched=%s | scores=%s | "
@@ -3414,8 +3810,8 @@ def analyze_daily(
     stop = max(valid_stops) if valid_stops else price * 0.985
 
     risk = price - stop
-    min_risk = price * 0.006
-    max_risk = price * 0.10
+    min_risk = price * (DAILY_MIN_RISK_PCT / 100.0)
+    max_risk = price * (DAILY_MAX_RISK_PCT / 100.0)
     if risk < min_risk:
         stop = price - min_risk
         risk = min_risk
@@ -3449,7 +3845,7 @@ def analyze_daily(
         tp1 = adaptive_tp1
         risk = price - stop
         risk_pct_check = risk / price * 100 if price else 0.0
-        if 1.50 <= risk_pct_check <= 10.00:
+        if DAILY_MIN_RISK_PCT <= risk_pct_check <= DAILY_MAX_RISK_PCT:
             warnings.append(f"Adaptive Exit: TP1={adaptive_tp1_r:.2f}R")
         else:
             # Safety: revert to the original structural stop if adaptive scaling
@@ -3479,7 +3875,7 @@ def analyze_daily(
     buy_high = price * 1.004
 
     # فحص Spread/السيولة يُجرى في scan_daily للمرشحين فقط، حتى لا يبطئ تحليل كل الأسهم.
-    liquidity = {"ok": True, "spread_pct": 0.0, "slippage_pct": 0.0, "dollar_volume": 0.0}
+    liquidity = {"ok": True, "spread_pct": 0.0, "slippage_pct": 0.0}
     liquidity_ok = True
 
     interaction_keys = _interaction_keys(
@@ -3499,7 +3895,7 @@ def analyze_daily(
         and not chop
         and news_momentum_ok
         and not (h4_state == "معاكس" and score_i < 92)
-        and risk <= price * 0.10
+        and risk <= price * (DAILY_MAX_RISK_PCT / 100.0)
         and tp1 > price
         and tp1_distance_pct >= 0.8
         and reward_r >= float(policy.get("min_tp1_r", 1.2))
@@ -3606,7 +4002,6 @@ def analyze_daily(
         interaction_keys=interaction_keys,
         spread_pct=round(float(liquidity.get("spread_pct", 0) or 0), 3),
         expected_slippage_pct=round(float(liquidity.get("slippage_pct", 0) or 0), 3),
-        dollar_volume_3m=round(float(liquidity.get("dollar_volume", 0) or 0), 0),
         liquidity_ok=liquidity_ok,
         quality_reasons=quality_reasons,
     )
@@ -3616,7 +4011,7 @@ def format_daily_ar(sig: DailySignal, min_score: int = DAILY_MIN_SCORE) -> str:
     arrow = "▲" if sig.change_pct >= 0 else "▼"
     market_map = {
         "قوي": "🟢 قوي",
-        "إيجابي_تحت_VWAP": "🟠 إيجابي",
+        "إيجابي_تحت_VWAP": "🟠 إيجابي تحت VWAP",
         "مختلط": "🟡 مختلط",
         "ضعيف": "🔴 ضعيف",
         "غير مؤكد": "⚪️ غير مؤكد",
@@ -3818,6 +4213,16 @@ def scan_daily(
                 return _prefilter_daily_from_frames(sym, weekly, daily)
             for sym in symbols:
                 item = _route_from_frames(sym)
+                if item is None:
+                    # Partial-batch hardening: a missing symbol must get its own
+                    # normal fetch path instead of being silently discarded.
+                    try:
+                        item = _prefilter_daily(sym)
+                        if item:
+                            log.info("DAILY INDIVIDUAL FALLBACK | %s | recovered after batch miss", sym)
+                    except Exception as exc:
+                        log.warning("DAILY INDIVIDUAL FALLBACK FAILED | %s | %s", sym, exc)
+                        item = None
                 if item:
                     route, routes, weekly, daily = item; stage1.append((route, routes, sym, weekly, daily))
         else:
@@ -3907,11 +4312,15 @@ def scan_daily(
                 liq = _quote_liquidity(sig.symbol, sig.price)
                 sig.spread_pct = round(float(liq.get("spread_pct", 0) or 0), 3)
                 sig.expected_slippage_pct = round(float(liq.get("slippage_pct", 0) or 0), 3)
-                sig.dollar_volume_3m = round(float(liq.get("dollar_volume", 0) or 0), 0)
                 sig.liquidity_ok = bool(liq.get("ok", False))
                 if not sig.liquidity_ok:
                     stage2_rejects["liquidity"] += 1
                     continue
+                if sig.spread_pct > MAX_SPREAD_PCT:
+                    log.warning(
+                        "DAILY LIQUIDITY WARNING | %s | spread=%.3f%% > %.2f%%",
+                        sig.symbol, sig.spread_pct, MAX_SPREAD_PCT,
+                    )
                 if liq.get("quote_source") == "none" or float(liq.get("quote_age_min", 999) or 999) > 2.0:
                     stage2_rejects["stale_or_no_quote"] += 1
                     continue
