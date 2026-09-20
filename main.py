@@ -80,6 +80,7 @@ logging.basicConfig(
 log = logging.getLogger("halal-bot")
 
 # Runtime diagnostic: prove exactly which analyzer_intraday.py Render loads.
+# /scani display cleanup is session-only; it does not alter scan or strategy logic.
 import analyzer_intraday as _runtime_analyzer_intraday
 log.info(
     "RUNTIME ANALYZER | file=%s | version=%s",
@@ -755,9 +756,23 @@ async def cmd_scan(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def cmd_scan_intra(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     msg = await update.message.reply_text("جاري المسح اللحظي (ساعة + 5د)...")
+
+    # Display-only session handling: never run an intraday scan while the
+    # regular US session is closed, and do not show in-session VWAP/window
+    # labels when the market is actually closed.
+    if not is_us_regular_session():
+        await msg.edit_text(
+            f"🔴 السوق مغلق — لا يوجد مسح لحظي ولا تنبيهات\n"
+            f"{session_label()}"
+        )
+        return
+
     ok, reason = session_window_ok()
     if not ok:
-        await msg.edit_text(f"خارج نافذة اللحظي الآن.\n{reason}")
+        await msg.edit_text(
+            f"🟠 السوق مفتوح — {session_label()}\n"
+            f"🔴 نافذة اللحظي غير مسموحة الآن — {reason}"
+        )
         return
 
     if _intra_scan_lock.locked():
@@ -779,10 +794,12 @@ async def cmd_scan_intra(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             "غير مؤكد": "⚪️ غير مؤكد",
         }
         market_label = market_labels.get(market_condition, "⚪️ غير مؤكد")
+        # No candidates is still an open-market result, so show the actual
+        # market regime and the permitted intraday window.
         await msg.edit_text(
             f"لا مرشحين لحظيين الآن.\n{session_label()}\n"
             f"{market_label} | نظام السوق\n"
-            f"حد {INTRADAY_MIN_SCORE} | فوق VWAP | نافذة بعد الافتتاح وقبل الإغلاق"
+            f"حد {INTRADAY_MIN_SCORE} | نافذة اللحظي: 🟢 بعد الافتتاح وقبل الإغلاق"
         )
         return
     parts = [f"⚡ مسح لحظي — {session_label()}", f"السقف اليومي للحظي: {INTRADAY_MAX}"]

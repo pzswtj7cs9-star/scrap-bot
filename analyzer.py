@@ -4611,6 +4611,22 @@ def analyze_daily(
         and tp1_distance_pct >= 0.8
         and reward_r >= float(policy.get("min_tp1_r", 1.2))
     )
+    # The weak-market override may bypass ONLY the market blocker. It must
+    # never erase another quality failure (wide stop, volume, chop, failed
+    # breakout, news, HTF contradiction, etc.).
+    non_market_quality_ok = bool(
+        (not dump)
+        and (not failed)
+        and ext <= 8.0
+        and atr_pct <= 8.0
+        and vol_ratio >= float(policy.get("min_volume_ratio", 0.85))
+        and not chop
+        and news_momentum_ok
+        and not (h4_state == "معاكس" and raw_score < 92)
+    )
+    strong_stock_market_override = bool(
+        strong_stock_market_override and non_market_quality_ok
+    )
     market_permission = bool(
         strong_market_ok
         or positive_market_ok
@@ -4618,7 +4634,8 @@ def analyze_daily(
         or strong_stock_market_override
     )
     if strong_stock_market_override:
-        quality_ok = True
+        # Only market_block is waived; all other quality gates remain intact.
+        quality_ok = non_market_quality_ok
 
     if resistance_source != "هدف مخاطر 1.20R":
         reasons.append(f"TP1 مقاومة: {tp1:.2f}")
