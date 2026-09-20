@@ -988,7 +988,7 @@ async def live_scan_intraday_job(context: ContextTypes.DEFAULT_TYPE) -> None:
         if not fresh:
             return
 
-        # scan_intraday رتّب جميع الاستراتيجيات الـ16 بالفعل؛ نحافظ على ترتيبه
+        # scan_intraday رتّب جميع الاستراتيجيات الـ19 بالفعل؛ نحافظ على ترتيبه
         # ولا نفرض أولوية يدوية على 3 استراتيجيات فقط هنا.
         sig = fresh[0]
         # لا نسجل الإشارة كـ"مُرسلة" قبل نجاح Telegram فعلياً.
