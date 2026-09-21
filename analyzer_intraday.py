@@ -2711,7 +2711,10 @@ def analyze_intraday(
 
     # Early Entry core: pre-breakout compression/holding near meaningful resistance.
     # Initialize diagnostics before try so Stage 2 never raises UnboundLocalError.
-    early_range = 3.0
+    # Intraday Early Entry structural range limit is 1.5%.
+    # Keep the fallback aligned with the same authoritative limit so a diagnostic
+    # fallback can never accidentally treat a missing range as valid.
+    early_range = 1.5
     early_near_resistance = False
     early_holding = False
     early = False
@@ -3045,7 +3048,11 @@ def analyze_intraday(
             add("السعر ليس فوق الافتتاح", v("above_open", False))
             add("يوجد breakout_now", not v("breakout_now", False))
             add("ليس قريبًا من المقاومة", v("early_near_resistance", False))
-            limit = 1.5 if "m15_state" in c else 3.0
+            # Intraday Early Entry has one authoritative structural limit: 1.5%.
+            # Do not infer the limit from the presence of m15_state; this context
+            # exists for all intraday candidates and previously made the audit
+            # conditional for no valid reason.
+            limit = 1.5
             try: add(f"نطاق الدخول المبكر أكبر من {limit:.1f}%", float(v("early_range", 999.0) or 999.0) <= limit)
             except Exception: add("تعذر فحص early_range", False)
             add("Holding غير إيجابي", v("early_holding", False))
@@ -3296,8 +3303,10 @@ def analyze_intraday(
             q=0.30*rsq+0.25*pb+0.20*hl+0.25*trig; components={"rs_strength":rsq,"rs_pullback":pb,"rs_higher_low":hl,"rs_trigger":trig}
 
         else:  # دخول مبكر
-            er = float(c.get("early_range",3.0) or 3.0)
-            early_range = clip((3.0-er)/2.0*100)
+            # Keep the scoring scale aligned with the real intraday Core gate:
+            # 0% range = 100, 1.5% range = 0. No 3% scoring scale here.
+            er = float(c.get("early_range",1.5) or 1.5)
+            early_range = clip((1.5-er)/1.5*100)
             near = 100 if c.get("early_near_resistance", False) else 0
             holding = 100 if c.get("early_holding", False) else 0
             q = 0.30*early_range + 0.25*near + 0.20*holding + 0.15*clip((mom-0.05)/0.25*100) + 0.10*(100 if green else 0)
@@ -4598,14 +4607,30 @@ def _prefilter_intraday(
         ok_h1, _ = intraday_data_fresh(h1, "60m", 90)
         ok_m5, _ = intraday_data_fresh(m5, "5m", 12)
         if h1 is None or m5 is None or len(h1) < 40 or len(m5) < 30 or not ok_h1 or not ok_m5:
+            reasons = []
+            if h1 is None:
+                reasons.append("h1_missing")
+            elif len(h1) < 40:
+                reasons.append(f"h1_bars<{40}")
+            if m5 is None:
+                reasons.append("m5_missing")
+            elif len(m5) < 30:
+                reasons.append(f"m5_bars<{30}")
+            if not ok_h1:
+                reasons.append("h1_stale")
+            if not ok_m5:
+                reasons.append("m5_stale")
+            log.info("INTRADAY STAGE 1 REJECT | %s | %s", symbol, ";".join(reasons) or "data_invalid")
             return None
 
         last_day = m5.index[-1].date()
         today = m5[m5.index.date == last_day]
         if len(today) < 6:
+            log.info("INTRADAY STAGE 1 REJECT | %s | session_bars<6", symbol)
             return None
         price = float(today["Close"].iloc[-1])
         if price <= 0 or price > float(MAX_AUTO_PRICE):
+            log.info("INTRADAY STAGE 1 REJECT | %s | invalid_price=%.4f|max=%.2f", symbol, price, float(MAX_AUTO_PRICE))
             return None
 
         hc = h1["Close"]
@@ -4722,9 +4747,12 @@ def _prefilter_intraday(
         # Only hard-fail unusable data/liquidity. Do NOT discard a valid setup
         # merely because it is not a generic trend/VWAP/momentum candidate.
         if vol_ratio < 0.65:
+            log.info("INTRADAY STAGE 1 REJECT | %s | low_volume_ratio=%.2fx<0.65x", symbol, vol_ratio)
             return None
+        log.debug("INTRADAY STAGE 1 PASS | %s | route=%.1f | top_strategy=%s:%.1f", symbol, route_score, max(route_by_strategy, key=route_by_strategy.get), max(route_by_strategy.values()))
         return route_score, route_by_strategy, h1, m5
-    except Exception:
+    except Exception as exc:
+        log.info("INTRADAY STAGE 1 REJECT | %s | exception=%s", symbol, str(exc))
         return None
 
 
