@@ -4604,8 +4604,11 @@ def _prefilter_intraday(
         else:
             h1 = fetch_intraday(symbol, interval="60m", period="10d")
             m5 = fetch_intraday(symbol, interval="5m", period="5d")
-        ok_h1, _ = intraday_data_fresh(h1, "60m", 90)
-        ok_m5, _ = intraday_data_fresh(m5, "5m", 12)
+        # Diagnostic only: keep the existing freshness gates unchanged, but expose
+        # the measured age so a stale rejection can be distinguished from a
+        # genuine data-source delay.
+        ok_h1, h1_age_min = intraday_data_fresh(h1, "60m", 90)
+        ok_m5, m5_age_min = intraday_data_fresh(m5, "5m", 12)
         if h1 is None or m5 is None or len(h1) < 40 or len(m5) < 30 or not ok_h1 or not ok_m5:
             reasons = []
             if h1 is None:
@@ -4617,10 +4620,13 @@ def _prefilter_intraday(
             elif len(m5) < 30:
                 reasons.append(f"m5_bars<{30}")
             if not ok_h1:
-                reasons.append("h1_stale")
+                reasons.append(f"h1_stale(age={h1_age_min:.1f}m>90m)")
             if not ok_m5:
-                reasons.append("m5_stale")
-            log.info("INTRADAY STAGE 1 REJECT | %s | %s", symbol, ";".join(reasons) or "data_invalid")
+                reasons.append(f"m5_stale(age={m5_age_min:.1f}m>12m)")
+            log.info(
+                "INTRADAY STAGE 1 REJECT | %s | %s | ages=h1:%.1fm/90m,m5:%.1fm/12m",
+                symbol, ";".join(reasons) or "data_invalid", float(h1_age_min), float(m5_age_min),
+            )
             return None
 
         last_day = m5.index[-1].date()
