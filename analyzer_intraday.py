@@ -70,6 +70,7 @@ LEARNING_ALERT_FILE = Path("/var/data/intraday_learning_alert.json")
 # and the canonical strategy list so it cannot drift if the strategy count changes.
 PREFILTER_MAX_CANDIDATES = 50
 PREFILTER_STRATEGY_TOP_K = 4
+INTRADAY_ANALYZER_VERSION = "20260921-145021-FINAL-AUDIT-VWAP"
 ENTRY_TYPES = (
     "اختراق مؤكد", "إعادة اختبار", "دخول مبكر", "ارتداد VWAP", "ارتداد EMA20",
     "سحب سيولة", "اختراق نطاق الافتتاح", "استمرار الزخم", "ضغط ثم انفجار",
@@ -2713,6 +2714,9 @@ def analyze_intraday(
         compression_expansion = False
 
     # Early Entry core: pre-breakout compression/holding near meaningful resistance.
+    early_range = 3.0
+    early_near_resistance = False
+    early_holding = False
     early = False
     try:
         recent3 = today_5.iloc[:closed_idx + 1].tail(3)

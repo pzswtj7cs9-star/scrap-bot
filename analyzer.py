@@ -67,6 +67,7 @@ LEARNING_ALERT_FILE = Path("/var/data/daily_v2_learning_alert.json")
 # and the canonical strategy list so it cannot drift if the strategy count changes.
 PREFILTER_MAX_CANDIDATES = 50
 PREFILTER_STRATEGY_TOP_K = 4
+DAILY_ANALYZER_VERSION = "20260921-145021-FINAL-AUDIT-VWAP"
 ENTRY_TYPES = (
     "اختراق مؤكد", "إعادة اختبار", "دخول مبكر", "ارتداد VWAP", "ارتداد EMA20",
     "سحب سيولة", "اختراق نطاق الافتتاح", "استمرار الزخم", "ضغط ثم انفجار",
@@ -2669,19 +2670,24 @@ def analyze_daily(
 
     retest = prior_break and near_level and closed_close >= level_high * 0.997
 
-    # 1) VWAP Bounce/Reclaim: رجوع منظم إلى VWAP ثم استعادة المستوى.
+    # 1) VWAP Bounce/Reclaim: رجوع فعلي إلى VWAP ثم استعادة المستوى.
+    # لا يتغير باقي منطق الاستراتيجية؛ اللمس أصبح تفاعلًا فعليًا مع نطاق VWAP.
     recent4 = today_d.iloc[max(0, closed_idx - 4):closed_idx]
     vwap_touch = False
     try:
-        vwap_touch = bool((recent4["Low"].astype(float) <= vwap_last * 1.006).any())
+        rh = recent4["High"].astype(float)
+        rl = recent4["Low"].astype(float)
+        vwap_touch = bool(((rl <= vwap_last * 1.006) & (rh >= vwap_last * 0.994)).any())
     except Exception:
         vwap_touch = False
     vwap_bounce = bool(vwap_touch and closed_close >= vwap_last_closed * 1.001)
 
-    # 2) EMA20 Pullback: ترند صاعد + تصحيح صحي إلى EMA20 + استعادة.
+    # 2) EMA20 Pullback: ترند صاعد + تصحيح فعلي إلى EMA20 + استعادة.
     ema_touch = False
     try:
-        ema_touch = bool((recent4["Low"].astype(float) <= e5 * 1.006).any())
+        rh = recent4["High"].astype(float)
+        rl = recent4["Low"].astype(float)
+        ema_touch = bool(((rl <= e5 * 1.006) & (rh >= e5 * 0.994)).any())
     except Exception:
         ema_touch = False
     ema_pullback = bool(ema_touch and closed_close >= e5_closed * 1.001)
@@ -3049,6 +3055,9 @@ def analyze_daily(
     # Early Entry is itself a structural setup, not a score fallback:
     # pre-breakout compression/holding under a meaningful resistance, with
     # improving price action and no already-confirmed strategy trigger.
+    early_range = 3.0
+    early_near_resistance = False
+    early_holding = False
     early = False
     try:
         recent3 = today_d.iloc[:closed_idx + 1].tail(3)
@@ -3951,6 +3960,23 @@ def analyze_daily(
                 symbol,
                 _detail,
             )
+        # DIAGNOSTIC ONLY: summarize the most frequent blockers across all canonical strategies.
+        # This does not change the no-match decision.
+        from collections import Counter as _Counter
+        _blocker_counts = _Counter()
+        for _et in ENTRY_TYPES:
+            try:
+                _blocker_counts.update(_competition_fail_reasons(_et))
+            except Exception as exc:
+                log.debug("DAILY non-critical deep fallback exception: %s", exc)
+        _top_blockers = ";".join(
+            f"{_reason}={_count}" for _reason, _count in _blocker_counts.most_common(6)
+        ) or "unavailable"
+        log.info(
+            "DAILY NO_SIGNAL | %s | reason=no_strategy_match | top_blockers=%s",
+            symbol,
+            _top_blockers,
+        )
         # Preserve the original trading behavior exactly.
         return None
 
