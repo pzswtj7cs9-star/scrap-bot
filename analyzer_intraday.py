@@ -29,7 +29,7 @@ from stocks import MAX_AUTO_PRICE
 log = logging.getLogger(__name__)
 
 # Deployment marker: proves which analyzer_intraday build Render actually loaded.
-INTRADAY_ANALYZER_VERSION = "REGIME_ADAPTIVE_PROFESSIONAL_MARKET_REGIME_V5"
+INTRADAY_ANALYZER_VERSION = "20260921-170000-FINAL-AUDIT-VWAP-EARLYFIX"
 log.info("INTRADAY ANALYZER VERSION | %s", INTRADAY_ANALYZER_VERSION)
 
 SKIP_OPEN_MIN = 20
@@ -70,7 +70,6 @@ LEARNING_ALERT_FILE = Path("/var/data/intraday_learning_alert.json")
 # and the canonical strategy list so it cannot drift if the strategy count changes.
 PREFILTER_MAX_CANDIDATES = 50
 PREFILTER_STRATEGY_TOP_K = 4
-INTRADAY_ANALYZER_VERSION = "20260921-145021-FINAL-AUDIT-VWAP"
 ENTRY_TYPES = (
     "اختراق مؤكد", "إعادة اختبار", "دخول مبكر", "ارتداد VWAP", "ارتداد EMA20",
     "سحب سيولة", "اختراق نطاق الافتتاح", "استمرار الزخم", "ضغط ثم انفجار",
@@ -2444,9 +2443,6 @@ def analyze_intraday(
     day_open = float(today_5["Open"].iloc[0])
     prev_days = m5[m5.index.date < last_day]
     prev_close = float(prev_days["Close"].iloc[-1]) if not prev_days.empty else price
-    # Previous-session close is the intraday PrevClose reference level.
-    # Keep this on the intraday 5m context; do not borrow the Daily formula.
-    prev_close_level = float(prev_close)
     change_pct = (price - prev_close) / prev_close * 100 if prev_close else 0.0
 
     vwap_s = _vwap(today_5)
@@ -2714,6 +2710,7 @@ def analyze_intraday(
         compression_expansion = False
 
     # Early Entry core: pre-breakout compression/holding near meaningful resistance.
+    # Initialize diagnostics before try so Stage 2 never raises UnboundLocalError.
     early_range = 3.0
     early_near_resistance = False
     early_holding = False
@@ -2925,6 +2922,12 @@ def analyze_intraday(
         matched_entry_types.append("دخول مبكر")
 
     # طبقة Confluence: ليست نوع دخول جديداً، بل Bonus عند اجتماع VWAP + H1 + عدة مستويات.
+    # Previous-close level is intraday session context, not a daily formula change.
+    prev_close_level = float(prev_close) if prev_close > 0 else 0.0
+    key_level_near = any(
+        lvl > 0 and abs(price - float(lvl)) / max(price, 1e-9) * 100 <= 0.60
+        for lvl in (prev_close_level, orb_high, level_high)
+    )
     confluence_levels = []
     for lvl, label in ((vwap_last, "VWAP"), (e5, "EMA20"), (orb_high, "ORB"),
                        (level_high, "H1-Level"), (prev_close_level, "PrevClose")):
@@ -4079,13 +4082,6 @@ def analyze_intraday(
         reasons.append("دخول مبكر فوق VWAP")
         factors.append("early")
 
-    # Intraday key levels: previous-session close + ORB + current H1 structural level.
-    # Diagnostic/quality factor only; it does not create or block a strategy.
-    key_level_near = any(
-        lvl > 0 and abs(price - float(lvl)) / max(price, 1e-9) * 100 <= 0.60
-        for lvl in (prev_close_level, orb_high, level_high)
-    )
-
     if key_level_near and "key_level" not in factors:
         factors.append("key_level")
         reasons.append("قرب مستوى سعري مهم")
@@ -4136,8 +4132,10 @@ def analyze_intraday(
     limits = policy.get("entry_limits", {})
     # IMPORTANT: entry_limits are Score caps only. They NEVER determine alert eligibility.
     # Global eligibility uses raw_score in scan_* after all structural/final gates pass.
-    # Capture the complete pre-cap score once, after adaptive adjustments.
-    # The strategy cap below affects only the displayed/ranking score.
+    # نحفظ الدرجة قبل سقف نوع الاستراتيجية لاستخدامها في استثناء السوق.
+    # سقف الاستراتيجية يبقى كما هو للـScore المعروض والترتيب.
+    # Preserve the uncapped score for global eligibility and strong-stock override.
+    # Strategy entry_limits remain display/ranking caps only.
     raw_score = float(score)
     override_score = raw_score
     if entry_type == "دخول مبكر":
