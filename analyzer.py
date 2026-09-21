@@ -30,7 +30,7 @@ from stocks import MAX_AUTO_PRICE
 
 log = logging.getLogger("halal-bot.daily")
 
-DAILY_ANALYZER_VERSION = "20260921-214500-FINAL-AUDIT-CUMULATIVE"
+DAILY_ANALYZER_VERSION = "20260921-214500-FINAL-AUDIT-CUMULATIVE-LIVEGATE"
 log.info("DAILY ANALYZER VERSION | %s", DAILY_ANALYZER_VERSION)
 
 SKIP_OPEN_MIN = 0
@@ -39,6 +39,10 @@ DAILY_MIN_SCORE = 82
 
 DAILY_AUDIT_FILE = Path("/var/data/daily_audit_counters.json")
 _DAILY_AUDIT_LOCK = Lock()
+# Runtime-only bridge: analyze_daily() records the exact zero-match blockers so
+# scan_daily() can persist them in the cumulative audit. Diagnostic only.
+_DAILY_NO_SIGNAL_AUDIT: dict[str, dict[str, int]] = {}
+_DAILY_NO_SIGNAL_LOCK = Lock()
 
 def _new_daily_audit() -> dict:
     return {
@@ -286,6 +290,8 @@ class DailySignal:
     structure_zone: str = "محايدة"
     quality_ok: bool = True
     live_ok: bool = True
+    # Diagnostic-only: exact failed sub-conditions of the live gate.
+    live_gate_reasons: list[str] | None = None
     volume_ratio: float = 1.0
     regime: str = "neutral"
     factor_keys: list | None = None
@@ -2700,6 +2706,17 @@ def analyze_daily(
     last_green = float(today_d["Close"].iloc[closed_idx]) >= float(today_d["Open"].iloc[closed_idx])
     mom = (price - float(c5.iloc[-6])) / float(c5.iloc[-6]) * 100 if len(c5) >= 6 else 0.0
     live_ok = price >= e5 * 0.998 and above_vwap and (last_green or mom > 0.05) and r5 < 78
+    # AUDIT ONLY: decompose the exact live gate without changing its logic.
+    live_gate_reasons: list[str] = []
+    if price < e5 * 0.998:
+        live_gate_reasons.append("below_ema20_gate")
+    if not above_vwap:
+        live_gate_reasons.append("below_vwap_gate")
+    if (not last_green) and mom <= 0.05:
+        live_gate_reasons.append("last_candle_not_green")
+        live_gate_reasons.append("momentum<=0.05")
+    if r5 >= 78:
+        live_gate_reasons.append("rsi5>=78")
 
     h4_state, h4_points = _m15_confirmation(h4, price)
     news_state, news_title, news_source = _classify_news(symbol)
@@ -3251,7 +3268,9 @@ def analyze_daily(
             if market:
                 add("صلاحية السوق/الإعداد غير متحققة", v("setup_market_permission", v("market_ok", False)))
             if state:
-                add("حالة الإطار معاكسة", str(v("m15_state", v("h4_state", "محايد"))) == "معاكس")
+                # add() records a blocker when its second argument is False.
+                # Therefore the argument must represent the GOOD state here.
+                add("حالة الإطار معاكسة", str(v("m15_state", v("h4_state", "محايد"))) != "معاكس")
             if no_failed:
                 add("يوجد failed/rejection", not v("failed", False))
             if mom_min is not None:
@@ -4043,6 +4062,22 @@ def analyze_daily(
                 symbol,
                 _detail,
             )
+        # Persist only diagnostic blocker counts for this symbol; this does not
+        # participate in the trading decision.
+        from collections import Counter as _Counter
+        _blocker_counts = _Counter()
+        for _et in ENTRY_TYPES:
+            try:
+                _blocker_counts.update(_competition_fail_reasons(_et))
+            except Exception as exc:
+                log.debug("DAILY non-critical deep fallback exception: %s", exc)
+        with _DAILY_NO_SIGNAL_LOCK:
+            _DAILY_NO_SIGNAL_AUDIT[str(symbol)] = dict(_blocker_counts)
+        log.info(
+            "DAILY NO_SIGNAL | %s | reason=no_strategy_match | top_blockers=%s",
+            symbol,
+            ";".join(f"{r}={c}" for r, c in _blocker_counts.most_common(6)) or "unavailable",
+        )
         # Preserve the original trading behavior exactly.
         return None
 
@@ -4797,6 +4832,7 @@ def analyze_daily(
         warnings=warnings[:4],
         quality_ok=quality_ok,
         live_ok=live_ok,
+        live_gate_reasons=live_gate_reasons,
         volume_ratio=round(vol_ratio, 2),
         factor_keys=factors,
         sma20=round(e20, 4),
@@ -5148,8 +5184,9 @@ def scan_daily(
             log.warning("DAILY STAGE 2 EXCEPTION | %s | %s", sym, str(exc))
             return None
     with ThreadPoolExecutor(max_workers=workers) as pool:
-        futures=[pool.submit(one,x) for x in finalists]
+        futures={pool.submit(one,x): x[2] for x in finalists}
         for fut in as_completed(futures):
+            _stage2_symbol = str(futures.get(fut, ""))
             try:
                 sig=fut.result()
             except Exception as exc:
@@ -5161,6 +5198,15 @@ def scan_daily(
             if not sig:
                 stage2_rejects["no_signal"] += 1
                 _stage2_reason("no_signal", "analyze_daily_returned_none")
+                with _DAILY_NO_SIGNAL_LOCK:
+                    _ns_blockers = dict(_DAILY_NO_SIGNAL_AUDIT.pop(_stage2_symbol, {}) or {})
+                for _reason, _count in _ns_blockers.items():
+                    _stage2_reason("no_signal", _reason, diagnostic=True)
+                log.info(
+                    "DAILY NO_SIGNAL AUDIT | %s | blockers=%s",
+                    _stage2_symbol,
+                    ";".join(f"{r}={c}" for r, c in sorted(_ns_blockers.items(), key=lambda kv: (-kv[1], kv[0]))[:8]) or "unavailable",
+                )
                 continue
             stage2_scores.append((str(getattr(sig, "symbol", "?")), float(getattr(sig, "score", 0) or 0)))
             _strategy_audit_from_signal(sig)
@@ -5172,16 +5218,9 @@ def scan_daily(
                 continue
             if not sig.live_ok:
                 stage2_rejects["live_ok"] += 1
-                live_reasons = []
-                if float(getattr(sig, "price", 0) or 0) < float(getattr(sig, "sma20", 0) or 0) * 0.998:
-                    live_reasons.append("below_ema20")
-                if not bool(getattr(sig, "vwap_note", "").startswith("فوق")):
-                    live_reasons.append("below_vwap")
-                if not bool(getattr(sig, "above_open", False)) and float(getattr(sig, "change_pct", 0) or 0) <= 0.05:
-                    live_reasons.append("weak_daily_candle")
-                if float(getattr(sig, "score", 0) or 0) >= 0 and not (getattr(sig, "live_ok", False)):
-                    live_reasons.append("live_gate_failed")
-                for rr in (live_reasons or ["live_gate_failed"]):
+                # Exact sub-conditions are calculated beside the live gate itself.
+                live_reasons = list(getattr(sig, "live_gate_reasons", []) or [])
+                for rr in (live_reasons or ["live_ok_unexplained"]):
                     _stage2_reason("live_ok", rr)
                 continue
             if not sig.quality_ok:
@@ -5243,12 +5282,14 @@ def scan_daily(
             if not execution.get("ok"):
                 stage2_rejects["final_execution"] += 1
                 _stage2_reason("final_execution", "execution_ok_false")
+                _exec_reason = str(execution.get("reason", "unspecified") or "unspecified")
+                _stage2_reason("final_execution", f"reason:{_exec_reason}")
                 if execution.get("quote_source") == "none":
                     _stage2_reason("final_execution", "quote_source_none")
                 if float(execution.get("quote_age_min", 999) or 999) > QUOTE_MAX_AGE_MIN:
-                    _stage2_reason("final_execution", "quote_stale")
+                    _stage2_reason("final_execution", f"quote_age>{QUOTE_MAX_AGE_MIN}m")
                 if float(execution.get("spread_pct", 999) or 999) > MAX_SPREAD_PCT:
-                    _stage2_reason("final_execution", "spread_high")
+                    _stage2_reason("final_execution", f"spread>{MAX_SPREAD_PCT:.2f}%")
                 _stage2_reason("final_execution", str(execution.get("reason", "unspecified")), diagnostic=True)
                 log.info(
                     "DAILY FINAL EXECUTION REJECT | %s | source=%s age=%.2fm spread=%.3f%%",

@@ -30,7 +30,7 @@ from stocks import MAX_AUTO_PRICE
 log = logging.getLogger(__name__)
 
 # Deployment marker: proves which analyzer_intraday build Render actually loaded.
-INTRADAY_ANALYZER_VERSION = "20260921-210000-FINAL-AUDIT-VWAP-EARLYFIX5-CUMULATIVE"
+INTRADAY_ANALYZER_VERSION = "20260921-210000-FINAL-AUDIT-VWAP-EARLYFIX6-CUMULATIVE"
 log.info("INTRADAY ANALYZER VERSION | %s", INTRADAY_ANALYZER_VERSION)
 
 SKIP_OPEN_MIN = 20
@@ -69,6 +69,10 @@ LEARNING_ALERT_FILE = Path("/var/data/intraday_learning_alert.json")
 # Diagnostic-only cumulative audit. Never participates in trading decisions.
 INTRADAY_AUDIT_FILE = Path("/var/data/intraday_audit_counters.json")
 _AUDIT_LOCK = Lock()
+# Runtime-only bridge: analyze_intraday() records exact zero-match blockers so
+# scan_intraday() can persist them in the cumulative audit. Diagnostic only.
+_INTRADAY_NO_SIGNAL_AUDIT: dict[str, dict[str, int]] = {}
+_INTRADAY_NO_SIGNAL_LOCK = Lock()
 
 def _new_intraday_audit() -> dict:
     return {"schema_version": 1, "updated_at": None, "scans": 0,
@@ -263,6 +267,8 @@ class IntradaySignal:
     structure_zone: str = "محايدة"
     quality_ok: bool = True
     live_ok: bool = True
+    # Diagnostic-only: exact failed sub-conditions of the live gate.
+    live_gate_reasons: list[str] | None = None
     volume_ratio: float = 1.0
     regime: str = "neutral"
     factor_keys: list | None = None
@@ -2539,6 +2545,17 @@ def analyze_intraday(
     last_green = float(today_5["Close"].iloc[closed_idx]) >= float(today_5["Open"].iloc[closed_idx])
     mom = (price - float(c5.iloc[-6])) / float(c5.iloc[-6]) * 100 if len(c5) >= 6 else 0.0
     live_ok = price >= e5 * 0.998 and above_vwap and (last_green or mom > 0.05) and r5 < 78
+    # AUDIT ONLY: decompose the exact live gate without changing its logic.
+    live_gate_reasons: list[str] = []
+    if price < e5 * 0.998:
+        live_gate_reasons.append("below_ema20_gate")
+    if not above_vwap:
+        live_gate_reasons.append("below_vwap_gate")
+    if (not last_green) and mom <= 0.05:
+        live_gate_reasons.append("last_candle_not_green")
+        live_gate_reasons.append("momentum<=0.05")
+    if r5 >= 78:
+        live_gate_reasons.append("rsi5>=78")
 
     m15_state, m15_points = _m15_confirmation(m15, price)
     news_state, news_title, news_source = _classify_news(symbol)
@@ -3856,6 +3873,8 @@ def analyze_intraday(
             symbol,
             _top_blockers,
         )
+        with _INTRADAY_NO_SIGNAL_LOCK:
+            _INTRADAY_NO_SIGNAL_AUDIT[str(symbol)] = dict(_blocker_counts)
         # Preserve the original trading behavior exactly.
         return None
 
@@ -4558,6 +4577,7 @@ def analyze_intraday(
         warnings=warnings[:4],
         quality_ok=quality_ok,
         live_ok=live_ok,
+        live_gate_reasons=live_gate_reasons,
         volume_ratio=round(vol_session_ratio, 2),
         factor_keys=factors,
         sma20=round(e20, 4),
@@ -5024,12 +5044,21 @@ def scan_intraday(
             return None
 
     with ThreadPoolExecutor(max_workers=workers) as pool:
-        futures = [pool.submit(_one_stage2, item) for item in finalists]
+        futures = {pool.submit(_one_stage2, item): str(item[2]) for item in finalists}
         for fut in as_completed(futures):
+            _stage2_symbol = futures.get(fut, "")
             sig = fut.result()
             if not sig:
                 rejection_counts["no_signal"] += 1
                 _record_stage2_gate("no_signal", ["analyze_intraday_return_none"])
+                with _INTRADAY_NO_SIGNAL_LOCK:
+                    _ns_blockers = dict(_INTRADAY_NO_SIGNAL_AUDIT.pop(_stage2_symbol, {}) or {})
+                _record_stage2_diag("no_signal", [f"{r}={c}" for r, c in _ns_blockers.items()])
+                log.info(
+                    "INTRADAY NO_SIGNAL AUDIT | %s | blockers=%s",
+                    _stage2_symbol,
+                    ";".join(f"{r}={c}" for r, c in sorted(_ns_blockers.items(), key=lambda kv: (-kv[1], kv[0]))[:8]) or "unavailable",
+                )
                 continue
             # تشخيص أول سبب فعلي للرفض، مع الاحتفاظ بأسباب الإشارة كلها داخل
             # diagnostic_reasons حتى نعرف هل المشكلة درجة أم جودة أم سوق...
@@ -5045,10 +5074,12 @@ def scan_intraday(
                 continue
             if not sig.live_ok:
                 rejection_counts["live_ok"] += 1
-                _record_stage2_gate("live_ok", reasons or ["live_ok=False"])
+                live_reasons = list(getattr(sig, "live_gate_reasons", []) or [])
+                # Gate-specific cumulative audit: only exact failed live sub-conditions.
+                _record_stage2_gate("live_ok", live_reasons or ["live_ok_unexplained"])
                 _record_stage2_diag("live_ok", reasons)
                 rejection_samples.append(
-                    f"{sig.symbol}: live_ok=False reasons={reasons} | {_intraday_diagnostic_metrics(sig, min_score)}"
+                    f"{sig.symbol}: live_ok=False live_gate_reasons={live_reasons or ['live_ok_unexplained']} all_diagnostics={reasons} | {_intraday_diagnostic_metrics(sig, min_score)}"
                 )
                 continue
             if not sig.quality_ok:
@@ -5111,7 +5142,15 @@ def scan_intraday(
             execution = _final_execution_snapshot(sig.symbol, sig.price)
             if not execution.get("ok"):
                 rejection_counts["final_execution"] += 1
-                _record_stage2_gate("final_execution", ["final_execution_failed"])
+                _exec_reason = str(execution.get("reason", "unspecified") or "unspecified")
+                _exec_reasons = [f"reason:{_exec_reason}"]
+                if execution.get("quote_source") == "none":
+                    _exec_reasons.append("quote_source_none")
+                if float(execution.get("quote_age_min", 999) or 999) > QUOTE_MAX_AGE_MIN:
+                    _exec_reasons.append(f"quote_age>{QUOTE_MAX_AGE_MIN}m")
+                if float(execution.get("spread_pct", 999) or 999) > MAX_SPREAD_PCT:
+                    _exec_reasons.append(f"spread>{MAX_SPREAD_PCT:.2f}%")
+                _record_stage2_gate("final_execution", _exec_reasons)
                 _record_stage2_diag("final_execution", reasons)
                 rejection_samples.append(
                     f"{sig.symbol}: final_execution_failed "
