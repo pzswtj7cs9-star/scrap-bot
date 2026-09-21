@@ -29,7 +29,7 @@ from stocks import MAX_AUTO_PRICE
 log = logging.getLogger(__name__)
 
 # Deployment marker: proves which analyzer_intraday build Render actually loaded.
-INTRADAY_ANALYZER_VERSION = "20260921-170000-FINAL-AUDIT-VWAP-EARLYFIX"
+INTRADAY_ANALYZER_VERSION = "20260921-172500-FINAL-AUDIT-VWAP-EARLYFIX2"
 log.info("INTRADAY ANALYZER VERSION | %s", INTRADAY_ANALYZER_VERSION)
 
 SKIP_OPEN_MIN = 20
@@ -3333,7 +3333,13 @@ def analyze_intraday(
             components = {"failed_reclaim": failed, "orb_quality": orbq, "reclaim": reclaim, "momentum": clip((mom-0.05)/0.25*100), "volume": clip((vr-0.9)/0.7*100)}
         elif name == "استمرار ABC":
             components = {"a": a, "b": b, "c_break": cb, "momentum": clip((mom-0.05)/0.25*100), "volume": clip((vr-0.9)/0.7*100)}
-        else:
+        elif name == "استمرار/استعادة الفجوة":
+            components = {"gap_quality": gap, "gap_hold": hold, "gap_trigger": trigger, "volume": clip((vr-0.9)/0.7*100), "candle": 100 if green else 0}
+        elif name == "استعادة بعد فشل كسر دعم":
+            components = {"support_quality": touches, "breakdown_quality": breakdown, "breakdown_reclaim": reclaim, "volume": clip((vr-0.9)/0.7*100), "candle": 100 if green else 0}
+        elif name == "ارتداد بعد تفوق نسبي":
+            components = {"rs_strength": rsq, "rs_pullback": pb, "rs_higher_low": hl, "rs_trigger": trig, "volume": clip((vr-0.9)/0.7*100), "candle": 100 if green else 0}
+        else:  # دخول مبكر
             components = {"early_range": early_range, "near_resistance": near, "holding": holding, "momentum": clip((mom-0.05)/0.25*100), "candle": 100 if green else 0}
 
         # Core score uses only structural components. Generic confirmations such as
