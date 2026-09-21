@@ -20,6 +20,7 @@ import os
 import time as time_module
 import urllib.parse
 import urllib.request
+from threading import Lock
 
 import numpy as np
 import pandas as pd
@@ -29,9 +30,100 @@ from stocks import MAX_AUTO_PRICE
 
 log = logging.getLogger("halal-bot.daily")
 
+DAILY_ANALYZER_VERSION = "20260921-214500-FINAL-AUDIT-CUMULATIVE"
+log.info("DAILY ANALYZER VERSION | %s", DAILY_ANALYZER_VERSION)
+
 SKIP_OPEN_MIN = 0
 SKIP_CLOSE_MIN = 0
 DAILY_MIN_SCORE = 82
+
+DAILY_AUDIT_FILE = Path("/var/data/daily_audit_counters.json")
+_DAILY_AUDIT_LOCK = Lock()
+
+def _new_daily_audit() -> dict:
+    return {
+        "schema_version": 1,
+        "updated_at": None,
+        "scans": 0,
+        "stage1": {"passed": 0, "rejected": 0, "reasons": {}},
+        "stage2": {
+            "deep_candidates": 0, "qualified": 0,
+            "gates": {},
+            "reason_counts_by_gate": {},
+            "diagnostic_reason_counts_by_gate": {},
+        },
+        "strategy": {"matched": {}, "failed": {}, "blockers": {}},
+    }
+
+def _load_daily_audit() -> dict:
+    base = _new_daily_audit()
+    try:
+        if not DAILY_AUDIT_FILE.exists():
+            return base
+        raw = json.loads(DAILY_AUDIT_FILE.read_text(encoding="utf-8"))
+        if not isinstance(raw, dict):
+            return base
+        for key, value in raw.items():
+            if key in base and isinstance(base[key], dict) and isinstance(value, dict):
+                base[key].update(value)
+            else:
+                base[key] = value
+        return base
+    except Exception as exc:
+        log.warning("DAILY AUDIT LOAD FAILED | %s", str(exc))
+        return base
+
+def _save_daily_audit(data: dict) -> None:
+    try:
+        DAILY_AUDIT_FILE.parent.mkdir(parents=True, exist_ok=True)
+        tmp = DAILY_AUDIT_FILE.with_suffix(".tmp")
+        tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+        tmp.replace(DAILY_AUDIT_FILE)
+    except Exception as exc:
+        log.warning("DAILY AUDIT SAVE FAILED | %s", str(exc))
+
+def _daily_bump(counter: dict[str, int], reason: str, amount: int = 1) -> None:
+    key = str(reason or "unknown")
+    counter[key] = int(counter.get(key, 0) or 0) + int(amount or 0)
+
+def _commit_daily_audit(*, stage1_counts=None, stage1_passed=0, stage1_rejected=0,
+                        stage2_deep=0, stage2_qualified=0, stage2_gate_counts=None,
+                        stage2_gate_reasons=None, stage2_gate_diag=None,
+                        strategy_matched=None, strategy_failed=None, strategy_blockers=None) -> dict:
+    with _DAILY_AUDIT_LOCK:
+        data = _load_daily_audit()
+        data["scans"] = int(data.get("scans", 0) or 0) + 1
+        data["updated_at"] = datetime.now(timezone.utc).isoformat()
+        st1 = data.setdefault("stage1", {"passed": 0, "rejected": 0, "reasons": {}})
+        st1["passed"] = int(st1.get("passed", 0) or 0) + int(stage1_passed or 0)
+        st1["rejected"] = int(st1.get("rejected", 0) or 0) + int(stage1_rejected or 0)
+        for reason, count in (stage1_counts or {}).items():
+            _daily_bump(st1.setdefault("reasons", {}), reason, count)
+        st2 = data.setdefault("stage2", {})
+        st2["deep_candidates"] = int(st2.get("deep_candidates", 0) or 0) + int(stage2_deep or 0)
+        st2["qualified"] = int(st2.get("qualified", 0) or 0) + int(stage2_qualified or 0)
+        for gate, count in (stage2_gate_counts or {}).items():
+            _daily_bump(st2.setdefault("gates", {}), gate, count)
+        for gate, reasons in (stage2_gate_reasons or {}).items():
+            dst = st2.setdefault("reason_counts_by_gate", {}).setdefault(gate, {})
+            for reason, count in reasons.items():
+                _daily_bump(dst, reason, count)
+        for gate, reasons in (stage2_gate_diag or {}).items():
+            dst = st2.setdefault("diagnostic_reason_counts_by_gate", {}).setdefault(gate, {})
+            for reason, count in reasons.items():
+                _daily_bump(dst, reason, count)
+        strat = data.setdefault("strategy", {})
+        for key, count in (strategy_matched or {}).items():
+            _daily_bump(strat.setdefault("matched", {}), key, count)
+        for key, count in (strategy_failed or {}).items():
+            _daily_bump(strat.setdefault("failed", {}), key, count)
+        for strategy, reasons in (strategy_blockers or {}).items():
+            dst = strat.setdefault("blockers", {}).setdefault(strategy, {})
+            for reason, count in reasons.items():
+                _daily_bump(dst, reason, count)
+        _save_daily_audit(data)
+        return data
+
 
 # Central execution / market-regime configuration. Keep global safety thresholds
 # here so changing one policy value cannot leave a stale duplicate elsewhere.
@@ -67,7 +159,6 @@ LEARNING_ALERT_FILE = Path("/var/data/daily_v2_learning_alert.json")
 # and the canonical strategy list so it cannot drift if the strategy count changes.
 PREFILTER_MAX_CANDIDATES = 50
 PREFILTER_STRATEGY_TOP_K = 4
-DAILY_ANALYZER_VERSION = "20260921-145021-FINAL-AUDIT-VWAP"
 ENTRY_TYPES = (
     "اختراق مؤكد", "إعادة اختبار", "دخول مبكر", "ارتداد VWAP", "ارتداد EMA20",
     "سحب سيولة", "اختراق نطاق الافتتاح", "استمرار الزخم", "ضغط ثم انفجار",
@@ -2670,24 +2761,19 @@ def analyze_daily(
 
     retest = prior_break and near_level and closed_close >= level_high * 0.997
 
-    # 1) VWAP Bounce/Reclaim: رجوع فعلي إلى VWAP ثم استعادة المستوى.
-    # لا يتغير باقي منطق الاستراتيجية؛ اللمس أصبح تفاعلًا فعليًا مع نطاق VWAP.
+    # 1) VWAP Bounce/Reclaim: رجوع منظم إلى VWAP ثم استعادة المستوى.
     recent4 = today_d.iloc[max(0, closed_idx - 4):closed_idx]
     vwap_touch = False
     try:
-        rh = recent4["High"].astype(float)
-        rl = recent4["Low"].astype(float)
-        vwap_touch = bool(((rl <= vwap_last * 1.006) & (rh >= vwap_last * 0.994)).any())
+        vwap_touch = bool((recent4["Low"].astype(float) <= vwap_last * 1.006).any())
     except Exception:
         vwap_touch = False
     vwap_bounce = bool(vwap_touch and closed_close >= vwap_last_closed * 1.001)
 
-    # 2) EMA20 Pullback: ترند صاعد + تصحيح فعلي إلى EMA20 + استعادة.
+    # 2) EMA20 Pullback: ترند صاعد + تصحيح صحي إلى EMA20 + استعادة.
     ema_touch = False
     try:
-        rh = recent4["High"].astype(float)
-        rl = recent4["Low"].astype(float)
-        ema_touch = bool(((rl <= e5 * 1.006) & (rh >= e5 * 0.994)).any())
+        ema_touch = bool((recent4["Low"].astype(float) <= e5 * 1.006).any())
     except Exception:
         ema_touch = False
     ema_pullback = bool(ema_touch and closed_close >= e5_closed * 1.001)
@@ -3055,9 +3141,6 @@ def analyze_daily(
     # Early Entry is itself a structural setup, not a score fallback:
     # pre-breakout compression/holding under a meaningful resistance, with
     # improving price action and no already-confirmed strategy trigger.
-    early_range = 3.0
-    early_near_resistance = False
-    early_holding = False
     early = False
     try:
         recent3 = today_d.iloc[:closed_idx + 1].tail(3)
@@ -3960,23 +4043,6 @@ def analyze_daily(
                 symbol,
                 _detail,
             )
-        # DIAGNOSTIC ONLY: summarize the most frequent blockers across all canonical strategies.
-        # This does not change the no-match decision.
-        from collections import Counter as _Counter
-        _blocker_counts = _Counter()
-        for _et in ENTRY_TYPES:
-            try:
-                _blocker_counts.update(_competition_fail_reasons(_et))
-            except Exception as exc:
-                log.debug("DAILY non-critical deep fallback exception: %s", exc)
-        _top_blockers = ";".join(
-            f"{_reason}={_count}" for _reason, _count in _blocker_counts.most_common(6)
-        ) or "unavailable"
-        log.info(
-            "DAILY NO_SIGNAL | %s | reason=no_strategy_match | top_blockers=%s",
-            symbol,
-            _top_blockers,
-        )
         # Preserve the original trading behavior exactly.
         return None
 
@@ -4853,16 +4919,26 @@ def _daily_strategy_route_scores(*, price: float, trend: bool, above_vwap: bool,
     return {k:round(float(v),2) for k,v in scores.items()}
 
 
-def _prefilter_daily(symbol: str) -> tuple[float, dict[str, float], pd.DataFrame, pd.DataFrame] | None:
+def _prefilter_daily(symbol: str, audit_counts: dict[str, int] | None = None, audit_lock: Lock | None = None) -> tuple[float, dict[str, float], pd.DataFrame, pd.DataFrame] | None:
     """Stage 1: weekly + daily routing for the full universe."""
+    def _audit_stage1(reason: str) -> None:
+        if audit_counts is None:
+            return
+        if audit_lock is not None:
+            with audit_lock:
+                _daily_bump(audit_counts, reason)
+        else:
+            _daily_bump(audit_counts, reason)
     try:
         from market_data import fetch_intraday, intraday_data_fresh
         weekly = fetch_intraday(symbol, interval="1wk", period="5y")
         daily = fetch_intraday(symbol, interval="1d", period="2y")
         if weekly is None or daily is None or len(weekly) < 60 or len(daily) < 80:
+            _audit_stage1("data_missing_or_short")
             return None
         price = float(daily["Close"].iloc[-1])
         if price <= 0 or price > float(MAX_AUTO_PRICE):
+            _audit_stage1("invalid_price")
             return None
         wc = weekly["Close"].astype(float)
         dc = daily["Close"].astype(float)
@@ -4884,21 +4960,34 @@ def _prefilter_daily(symbol: str) -> tuple[float, dict[str, float], pd.DataFrame
         route += 1.0 if we20 > we50 else 0.0
         route -= 1.0 if wrsi >= 80 else 0.0
         if vol_ratio < 0.55:
+            _audit_stage1("low_volume_ratio<0.55x")
             return None
         routes=_daily_strategy_route_scores(price=price, trend=trend, above_vwap=above_vwap, above_open=above_open, vol_ratio=vol_ratio, mom=mom, wrsi=wrsi, we20=we20, we50=we50, daily=daily, weekly=weekly)
         return route, routes, weekly, daily
-    except Exception:
+    except Exception as exc:
+        _audit_stage1("exception")
+        log.info("DAILY STAGE 1 REJECT | %s | exception=%s", symbol, str(exc))
         return None
 
 
 
-def _prefilter_daily_from_frames(symbol: str, weekly: pd.DataFrame, daily: pd.DataFrame) -> tuple[float, dict[str, float], pd.DataFrame, pd.DataFrame] | None:
+def _prefilter_daily_from_frames(symbol: str, weekly: pd.DataFrame, daily: pd.DataFrame, audit_counts: dict[str, int] | None = None, audit_lock: Lock | None = None) -> tuple[float, dict[str, float], pd.DataFrame, pd.DataFrame] | None:
+    def _audit_stage1(reason: str) -> None:
+        if audit_counts is None:
+            return
+        if audit_lock is not None:
+            with audit_lock:
+                _daily_bump(audit_counts, reason)
+        else:
+            _daily_bump(audit_counts, reason)
     try:
         from market_data import fetch_intraday
         if weekly is None or daily is None or len(weekly) < 60 or len(daily) < 80:
+            _audit_stage1("data_missing_or_short")
             return None
         price = float(daily["Close"].iloc[-1])
         if price <= 0 or price > float(MAX_AUTO_PRICE):
+            _audit_stage1("invalid_price")
             return None
         wc = weekly["Close"].astype(float); dc = daily["Close"].astype(float)
         we20 = float(_ema(wc,20).iloc[-1]); we50 = float(_ema(wc,50).iloc[-1])
@@ -4913,10 +5002,13 @@ def _prefilter_daily_from_frames(symbol: str, weekly: pd.DataFrame, daily: pd.Da
         route += min(2.5,max(0.0,mom)) + min(2.0,max(0.0,vol_ratio-0.75)*2.0) + (1.0 if we20 > we50 else 0.0)
         route -= 1.0 if wrsi >= 80 else 0.0
         if vol_ratio < 0.55:
+            _audit_stage1("low_volume_ratio<0.55x")
             return None
         routes=_daily_strategy_route_scores(price=price, trend=trend, above_vwap=above_vwap, above_open=above_open, vol_ratio=vol_ratio, mom=mom, wrsi=wrsi, we20=we20, we50=we50, daily=daily, weekly=weekly)
         return route, routes, weekly, daily
-    except Exception:
+    except Exception as exc:
+        _audit_stage1("exception")
+        log.info("DAILY STAGE 1 REJECT | %s | exception=%s", symbol, str(exc))
         return None
 
 def scan_daily(
@@ -4947,6 +5039,10 @@ def scan_daily(
 
     workers = min(8, max(2, len(symbols)))
     stage1=[]
+    stage1_audit_counts: dict[str, int] = {}
+    stage1_audit_passed = 0
+    stage1_audit_rejected = 0
+    stage1_audit_lock = Lock()
     log.info("DAILY V2 SCAN: %d symbols loaded", len(symbols))
     try:
         from market_data import fetch_alpaca_bars_multi, alpaca_configured
@@ -4960,14 +5056,14 @@ def scan_daily(
                 weekly = weekly_map.get(sym.upper()); daily = daily_map.get(sym.upper())
                 if weekly is None or daily is None or len(weekly) < 60 or len(daily) < 80:
                     return None
-                return _prefilter_daily_from_frames(sym, weekly, daily)
+                return _prefilter_daily_from_frames(sym, weekly, daily, stage1_audit_counts, stage1_audit_lock)
             for sym in symbols:
                 item = _route_from_frames(sym)
                 if item is None:
                     # Partial-batch hardening: a missing symbol must get its own
                     # normal fetch path instead of being silently discarded.
                     try:
-                        item = _prefilter_daily(sym)
+                        item = _prefilter_daily(sym, stage1_audit_counts, stage1_audit_lock)
                         if item:
                             log.info("DAILY INDIVIDUAL FALLBACK | %s | recovered after batch miss", sym)
                     except Exception as exc:
@@ -4975,12 +5071,15 @@ def scan_daily(
                         item = None
                 if item:
                     route, routes, weekly, daily = item; stage1.append((route, routes, sym, weekly, daily))
+                    with stage1_audit_lock: stage1_audit_passed += 1
+                else:
+                    with stage1_audit_lock: stage1_audit_rejected += 1
         else:
             raise RuntimeError("Alpaca not configured")
     except Exception as exc:
         log.warning("Daily batch scan unavailable; using per-symbol fallback: %s", exc)
         with ThreadPoolExecutor(max_workers=workers) as pool:
-            futures={pool.submit(_prefilter_daily,sym):sym for sym in symbols}
+            futures={pool.submit(_prefilter_daily,sym,stage1_audit_counts,stage1_audit_lock):sym for sym in symbols}
             for fut in as_completed(futures):
                 sym=futures[fut]
                 try: item=fut.result()
@@ -4989,8 +5088,11 @@ def scan_daily(
                     item=None
                 if item:
                     route,routes,weekly,daily=item; stage1.append((route,routes,sym,weekly,daily))
+                    with stage1_audit_lock: stage1_audit_passed += 1
+                else:
+                    with stage1_audit_lock: stage1_audit_rejected += 1
     stage1.sort(key=lambda x:(x[0], max(x[1].values()) if x[1] else 0.0), reverse=True)
-    log.info("STAGE 1 DAILY: %d/%d passed", len(stage1), len(symbols))
+    log.info("STAGE 1 DAILY: %d/%d passed | rejected=%d | audit_reasons=%s", len(stage1), len(symbols), len(symbols)-len(stage1), stage1_audit_counts)
     base_n=max(PREFILTER_MAX_CANDIDATES, limit*5)
     selected={item[2]:item for item in stage1[:base_n]}
     for et in ENTRY_TYPES:
@@ -5021,6 +5123,23 @@ def scan_daily(
         "stale_or_no_quote": 0,
         "final_execution": 0,
     }
+    stage2_gate_reasons: dict[str, dict[str, int]] = {}
+    stage2_gate_diag: dict[str, dict[str, int]] = {}
+    strategy_matched: dict[str, int] = {}
+    strategy_failed: dict[str, int] = {}
+    strategy_blockers: dict[str, dict[str, int]] = {}
+    def _stage2_reason(gate: str, reason: str, diagnostic: bool = False) -> None:
+        target = stage2_gate_diag if diagnostic else stage2_gate_reasons
+        _daily_bump(target.setdefault(gate, {}), reason)
+    def _strategy_audit_from_signal(sig) -> None:
+        matched = set(getattr(sig, "matched_entry_types", []) or [])
+        scores_map = dict(getattr(sig, "strategy_scores", {}) or {})
+        for _et in ENTRY_TYPES:
+            if _et in matched:
+                _daily_bump(strategy_matched, _et)
+            else:
+                _daily_bump(strategy_failed, _et)
+                _daily_bump(strategy_blockers.setdefault(_et, {}), "not_matched")
     def one(item):
         _,_,sym,weekly,daily=item
         try:
@@ -5035,17 +5154,35 @@ def scan_daily(
                 sig=fut.result()
             except Exception as exc:
                 stage2_rejects["exception"] += 1
+                _stage2_reason("exception", "future_exception")
+                _stage2_reason("exception", str(exc)[:120], diagnostic=True)
                 log.warning("DAILY STAGE 2 FUTURE EXCEPTION | %s", str(exc))
                 continue
             if not sig:
                 stage2_rejects["no_signal"] += 1
+                _stage2_reason("no_signal", "analyze_daily_returned_none")
                 continue
             stage2_scores.append((str(getattr(sig, "symbol", "?")), float(getattr(sig, "score", 0) or 0)))
-            if float(getattr(sig, "raw_score", sig.score)) < min_score:
+            _strategy_audit_from_signal(sig)
+            raw_score = float(getattr(sig, "raw_score", sig.score) or 0.0)
+            if raw_score < min_score:
                 stage2_rejects["score"] += 1
+                _stage2_reason("score", "raw_score_below_min")
+                _stage2_reason("score", f"raw_score<{min_score}", diagnostic=True)
                 continue
             if not sig.live_ok:
                 stage2_rejects["live_ok"] += 1
+                live_reasons = []
+                if float(getattr(sig, "price", 0) or 0) < float(getattr(sig, "sma20", 0) or 0) * 0.998:
+                    live_reasons.append("below_ema20")
+                if not bool(getattr(sig, "vwap_note", "").startswith("فوق")):
+                    live_reasons.append("below_vwap")
+                if not bool(getattr(sig, "above_open", False)) and float(getattr(sig, "change_pct", 0) or 0) <= 0.05:
+                    live_reasons.append("weak_daily_candle")
+                if float(getattr(sig, "score", 0) or 0) >= 0 and not (getattr(sig, "live_ok", False)):
+                    live_reasons.append("live_gate_failed")
+                for rr in (live_reasons or ["live_gate_failed"]):
+                    _stage2_reason("live_ok", rr)
                 continue
             if not sig.quality_ok:
                 stage2_rejects["quality"] += 1
@@ -5060,9 +5197,14 @@ def scan_daily(
                     getattr(sig, "market_state", "?"),
                     float(getattr(sig, "reward_r", 0) or 0),
                 )
+                for rr in (qreasons or ["quality_unexplained"]):
+                    _stage2_reason("quality", rr)
+                if not qreasons:
+                    _stage2_reason("quality", "quality=False_unexplained", diagnostic=True)
                 continue
             if sig.news_state == "negative":
                 stage2_rejects["negative_news"] += 1
+                _stage2_reason("negative_news", "negative_news")
                 continue
             # Validate current bid/ask only for the Stage-2 finalists.
             # This keeps the full-universe scan fast while preventing Daily V2
@@ -5074,6 +5216,9 @@ def scan_daily(
                 sig.liquidity_ok = bool(liq.get("ok", False))
                 if not sig.liquidity_ok:
                     stage2_rejects["liquidity"] += 1
+                    _stage2_reason("liquidity", "liquidity_ok_false")
+                    _stage2_reason("liquidity", f"spread={sig.spread_pct:.3f}%", diagnostic=True)
+                    _stage2_reason("liquidity", f"slippage={sig.expected_slippage_pct:.3f}%", diagnostic=True)
                     continue
                 if sig.spread_pct > MAX_SPREAD_PCT:
                     log.warning(
@@ -5082,9 +5227,13 @@ def scan_daily(
                     )
                 if liq.get("quote_source") == "none" or float(liq.get("quote_age_min", 999) or 999) > QUOTE_MAX_AGE_MIN:
                     stage2_rejects["stale_or_no_quote"] += 1
+                    _stage2_reason("stale_or_no_quote", "quote_source_none" if liq.get("quote_source") == "none" else "quote_stale")
+                    _stage2_reason("stale_or_no_quote", f"age>{QUOTE_MAX_AGE_MIN}m", diagnostic=True)
                     continue
             except Exception as exc:
                 stage2_rejects["liquidity"] += 1
+                _stage2_reason("liquidity", "liquidity_exception")
+                _stage2_reason("liquidity", str(exc)[:120], diagnostic=True)
                 log.warning("DAILY LIQUIDITY CHECK FAILED | %s | %s", sig.symbol, str(exc))
                 continue
 
@@ -5093,6 +5242,14 @@ def scan_daily(
             execution = _final_execution_snapshot(sig.symbol, sig.price)
             if not execution.get("ok"):
                 stage2_rejects["final_execution"] += 1
+                _stage2_reason("final_execution", "execution_ok_false")
+                if execution.get("quote_source") == "none":
+                    _stage2_reason("final_execution", "quote_source_none")
+                if float(execution.get("quote_age_min", 999) or 999) > QUOTE_MAX_AGE_MIN:
+                    _stage2_reason("final_execution", "quote_stale")
+                if float(execution.get("spread_pct", 999) or 999) > MAX_SPREAD_PCT:
+                    _stage2_reason("final_execution", "spread_high")
+                _stage2_reason("final_execution", str(execution.get("reason", "unspecified")), diagnostic=True)
                 log.info(
                     "DAILY FINAL EXECUTION REJECT | %s | source=%s age=%.2fm spread=%.3f%%",
                     sig.symbol, execution.get("quote_source"),
@@ -5102,6 +5259,25 @@ def scan_daily(
                 continue
             sig.alert_entry_price = float(execution["entry_price"])
             results.append(sig)
+
+    stage1_passed = int(stage1_audit_passed)
+    stage1_rejected = int(stage1_audit_rejected)
+    cumulative_audit = _commit_daily_audit(
+        stage1_counts=stage1_audit_counts,
+        stage1_passed=stage1_passed,
+        stage1_rejected=stage1_rejected,
+        stage2_deep=len(finalists),
+        stage2_qualified=len(results),
+        stage2_gate_counts=stage2_rejects,
+        stage2_gate_reasons=stage2_gate_reasons,
+        stage2_gate_diag=stage2_gate_diag,
+        strategy_matched=strategy_matched,
+        strategy_failed=strategy_failed,
+        strategy_blockers=strategy_blockers,
+    )
+    top_stage1 = sorted(cumulative_audit.get("stage1", {}).get("reasons", {}).items(), key=lambda x: x[1], reverse=True)[:8]
+    top_stage2 = {gate: sorted(reasons.items(), key=lambda x: x[1], reverse=True)[:5] for gate, reasons in cumulative_audit.get("stage2", {}).get("reason_counts_by_gate", {}).items()}
+    log.info("DAILY AUDIT CUMULATIVE | scans=%d | stage1_top=%s | stage2_top=%s", cumulative_audit.get("scans", 0), top_stage1, top_stage2)
 
     # Score distribution diagnostics only. These values are observational and
     # do not alter any selection rule. They show whether the zero-qualified
