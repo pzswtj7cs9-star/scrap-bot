@@ -2443,6 +2443,9 @@ def analyze_intraday(
     day_open = float(today_5["Open"].iloc[0])
     prev_days = m5[m5.index.date < last_day]
     prev_close = float(prev_days["Close"].iloc[-1]) if not prev_days.empty else price
+    # Previous-session close is the intraday PrevClose reference level.
+    # Keep this on the intraday 5m context; do not borrow the Daily formula.
+    prev_close_level = float(prev_close)
     change_pct = (price - prev_close) / prev_close * 100 if prev_close else 0.0
 
     vwap_s = _vwap(today_5)
@@ -4072,6 +4075,13 @@ def analyze_intraday(
         reasons.append("دخول مبكر فوق VWAP")
         factors.append("early")
 
+    # Intraday key levels: previous-session close + ORB + current H1 structural level.
+    # Diagnostic/quality factor only; it does not create or block a strategy.
+    key_level_near = any(
+        lvl > 0 and abs(price - float(lvl)) / max(price, 1e-9) * 100 <= 0.60
+        for lvl in (prev_close_level, orb_high, level_high)
+    )
+
     if key_level_near and "key_level" not in factors:
         factors.append("key_level")
         reasons.append("قرب مستوى سعري مهم")
@@ -4122,9 +4132,10 @@ def analyze_intraday(
     limits = policy.get("entry_limits", {})
     # IMPORTANT: entry_limits are Score caps only. They NEVER determine alert eligibility.
     # Global eligibility uses raw_score in scan_* after all structural/final gates pass.
-    # نحفظ الدرجة قبل سقف نوع الاستراتيجية لاستخدامها في استثناء السوق.
-    # سقف الاستراتيجية يبقى كما هو للـScore المعروض والترتيب.
-    override_score = float(score)
+    # Capture the complete pre-cap score once, after adaptive adjustments.
+    # The strategy cap below affects only the displayed/ranking score.
+    raw_score = float(score)
+    override_score = raw_score
     if entry_type == "دخول مبكر":
         score = min(score, float(limits.get("دخول مبكر", 94)))
     elif entry_type == "إعادة اختبار":
