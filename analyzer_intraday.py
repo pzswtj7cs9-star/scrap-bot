@@ -1984,6 +1984,11 @@ def _market_relative_returns(fetch_intraday) -> tuple[float | None, float | None
             if d is None or len(d) < 6:
                 log.warning("INTRADAY RELATIVE MARKET INCOMPLETE | %s | insufficient bars", sym)
                 continue
+            from market_data import intraday_data_fresh
+            fresh_ok, age_min = intraday_data_fresh(d, "5m", 12)
+            if not fresh_ok:
+                log.warning("INTRADAY RELATIVE MARKET STALE | %s | age=%.1fm>12m", sym, float(age_min))
+                continue
             day = d.index[-1].date()
             cur = d[d.index.date == day]
             prev = d[d.index.date < day]
@@ -2022,6 +2027,10 @@ def _market_alignment(fetch_intraday) -> tuple[bool, str]:
                 d = fetch_intraday(sym, interval="5m", period="2d")
                 if d is None or len(d) < 20:
                     raise ValueError("market data unavailable/incomplete")
+                from market_data import intraday_data_fresh
+                fresh_ok, age_min = intraday_data_fresh(d, "5m", 12)
+                if not fresh_ok:
+                    raise ValueError(f"market data stale: age={float(age_min):.1f}m > 12m")
                 day = d.index[-1].date()
                 cur = d[d.index.date == day]
                 if len(cur) < 6:
@@ -2150,7 +2159,7 @@ def _intraday_volume_ratio(today_df: pd.DataFrame, history_df: pd.DataFrame, max
     try:
         n = len(today_df)
         if n <= 0 or history_df is None or history_df.empty:
-            return 1.0
+            return float("nan")
         hist = history_df.copy()
         hist = hist.sort_index()
         day_groups = []
@@ -2159,13 +2168,13 @@ def _intraday_volume_ratio(today_df: pd.DataFrame, history_df: pd.DataFrame, max
             if len(day) >= n:
                 day_groups.append(day.iloc[:n]["Volume"].astype(float).mean())
         if not day_groups:
-            return 1.0
+            return float("nan")
         baseline = float(pd.Series(day_groups[-max_days:]).mean())
         current = float(today_df["Volume"].astype(float).mean())
-        return current / baseline if baseline > 0 else 1.0
+        return current / baseline if baseline > 0 and np.isfinite(baseline) and np.isfinite(current) else float("nan")
     except Exception as exc:
-        log.debug("INTRADAY volume ratio calculation fallback | %s", exc)
-        return 1.0
+        log.debug("INTRADAY volume ratio calculation unavailable | %s", exc)
+        return float("nan")
 
 
 def _grade(score: int, strong: bool = False) -> str:
@@ -2544,7 +2553,7 @@ def analyze_intraday(
     closed_prev_idx = closed_idx - 1 if abs(closed_idx) <= len(today_5) - 1 else -2
 
     price = float(today_5["Close"].iloc[-1])
-    if price <= 0 or price > float(MAX_AUTO_PRICE):
+    if not np.isfinite(price) or price <= 0 or price > float(MAX_AUTO_PRICE):
         return None
 
     day_open = float(today_5["Open"].iloc[0])
@@ -2560,6 +2569,8 @@ def analyze_intraday(
 
     hist_5 = m5[m5.index.date < last_day]
     vol_session_ratio = _intraday_volume_ratio(today_5, hist_5, max_days=20)
+    if not np.isfinite(vol_session_ratio):
+        return None
     vol_session_ok = vol_session_ratio >= 0.90
 
     hc = h1["Close"]
@@ -4796,7 +4807,7 @@ def _prefilter_intraday(
             log.info("INTRADAY STAGE 1 REJECT | %s | session_bars<6", symbol)
             return None
         price = float(today["Close"].iloc[-1])
-        if price <= 0 or price > float(MAX_AUTO_PRICE):
+        if not np.isfinite(price) or price <= 0 or price > float(MAX_AUTO_PRICE):
             _audit_stage1("invalid_price")
             log.info("INTRADAY STAGE 1 REJECT | %s | invalid_price=%.4f|max=%.2f", symbol, price, float(MAX_AUTO_PRICE))
             return None
@@ -4820,7 +4831,16 @@ def _prefilter_intraday(
         hist = m5[m5.index.date < last_day].copy()
         # Time-of-day RVOL: compare cumulative volume through the current
         # session position with the same number of 5m bars in prior sessions.
-        current_today = today["Volume"].astype(float).fillna(0.0)
+        # Use completed 5m bars for RVOL. The latest bar can still be forming
+        # while the analyzer is running, so do not compare a partial bar set
+        # with completed historical bars.
+        volume_today = today.iloc[:-1] if len(today) > 1 else today.iloc[0:0]
+        if volume_today.empty:
+            _audit_stage1("volume_data_unavailable")
+            _audit_data("volume_data_unavailable")
+            log.info("INTRADAY STAGE 1 REJECT | %s | volume_data_unavailable", symbol)
+            return None
+        current_today = volume_today["Volume"].astype(float).fillna(0.0)
         n_bars = len(current_today)
         current_cum = float(current_today.sum())
         prior_cums = []
@@ -4829,7 +4849,12 @@ def _prefilter_intraday(
             if len(g) >= n_bars:
                 prior_cums.append(float(g["Volume"].astype(float).fillna(0.0).sum()))
         baseline = float(np.mean(prior_cums)) if prior_cums else 0.0
-        vol_ratio = current_cum / baseline if baseline > 0 else 1.0
+        vol_ratio = current_cum / baseline if baseline > 0 and np.isfinite(baseline) and np.isfinite(current_cum) else float("nan")
+        if not np.isfinite(vol_ratio):
+            _audit_stage1("volume_data_unavailable")
+            _audit_data("volume_data_unavailable")
+            log.info("INTRADAY STAGE 1 REJECT | %s | volume_data_unavailable", symbol)
+            return None
 
         # Cheap structural proxies. These are ROUTING signals only; Stage 2 is authoritative.
         prev_high = float(hist["High"].max()) if not hist.empty else price

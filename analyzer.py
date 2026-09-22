@@ -2428,12 +2428,13 @@ def _daily_volume_ratio_time_of_day(symbol: str, fetch_intraday, now_ny) -> floa
     Compares today's cumulative 5-minute volume from the regular-session open
     through the current time with the average cumulative volume through that
     same time across prior sessions. Falls back to 1.0 when intraday history
-    is unavailable so missing data cannot manufacture a weak/strong reading.
+    is unavailable, the function returns NaN so missing data is handled as
+    unavailable rather than being silently interpreted as a normal 1.0x ratio.
     """
     try:
         bars = fetch_intraday(symbol, interval="5m", period="30d")
         if bars is None or bars.empty or "Volume" not in bars.columns:
-            return 1.0
+            return float("nan")
         df = bars.copy().sort_index()
         idx = pd.DatetimeIndex(df.index)
         if idx.tz is None:
@@ -2450,18 +2451,18 @@ def _daily_volume_ratio_time_of_day(symbol: str, fetch_intraday, now_ny) -> floa
         session_date = now.date()
         session_open = now.normalize() + pd.Timedelta(hours=9, minutes=30)
         if now < session_open:
-            return 1.0
+            return float("nan")
 
         # Use only regular-session bars through the current clock time.
         work = df[(df.index.time >= pd.Timestamp("09:30").time()) &
                   (df.index.time <= pd.Timestamp("16:00").time()) &
                   (df.index <= now)]
         if work.empty:
-            return 1.0
+            return float("nan")
 
         current = work[work.index.date == session_date]["Volume"].sum()
         if current <= 0:
-            return 1.0
+            return float("nan")
 
         cutoff = now.time()
         prior = []
@@ -2476,12 +2477,12 @@ def _daily_volume_ratio_time_of_day(symbol: str, fetch_intraday, now_ny) -> floa
             prior.append(float(g["Volume"].sum()))
 
         if not prior:
-            return 1.0
+            return float("nan")
         baseline = float(pd.Series(prior[-20:]).mean())
-        return float(current / baseline) if baseline > 0 else 1.0
+        return float(current / baseline) if baseline > 0 and np.isfinite(baseline) and np.isfinite(current) else float("nan")
     except Exception as exc:
         log.debug("DAILY time-of-day volume ratio fallback | %s | %s", symbol, exc)
-        return 1.0
+        return float("nan")
 
 
 def _aligned_relative_strength_metrics(
@@ -2712,7 +2713,7 @@ def analyze_daily(
             pass
 
     price = float(today_d["Close"].iloc[-1])
-    if price <= 0 or price > float(MAX_AUTO_PRICE):
+    if not np.isfinite(price) or price <= 0 or price > float(MAX_AUTO_PRICE):
         return None
 
     day_open = float(today_d["Open"].iloc[-1])
@@ -2729,6 +2730,9 @@ def analyze_daily(
     # Time-of-day relative volume: compare cumulative volume through the
     # current session time with the same point in prior sessions.
     vol_ratio = _daily_volume_ratio_time_of_day(symbol, fetch_intraday, now_ny)
+    if not np.isfinite(vol_ratio):
+        _daily_data_audit_record(symbol, "volume_data_unavailable")
+        return None
     vol_ok = vol_ratio >= 0.90
 
     hc = weekly["Close"]
@@ -5034,7 +5038,7 @@ def _prefilter_daily(symbol: str, audit_counts: dict[str, int] | None = None, au
             _audit_stage1("data_missing_or_short"); _audit_data("data_missing_or_short")
             return None
         price = float(daily["Close"].iloc[-1])
-        if price <= 0 or price > float(MAX_AUTO_PRICE):
+        if not np.isfinite(price) or price <= 0 or price > float(MAX_AUTO_PRICE):
             _audit_stage1("invalid_price")
             _audit_data("invalid_price")
             return None
@@ -5048,6 +5052,10 @@ def _prefilter_daily(symbol: str, audit_counts: dict[str, int] | None = None, au
         above_vwap = price >= vw * 0.995
         above_open = price >= float(daily["Open"].iloc[-1]) * 0.995
         vol_ratio = _daily_volume_ratio_time_of_day(symbol, fetch_intraday, now_ny())
+        if not np.isfinite(vol_ratio):
+            _audit_stage1("volume_data_unavailable")
+            _audit_data("volume_data_unavailable")
+            return None
         mom = (price - float(dc.iloc[-6])) / max(float(dc.iloc[-6]),1e-9) * 100 if len(dc)>=6 else 0.0
         route = 0.0
         route += 3.0 if trend else 0.0
@@ -5101,7 +5109,7 @@ def _prefilter_daily_from_frames(symbol: str, weekly: pd.DataFrame, daily: pd.Da
             _audit_stage1("data_missing_or_short"); _audit_data("data_missing_or_short")
             return None
         price = float(daily["Close"].iloc[-1])
-        if price <= 0 or price > float(MAX_AUTO_PRICE):
+        if not np.isfinite(price) or price <= 0 or price > float(MAX_AUTO_PRICE):
             _audit_stage1("invalid_price")
             _audit_data("invalid_price")
             return None
@@ -5113,6 +5121,10 @@ def _prefilter_daily_from_frames(symbol: str, weekly: pd.DataFrame, daily: pd.Da
         above_vwap = price >= vw * 0.995
         above_open = price >= float(daily["Open"].iloc[-1]) * 0.995
         vol_ratio = _daily_volume_ratio_time_of_day(symbol, fetch_intraday, now_ny())
+        if not np.isfinite(vol_ratio):
+            _audit_stage1("volume_data_unavailable")
+            _audit_data("volume_data_unavailable")
+            return None
         mom = (price - float(dc.iloc[-6])) / max(float(dc.iloc[-6]),1e-9) * 100 if len(dc)>=6 else 0.0
         route = (3.0 if trend else 0.0) + (2.0 if above_vwap else 0.0) + (1.5 if above_open else 0.0)
         route += min(2.5,max(0.0,mom)) + min(2.0,max(0.0,vol_ratio-0.75)*2.0) + (1.0 if we20 > we50 else 0.0)
