@@ -30,7 +30,7 @@ from stocks import MAX_AUTO_PRICE
 log = logging.getLogger(__name__)
 
 # Deployment marker: proves which analyzer_intraday build Render actually loaded.
-INTRADAY_ANALYZER_VERSION = "20260921-210000-FINAL-AUDIT-VWAP-EARLYFIX6-CUMULATIVE"
+INTRADAY_ANALYZER_VERSION = "20260922-DATA-INTEGRITY-AUDIT-V2"
 log.info("INTRADAY ANALYZER VERSION | %s", INTRADAY_ANALYZER_VERSION)
 
 SKIP_OPEN_MIN = 20
@@ -91,7 +91,7 @@ def _intraday_data_audit_pop(symbol: str) -> dict[str, int]:
 
 
 def _new_intraday_audit() -> dict:
-    return {"schema_version": 1, "updated_at": None, "scans": 0,
+    return {"schema_version": 2, "updated_at": None, "scans": 0,
             "stage1": {"passed": 0, "rejected": 0, "reasons": {}},
             "stage2": {"deep_candidates": 0, "qualified": 0, "gates": {},
                         "reason_counts_by_gate": {},
@@ -108,6 +108,9 @@ def _load_intraday_audit() -> dict:
         if not INTRADAY_AUDIT_FILE.exists(): return base
         raw = json.loads(INTRADAY_AUDIT_FILE.read_text(encoding="utf-8"))
         if not isinstance(raw, dict): return base
+        if int(raw.get("schema_version", 0) or 0) != 2:
+            log.info("INTRADAY AUDIT SCHEMA RESET | old=%s | new=2", raw.get("schema_version"))
+            return base
         for key, value in raw.items():
             if key in base and isinstance(base[key], dict) and isinstance(value, dict):
                 base[key].update(value)
@@ -2173,7 +2176,7 @@ def _intraday_volume_ratio(today_df: pd.DataFrame, history_df: pd.DataFrame, max
         current = float(today_df["Volume"].astype(float).mean())
         return current / baseline if baseline > 0 and np.isfinite(baseline) and np.isfinite(current) else float("nan")
     except Exception as exc:
-        log.debug("INTRADAY volume ratio calculation unavailable | %s", exc)
+        log.debug("INTRADAY volume ratio calculation fallback | %s", exc)
         return float("nan")
 
 
@@ -2570,6 +2573,7 @@ def analyze_intraday(
     hist_5 = m5[m5.index.date < last_day]
     vol_session_ratio = _intraday_volume_ratio(today_5, hist_5, max_days=20)
     if not np.isfinite(vol_session_ratio):
+        _intraday_data_audit_record(symbol, "volume_data_unavailable")
         return None
     vol_session_ok = vol_session_ratio >= 0.90
 
@@ -4767,6 +4771,22 @@ def _prefilter_intraday(
         from market_data import fetch_intraday, intraday_data_fresh
         if preloaded is not None:
             h1, m5 = preloaded
+            # Bulk responses can be incomplete/stale independently per symbol.
+            # Before rejecting the symbol, retry through the normal per-symbol
+            # loader so a transient bulk/data-lag issue cannot silently drop it.
+            pre_h1_ok, _pre_h1_age = intraday_data_fresh(h1, "60m", 90)
+            pre_m5_ok, _pre_m5_age = intraday_data_fresh(m5, "5m", 12)
+            if h1 is None or m5 is None or len(h1) < 40 or len(m5) < 30 or not pre_h1_ok or not pre_m5_ok:
+                try:
+                    retry_h1 = fetch_intraday(symbol, interval="60m", period="10d")
+                    retry_m5 = fetch_intraday(symbol, interval="5m", period="5d")
+                    if retry_h1 is not None and len(retry_h1) >= 40:
+                        h1 = retry_h1
+                    if retry_m5 is not None and len(retry_m5) >= 30:
+                        m5 = retry_m5
+                    log.info("INTRADAY INDIVIDUAL DATA RETRY | %s | bulk_incomplete_or_stale", symbol)
+                except Exception as exc:
+                    log.warning("INTRADAY INDIVIDUAL DATA RETRY FAILED | %s | %s", symbol, exc)
         else:
             h1 = fetch_intraday(symbol, interval="60m", period="10d")
             m5 = fetch_intraday(symbol, interval="5m", period="5d")
@@ -4831,9 +4851,6 @@ def _prefilter_intraday(
         hist = m5[m5.index.date < last_day].copy()
         # Time-of-day RVOL: compare cumulative volume through the current
         # session position with the same number of 5m bars in prior sessions.
-        # Use completed 5m bars for RVOL. The latest bar can still be forming
-        # while the analyzer is running, so do not compare a partial bar set
-        # with completed historical bars.
         volume_today = today.iloc[:-1] if len(today) > 1 else today.iloc[0:0]
         if volume_today.empty:
             _audit_stage1("volume_data_unavailable")

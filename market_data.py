@@ -18,10 +18,9 @@ log = logging.getLogger("halal-bot.data")
 APCA_KEY = os.getenv("APCA_API_KEY_ID", "").strip()
 APCA_SECRET = os.getenv("APCA_API_SECRET_KEY", "").strip()
 DATA_URL = os.getenv("APCA_DATA_URL", "https://data.alpaca.markets").rstrip("/")
-# auto = جرّب SIP ثم IEX تلقائيًا. إذا لم يكن SIP متاحًا يعود إلى IEX المجاني.
-APCA_FEED = os.getenv("APCA_FEED", "iex").strip().lower()
-SIP_RETRY_COOLDOWN_MIN = 15
-_SIP_DISABLED_UNTIL: datetime | None = None
+# حساب Alpaca الحالي يستخدم IEX. لا نستخدم SIP أو delayed_sip في هذا البناء.
+# IEX بيانات لحظية من بورصة IEX؛ القيد هو التغطية (بورصة واحدة) وليس تأخير 15 دقيقة.
+APCA_FEED = "iex"
 _LAST_ALPACA_FEED = "iex"
 
 _LAST_SOURCE = "none"
@@ -160,7 +159,7 @@ def fetch_alpaca_bars(
     end: Optional[datetime] = None,
     limit: int = 10000,
 ) -> pd.DataFrame:
-    global _SIP_DISABLED_UNTIL, _LAST_ALPACA_FEED
+    global _LAST_ALPACA_FEED
     if not alpaca_configured():
         raise RuntimeError("Alpaca keys missing")
     end = end or datetime.now(timezone.utc)
@@ -169,37 +168,20 @@ def fetch_alpaca_bars(
     if end.tzinfo is None:
         end = end.replace(tzinfo=timezone.utc)
 
-    requested = APCA_FEED if APCA_FEED in {"iex", "sip", "delayed_sip"} else "auto"
-    feeds = [requested] if requested != "auto" else []
-    if requested == "auto":
-        now = datetime.now(timezone.utc)
-        if _SIP_DISABLED_UNTIL is None or now >= _SIP_DISABLED_UNTIL:
-            feeds.append("sip")
-        feeds.append("iex")
-
-    last_exc = None
-    for feed in feeds:
-        try:
-            df = _alpaca_request_bars(symbol, timeframe, start, end, limit, feed)
-            if feed == "sip":
-                _SIP_DISABLED_UNTIL = None
-            _LAST_ALPACA_FEED = feed
-            if df is not None:
-                df.attrs["data_source"] = f"alpaca-{feed}"
-                df.attrs["feed"] = feed
-            _set_status(f"alpaca-{feed}")
-            return df
-        except Exception as exc:
-            last_exc = exc
-            # إذا لم تكن صلاحية SIP موجودة، لا نكرر الطلب في كل سهم/كل دقيقة.
-            if feed == "sip" and APCA_FEED == "auto":
-                _SIP_DISABLED_UNTIL = datetime.now(timezone.utc) + timedelta(minutes=SIP_RETRY_COOLDOWN_MIN)
-                log.info("Alpaca SIP غير متاح حاليًا؛ الرجوع إلى IEX: %s", exc)
-                continue
-            if feed != feeds[-1]:
-                continue
-            raise
-    raise last_exc or RuntimeError("Alpaca data unavailable")
+    # Explicit IEX-only path. This prevents an environment variable such as
+    # APCA_FEED=auto/sip from accidentally requesting a feed unavailable to the
+    # user's account and turning a data problem into a symbol rejection.
+    feed = "iex"
+    try:
+        df = _alpaca_request_bars(symbol, timeframe, start, end, limit, feed)
+        _LAST_ALPACA_FEED = feed
+        if df is not None:
+            df.attrs["data_source"] = f"alpaca-{feed}"
+            df.attrs["feed"] = feed
+        _set_status(f"alpaca-{feed}")
+        return df
+    except Exception:
+        raise
 
 
 def data_age_minutes(df: pd.DataFrame, now: Optional[datetime] = None) -> float:
@@ -231,9 +213,8 @@ def fetch_latest_quote(symbol: str, feed: Optional[str] = None) -> dict:
     """أفضل Bid/Ask من Alpaca عند توفره، بدون اختراع قيم عند غياب الاقتباس."""
     if not alpaca_configured():
         return {}
-    # في وضع auto نستخدم نفس الـfeed الذي نجح فعليًا مع آخر طلب شموع.
-    # إذا لم ننجح بعد، البداية الآمنة هي IEX المجاني.
-    use_feed = feed or (APCA_FEED if APCA_FEED in {"iex", "sip", "delayed_sip"} else _LAST_ALPACA_FEED)
+    # IEX-only: لا نسمح لمسار quote أن يتحول إلى SIP/delayed_sip.
+    use_feed = "iex"
     url = f"{DATA_URL}/v2/stocks/{symbol.upper()}/quotes/latest"
     params = {"feed": use_feed}
     r = _alpaca_get(url, params=params, timeout=5)
@@ -328,7 +309,7 @@ def fetch_alpaca_bars_multi(
             "end": end.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
             "limit": min(limit, 10000),
             "adjustment": "split",
-            "feed": APCA_FEED if APCA_FEED in {"iex", "sip", "delayed_sip"} else "iex",
+            "feed": "iex",
         }
         url = f"{DATA_URL}/v2/stocks/bars"
         r = _alpaca_get(url, params=params, timeout=15)
@@ -387,14 +368,30 @@ def fetch_intraday(symbol: str, period: str = "5d", interval: str = "5m") -> pd.
     start = datetime.now(timezone.utc) - timedelta(days=lookback_days)
 
     if alpaca_configured():
-        try:
-            df = fetch_alpaca_bars(symbol, alpaca_tf, start)
-            if df is not None and len(df) >= 10:
-                _set_status("alpaca")
-                return df
-        except Exception as exc:
-            log.warning("Alpaca intra %s %s: %s", symbol, interval, exc)
-            _set_status("yahoo", str(exc)[:120])
+        last_exc = None
+        for attempt in range(2):
+            try:
+                df = fetch_alpaca_bars(symbol, alpaca_tf, start)
+                if df is not None and len(df) >= 10:
+                    # Retry once when a live intraday response is materially old.
+                    # The retry does not relax the analyzer's hard freshness gate.
+                    if alpaca_tf in {"1Min", "5Min", "15Min", "1Hour"}:
+                        fresh_ok, age_min = intraday_data_fresh(df, interval)
+                        if not fresh_ok and attempt == 0:
+                            log.warning("Alpaca intraday stale; retrying %s %s | age=%.1fm", symbol, interval, float(age_min))
+                            _time.sleep(0.8)
+                            continue
+                        if not fresh_ok:
+                            log.warning("Alpaca intraday still stale %s %s | age=%.1fm", symbol, interval, float(age_min))
+                    _set_status(df.attrs.get("data_source", "alpaca-iex"))
+                    return df
+            except Exception as exc:
+                last_exc = exc
+                if attempt == 0:
+                    _time.sleep(0.5)
+                    continue
+                log.warning("Alpaca intra %s %s: %s", symbol, interval, exc)
+        _set_status("yahoo", str(last_exc)[:120] if last_exc else "alpaca stale/empty")
 
     try:
         df = yf.Ticker(symbol).history(

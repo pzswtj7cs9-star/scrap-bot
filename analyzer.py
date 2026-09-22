@@ -30,7 +30,7 @@ from stocks import MAX_AUTO_PRICE
 
 log = logging.getLogger("halal-bot.daily")
 
-DAILY_ANALYZER_VERSION = "20260921-214500-FINAL-AUDIT-CUMULATIVE-LIVEGATE"
+DAILY_ANALYZER_VERSION = "20260922-DATA-INTEGRITY-AUDIT-V2"
 log.info("DAILY ANALYZER VERSION | %s", DAILY_ANALYZER_VERSION)
 
 SKIP_OPEN_MIN = 0
@@ -62,7 +62,7 @@ def _daily_data_audit_pop(symbol: str) -> dict[str, int]:
 
 def _new_daily_audit() -> dict:
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "updated_at": None,
         "scans": 0,
         "stage1": {"passed": 0, "rejected": 0, "reasons": {}},
@@ -87,6 +87,9 @@ def _load_daily_audit() -> dict:
             return base
         raw = json.loads(DAILY_AUDIT_FILE.read_text(encoding="utf-8"))
         if not isinstance(raw, dict):
+            return base
+        if int(raw.get("schema_version", 0) or 0) != 2:
+            log.info("DAILY AUDIT SCHEMA RESET | old=%s | new=2", raw.get("schema_version"))
             return base
         for key, value in raw.items():
             if key in base and isinstance(base[key], dict) and isinstance(value, dict):
@@ -2425,16 +2428,33 @@ def _daily_market_relative_returns(fetch_intraday) -> tuple[float | None, float 
 def _daily_volume_ratio_time_of_day(symbol: str, fetch_intraday, now_ny) -> float:
     """Daily relative volume through the same session time.
 
-    Compares today's cumulative 5-minute volume from the regular-session open
-    through the current time with the average cumulative volume through that
-    same time across prior sessions. Falls back to 1.0 when intraday history
-    is unavailable, the function returns NaN so missing data is handled as
-    unavailable rather than being silently interpreted as a normal 1.0x ratio.
+    Data-integrity rule: stale/unavailable 5m data must NEVER be converted into
+    a weak-volume rejection. Retry the fetch, then return a neutral 1.0 if the
+    feed still cannot provide a fresh bar. This preserves the existing 0.55x
+    strategy threshold without allowing a data outage/delay to manufacture it.
     """
     try:
-        bars = fetch_intraday(symbol, interval="5m", period="30d")
+        bars = None
+        fresh_age = float("inf")
+        for attempt in range(2):
+            candidate = fetch_intraday(symbol, interval="5m", period="30d")
+            bars = candidate
+            try:
+                from market_data import intraday_data_fresh
+                fresh_ok, fresh_age = intraday_data_fresh(candidate, "5m", 12)
+            except Exception:
+                fresh_ok = candidate is not None and not candidate.empty
+            if fresh_ok:
+                break
+            if attempt == 0:
+                time_module.sleep(0.15)
+
         if bars is None or bars.empty or "Volume" not in bars.columns:
-            return float("nan")
+            log.info("DAILY volume neutral fallback | %s | missing 5m data", symbol)
+            return 1.0
+        if not np.isfinite(fresh_age) or fresh_age > 12.0:
+            log.info("DAILY volume neutral fallback | %s | 5m stale age=%.1fm", symbol, fresh_age)
+            return 1.0
         df = bars.copy().sort_index()
         idx = pd.DatetimeIndex(df.index)
         if idx.tz is None:
@@ -2451,18 +2471,18 @@ def _daily_volume_ratio_time_of_day(symbol: str, fetch_intraday, now_ny) -> floa
         session_date = now.date()
         session_open = now.normalize() + pd.Timedelta(hours=9, minutes=30)
         if now < session_open:
-            return float("nan")
+            return 1.0
 
         # Use only regular-session bars through the current clock time.
         work = df[(df.index.time >= pd.Timestamp("09:30").time()) &
                   (df.index.time <= pd.Timestamp("16:00").time()) &
                   (df.index <= now)]
         if work.empty:
-            return float("nan")
+            return 1.0
 
         current = work[work.index.date == session_date]["Volume"].sum()
         if current <= 0:
-            return float("nan")
+            return 1.0
 
         cutoff = now.time()
         prior = []
@@ -2477,12 +2497,12 @@ def _daily_volume_ratio_time_of_day(symbol: str, fetch_intraday, now_ny) -> floa
             prior.append(float(g["Volume"].sum()))
 
         if not prior:
-            return float("nan")
+            return 1.0
         baseline = float(pd.Series(prior[-20:]).mean())
-        return float(current / baseline) if baseline > 0 and np.isfinite(baseline) and np.isfinite(current) else float("nan")
+        return float(current / baseline) if baseline > 0 and np.isfinite(baseline) and np.isfinite(current) else 1.0
     except Exception as exc:
         log.debug("DAILY time-of-day volume ratio fallback | %s | %s", symbol, exc)
-        return float("nan")
+        return 1.0
 
 
 def _aligned_relative_strength_metrics(
