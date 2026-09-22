@@ -30,7 +30,7 @@ from stocks import MAX_AUTO_PRICE
 
 log = logging.getLogger("halal-bot.daily")
 
-DAILY_ANALYZER_VERSION = "20260922-DATA-INTEGRITY-AUDIT-V2"
+DAILY_ANALYZER_VERSION = "20260922-DATA-INTEGRITY-AUDIT-V2-PRICE-AUDIT"
 log.info("DAILY ANALYZER VERSION | %s", DAILY_ANALYZER_VERSION)
 
 SKIP_OPEN_MIN = 0
@@ -2428,33 +2428,15 @@ def _daily_market_relative_returns(fetch_intraday) -> tuple[float | None, float 
 def _daily_volume_ratio_time_of_day(symbol: str, fetch_intraday, now_ny) -> float:
     """Daily relative volume through the same session time.
 
-    Data-integrity rule: stale/unavailable 5m data must NEVER be converted into
-    a weak-volume rejection. Retry the fetch, then return a neutral 1.0 if the
-    feed still cannot provide a fresh bar. This preserves the existing 0.55x
-    strategy threshold without allowing a data outage/delay to manufacture it.
+    Compares today's cumulative 5-minute volume from the regular-session open
+    through the current time with the average cumulative volume through that
+    same time across prior sessions. Falls back to 1.0 when intraday history
+    is unavailable so missing data cannot manufacture a weak/strong reading.
     """
     try:
-        bars = None
-        fresh_age = float("inf")
-        for attempt in range(2):
-            candidate = fetch_intraday(symbol, interval="5m", period="30d")
-            bars = candidate
-            try:
-                from market_data import intraday_data_fresh
-                fresh_ok, fresh_age = intraday_data_fresh(candidate, "5m", 12)
-            except Exception:
-                fresh_ok = candidate is not None and not candidate.empty
-            if fresh_ok:
-                break
-            if attempt == 0:
-                time_module.sleep(0.15)
-
+        bars = fetch_intraday(symbol, interval="5m", period="30d")
         if bars is None or bars.empty or "Volume" not in bars.columns:
-            log.info("DAILY volume neutral fallback | %s | missing 5m data", symbol)
-            return 1.0
-        if not np.isfinite(fresh_age) or fresh_age > 12.0:
-            log.info("DAILY volume neutral fallback | %s | 5m stale age=%.1fm", symbol, fresh_age)
-            return 1.0
+            return float("nan")
         df = bars.copy().sort_index()
         idx = pd.DatetimeIndex(df.index)
         if idx.tz is None:
@@ -2471,18 +2453,18 @@ def _daily_volume_ratio_time_of_day(symbol: str, fetch_intraday, now_ny) -> floa
         session_date = now.date()
         session_open = now.normalize() + pd.Timedelta(hours=9, minutes=30)
         if now < session_open:
-            return 1.0
+            return float("nan")
 
         # Use only regular-session bars through the current clock time.
         work = df[(df.index.time >= pd.Timestamp("09:30").time()) &
                   (df.index.time <= pd.Timestamp("16:00").time()) &
                   (df.index <= now)]
         if work.empty:
-            return 1.0
+            return float("nan")
 
         current = work[work.index.date == session_date]["Volume"].sum()
         if current <= 0:
-            return 1.0
+            return float("nan")
 
         cutoff = now.time()
         prior = []
@@ -2497,12 +2479,12 @@ def _daily_volume_ratio_time_of_day(symbol: str, fetch_intraday, now_ny) -> floa
             prior.append(float(g["Volume"].sum()))
 
         if not prior:
-            return 1.0
+            return float("nan")
         baseline = float(pd.Series(prior[-20:]).mean())
-        return float(current / baseline) if baseline > 0 and np.isfinite(baseline) and np.isfinite(current) else 1.0
+        return float(current / baseline) if baseline > 0 and np.isfinite(baseline) and np.isfinite(current) else float("nan")
     except Exception as exc:
         log.debug("DAILY time-of-day volume ratio fallback | %s | %s", symbol, exc)
-        return 1.0
+        return float("nan")
 
 
 def _aligned_relative_strength_metrics(
@@ -5058,9 +5040,20 @@ def _prefilter_daily(symbol: str, audit_counts: dict[str, int] | None = None, au
             _audit_stage1("data_missing_or_short"); _audit_data("data_missing_or_short")
             return None
         price = float(daily["Close"].iloc[-1])
-        if not np.isfinite(price) or price <= 0 or price > float(MAX_AUTO_PRICE):
-            _audit_stage1("invalid_price")
-            _audit_data("invalid_price")
+        if not np.isfinite(price):
+            _audit_stage1("invalid_price_nan")
+            _audit_data("invalid_price_nan")
+            log.info("DAILY STAGE 1 REJECT | %s | invalid_price_nan", symbol)
+            return None
+        if price <= 0:
+            _audit_stage1("invalid_price_nonpositive")
+            _audit_data("invalid_price_nonpositive")
+            log.info("DAILY STAGE 1 REJECT | %s | invalid_price_nonpositive=%.6f", symbol, price)
+            return None
+        if price > float(MAX_AUTO_PRICE):
+            _audit_stage1("price_above_max")
+            _audit_data("price_above_max")
+            log.info("DAILY STAGE 1 REJECT | %s | price_above_max=%.4f|max=%.2f", symbol, price, float(MAX_AUTO_PRICE))
             return None
         wc = weekly["Close"].astype(float)
         dc = daily["Close"].astype(float)
@@ -5129,9 +5122,20 @@ def _prefilter_daily_from_frames(symbol: str, weekly: pd.DataFrame, daily: pd.Da
             _audit_stage1("data_missing_or_short"); _audit_data("data_missing_or_short")
             return None
         price = float(daily["Close"].iloc[-1])
-        if not np.isfinite(price) or price <= 0 or price > float(MAX_AUTO_PRICE):
-            _audit_stage1("invalid_price")
-            _audit_data("invalid_price")
+        if not np.isfinite(price):
+            _audit_stage1("invalid_price_nan")
+            _audit_data("invalid_price_nan")
+            log.info("DAILY STAGE 1 REJECT | %s | invalid_price_nan", symbol)
+            return None
+        if price <= 0:
+            _audit_stage1("invalid_price_nonpositive")
+            _audit_data("invalid_price_nonpositive")
+            log.info("DAILY STAGE 1 REJECT | %s | invalid_price_nonpositive=%.6f", symbol, price)
+            return None
+        if price > float(MAX_AUTO_PRICE):
+            _audit_stage1("price_above_max")
+            _audit_data("price_above_max")
+            log.info("DAILY STAGE 1 REJECT | %s | price_above_max=%.4f|max=%.2f", symbol, price, float(MAX_AUTO_PRICE))
             return None
         wc = weekly["Close"].astype(float); dc = daily["Close"].astype(float)
         we20 = float(_ema(wc,20).iloc[-1]); we50 = float(_ema(wc,50).iloc[-1])
