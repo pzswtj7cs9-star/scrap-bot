@@ -43,6 +43,22 @@ _DAILY_AUDIT_LOCK = Lock()
 # scan_daily() can persist them in the cumulative audit. Diagnostic only.
 _DAILY_NO_SIGNAL_AUDIT: dict[str, dict[str, int]] = {}
 _DAILY_NO_SIGNAL_LOCK = Lock()
+_DAILY_DATA_AUDIT: dict[str, dict[str, int]] = {}
+_DAILY_DATA_AUDIT_LOCK = Lock()
+
+def _daily_data_audit_record(symbol: str, *reasons: str) -> None:
+    if not symbol:
+        return
+    with _DAILY_DATA_AUDIT_LOCK:
+        dst = _DAILY_DATA_AUDIT.setdefault(str(symbol).upper(), {})
+        for reason in reasons:
+            if reason:
+                _daily_bump(dst, str(reason))
+
+def _daily_data_audit_pop(symbol: str) -> dict[str, int]:
+    with _DAILY_DATA_AUDIT_LOCK:
+        return dict(_DAILY_DATA_AUDIT.pop(str(symbol).upper(), {}) or {})
+
 
 def _new_daily_audit() -> dict:
     return {
@@ -55,6 +71,11 @@ def _new_daily_audit() -> dict:
             "gates": {},
             "reason_counts_by_gate": {},
             "diagnostic_reason_counts_by_gate": {},
+        },
+        "data": {
+            "stage1": {},
+            "stage2": {},
+            "timeframes": {},
         },
         "strategy": {"matched": {}, "failed": {}, "blockers": {}},
     }
@@ -93,6 +114,7 @@ def _daily_bump(counter: dict[str, int], reason: str, amount: int = 1) -> None:
 def _commit_daily_audit(*, stage1_counts=None, stage1_passed=0, stage1_rejected=0,
                         stage2_deep=0, stage2_qualified=0, stage2_gate_counts=None,
                         stage2_gate_reasons=None, stage2_gate_diag=None,
+                        data_stage1=None, data_stage2=None,
                         strategy_matched=None, strategy_failed=None, strategy_blockers=None) -> dict:
     with _DAILY_AUDIT_LOCK:
         data = _load_daily_audit()
@@ -116,6 +138,14 @@ def _commit_daily_audit(*, stage1_counts=None, stage1_passed=0, stage1_rejected=
             dst = st2.setdefault("diagnostic_reason_counts_by_gate", {}).setdefault(gate, {})
             for reason, count in reasons.items():
                 _daily_bump(dst, reason, count)
+        data_audit = data.setdefault("data", {"stage1": {}, "stage2": {}, "timeframes": {}})
+        for reason, count in (data_stage1 or {}).items():
+            _daily_bump(data_audit.setdefault("stage1", {}), reason, count)
+        for reason, count in (data_stage2 or {}).items():
+            _daily_bump(data_audit.setdefault("stage2", {}), reason, count)
+            if ":" in str(reason):
+                tf, subreason = str(reason).split(":", 1)
+                _daily_bump(data_audit.setdefault("timeframes", {}).setdefault(tf, {}), subreason, count)
         strat = data.setdefault("strategy", {})
         for key, count in (strategy_matched or {}).items():
             _daily_bump(strat.setdefault("matched", {}), key, count)
@@ -2649,8 +2679,13 @@ def analyze_daily(
     closed_prev_idx = closed_idx - 1 if abs(closed_idx) <= len(today_d) - 1 else -2
     try:
         h4_60m = fetch_intraday(symbol, interval="60m", period="60d")
-        ok_h4, _ = intraday_data_fresh(h4_60m, "60m", 240)
+        ok_h4, h4_age_min = intraday_data_fresh(h4_60m, "60m", 240)
+        if h4_60m is None:
+            _daily_data_audit_record(symbol, "60m:h4_missing")
+        elif len(h4_60m) < 30:
+            _daily_data_audit_record(symbol, "60m:h4_bars<30")
         if not ok_h4:
+            _daily_data_audit_record(symbol, f"60m:h4_stale(age={h4_age_min:.1f}m>240m)")
             h4 = None
         else:
             # مهم: المصدر يعطينا 60د؛ نحوله فعليًا إلى 4س قبل
@@ -2658,14 +2693,23 @@ def analyze_daily(
             # "4H" على شموع 60د.
             h4 = _build_4h_from_60m(h4_60m)
             if h4 is None or len(h4) < 30:
+                _daily_data_audit_record(symbol, "4h:h4_bars<30_after_resample")
                 h4 = None
     except Exception as exc:
+        _daily_data_audit_record(symbol, "60m:h4_fetch_or_resample_exception")
         h4 = None
         log.warning("DAILY 4H DATA FAILED | %s | %s", symbol, str(exc))
 
     # Compatibility aliases keep the proven setup intelligence readable.
     weekly = weekly.copy()
     daily = daily.copy()
+    for _tf_name, _df in (("weekly", weekly), ("daily", daily)):
+        try:
+            _ohlc_cols = [c for c in ("Open", "High", "Low", "Close") if c in _df.columns]
+            if _ohlc_cols and _df[_ohlc_cols].tail(3).isna().any().any():
+                _daily_data_audit_record(symbol, f"{_tf_name}:nan_ohlc_observed")
+        except Exception:
+            pass
 
     price = float(today_d["Close"].iloc[-1])
     if price <= 0 or price > float(MAX_AUTO_PRICE):
@@ -4955,7 +4999,8 @@ def _daily_strategy_route_scores(*, price: float, trend: bool, above_vwap: bool,
     return {k:round(float(v),2) for k,v in scores.items()}
 
 
-def _prefilter_daily(symbol: str, audit_counts: dict[str, int] | None = None, audit_lock: Lock | None = None) -> tuple[float, dict[str, float], pd.DataFrame, pd.DataFrame] | None:
+def _prefilter_daily(symbol: str, audit_counts: dict[str, int] | None = None, audit_lock: Lock | None = None,
+                     data_audit_counts: dict[str, int] | None = None) -> tuple[float, dict[str, float], pd.DataFrame, pd.DataFrame] | None:
     """Stage 1: weekly + daily routing for the full universe."""
     def _audit_stage1(reason: str) -> None:
         if audit_counts is None:
@@ -4965,16 +5010,33 @@ def _prefilter_daily(symbol: str, audit_counts: dict[str, int] | None = None, au
                 _daily_bump(audit_counts, reason)
         else:
             _daily_bump(audit_counts, reason)
+    def _audit_data(reason: str) -> None:
+        if data_audit_counts is None:
+            return
+        if audit_lock is not None:
+            with audit_lock:
+                _daily_bump(data_audit_counts, reason)
+        else:
+            _daily_bump(data_audit_counts, reason)
     try:
         from market_data import fetch_intraday, intraday_data_fresh
         weekly = fetch_intraday(symbol, interval="1wk", period="5y")
         daily = fetch_intraday(symbol, interval="1d", period="2y")
         if weekly is None or daily is None or len(weekly) < 60 or len(daily) < 80:
-            _audit_stage1("data_missing_or_short")
+            if weekly is None:
+                _audit_stage1("weekly_missing"); _audit_data("weekly_missing")
+            elif len(weekly) < 60:
+                _audit_stage1("weekly_bars<60"); _audit_data("weekly_bars<60")
+            if daily is None:
+                _audit_stage1("daily_missing"); _audit_data("daily_missing")
+            elif len(daily) < 80:
+                _audit_stage1("daily_bars<80"); _audit_data("daily_bars<80")
+            _audit_stage1("data_missing_or_short"); _audit_data("data_missing_or_short")
             return None
         price = float(daily["Close"].iloc[-1])
         if price <= 0 or price > float(MAX_AUTO_PRICE):
             _audit_stage1("invalid_price")
+            _audit_data("invalid_price")
             return None
         wc = weekly["Close"].astype(float)
         dc = daily["Close"].astype(float)
@@ -5007,7 +5069,8 @@ def _prefilter_daily(symbol: str, audit_counts: dict[str, int] | None = None, au
 
 
 
-def _prefilter_daily_from_frames(symbol: str, weekly: pd.DataFrame, daily: pd.DataFrame, audit_counts: dict[str, int] | None = None, audit_lock: Lock | None = None) -> tuple[float, dict[str, float], pd.DataFrame, pd.DataFrame] | None:
+def _prefilter_daily_from_frames(symbol: str, weekly: pd.DataFrame, daily: pd.DataFrame, audit_counts: dict[str, int] | None = None, audit_lock: Lock | None = None,
+                                   data_audit_counts: dict[str, int] | None = None) -> tuple[float, dict[str, float], pd.DataFrame, pd.DataFrame] | None:
     def _audit_stage1(reason: str) -> None:
         if audit_counts is None:
             return
@@ -5016,14 +5079,31 @@ def _prefilter_daily_from_frames(symbol: str, weekly: pd.DataFrame, daily: pd.Da
                 _daily_bump(audit_counts, reason)
         else:
             _daily_bump(audit_counts, reason)
+    def _audit_data(reason: str) -> None:
+        if data_audit_counts is None:
+            return
+        if audit_lock is not None:
+            with audit_lock:
+                _daily_bump(data_audit_counts, reason)
+        else:
+            _daily_bump(data_audit_counts, reason)
     try:
         from market_data import fetch_intraday
         if weekly is None or daily is None or len(weekly) < 60 or len(daily) < 80:
-            _audit_stage1("data_missing_or_short")
+            if weekly is None:
+                _audit_stage1("weekly_missing"); _audit_data("weekly_missing")
+            elif len(weekly) < 60:
+                _audit_stage1("weekly_bars<60"); _audit_data("weekly_bars<60")
+            if daily is None:
+                _audit_stage1("daily_missing"); _audit_data("daily_missing")
+            elif len(daily) < 80:
+                _audit_stage1("daily_bars<80"); _audit_data("daily_bars<80")
+            _audit_stage1("data_missing_or_short"); _audit_data("data_missing_or_short")
             return None
         price = float(daily["Close"].iloc[-1])
         if price <= 0 or price > float(MAX_AUTO_PRICE):
             _audit_stage1("invalid_price")
+            _audit_data("invalid_price")
             return None
         wc = weekly["Close"].astype(float); dc = daily["Close"].astype(float)
         we20 = float(_ema(wc,20).iloc[-1]); we50 = float(_ema(wc,50).iloc[-1])
@@ -5076,6 +5156,7 @@ def scan_daily(
     workers = min(8, max(2, len(symbols)))
     stage1=[]
     stage1_audit_counts: dict[str, int] = {}
+    stage1_data_audit_counts: dict[str, int] = {}
     stage1_audit_passed = 0
     stage1_audit_rejected = 0
     stage1_audit_lock = Lock()
@@ -5092,14 +5173,14 @@ def scan_daily(
                 weekly = weekly_map.get(sym.upper()); daily = daily_map.get(sym.upper())
                 if weekly is None or daily is None or len(weekly) < 60 or len(daily) < 80:
                     return None
-                return _prefilter_daily_from_frames(sym, weekly, daily, stage1_audit_counts, stage1_audit_lock)
+                return _prefilter_daily_from_frames(sym, weekly, daily, stage1_audit_counts, stage1_audit_lock, stage1_data_audit_counts)
             for sym in symbols:
                 item = _route_from_frames(sym)
                 if item is None:
                     # Partial-batch hardening: a missing symbol must get its own
                     # normal fetch path instead of being silently discarded.
                     try:
-                        item = _prefilter_daily(sym, stage1_audit_counts, stage1_audit_lock)
+                        item = _prefilter_daily(sym, stage1_audit_counts, stage1_audit_lock, stage1_data_audit_counts)
                         if item:
                             log.info("DAILY INDIVIDUAL FALLBACK | %s | recovered after batch miss", sym)
                     except Exception as exc:
@@ -5115,7 +5196,7 @@ def scan_daily(
     except Exception as exc:
         log.warning("Daily batch scan unavailable; using per-symbol fallback: %s", exc)
         with ThreadPoolExecutor(max_workers=workers) as pool:
-            futures={pool.submit(_prefilter_daily,sym,stage1_audit_counts,stage1_audit_lock):sym for sym in symbols}
+            futures={pool.submit(_prefilter_daily,sym,stage1_audit_counts,stage1_audit_lock,stage1_data_audit_counts):sym for sym in symbols}
             for fut in as_completed(futures):
                 sym=futures[fut]
                 try: item=fut.result()
@@ -5160,7 +5241,8 @@ def scan_daily(
         "final_execution": 0,
     }
     stage2_gate_reasons: dict[str, dict[str, int]] = {}
-    stage2_gate_diag: dict[str, dict[str, int]] = {}
+    stage2_gate_diag: dict[str, dict[str, int]] = {} 
+    data_stage2_audit: dict[str, int] = {}
     strategy_matched: dict[str, int] = {}
     strategy_failed: dict[str, int] = {}
     strategy_blockers: dict[str, dict[str, int]] = {}
@@ -5191,6 +5273,8 @@ def scan_daily(
                 sig=fut.result()
             except Exception as exc:
                 stage2_rejects["exception"] += 1
+                for _dr, _dc in _daily_data_audit_pop(_stage2_symbol).items():
+                    _daily_bump(data_stage2_audit, _dr, _dc)
                 _stage2_reason("exception", "future_exception")
                 _stage2_reason("exception", str(exc)[:120], diagnostic=True)
                 log.warning("DAILY STAGE 2 FUTURE EXCEPTION | %s", str(exc))
@@ -5202,12 +5286,16 @@ def scan_daily(
                     _ns_blockers = dict(_DAILY_NO_SIGNAL_AUDIT.pop(_stage2_symbol, {}) or {})
                 for _reason, _count in _ns_blockers.items():
                     _stage2_reason("no_signal", _reason, diagnostic=True)
+                for _dr, _dc in _daily_data_audit_pop(_stage2_symbol).items():
+                    _daily_bump(data_stage2_audit, _dr, _dc)
                 log.info(
                     "DAILY NO_SIGNAL AUDIT | %s | blockers=%s",
                     _stage2_symbol,
                     ";".join(f"{r}={c}" for r, c in sorted(_ns_blockers.items(), key=lambda kv: (-kv[1], kv[0]))[:8]) or "unavailable",
                 )
                 continue
+            for _dr, _dc in _daily_data_audit_pop(_stage2_symbol).items():
+                _daily_bump(data_stage2_audit, _dr, _dc)
             stage2_scores.append((str(getattr(sig, "symbol", "?")), float(getattr(sig, "score", 0) or 0)))
             _strategy_audit_from_signal(sig)
             raw_score = float(getattr(sig, "raw_score", sig.score) or 0.0)
@@ -5312,6 +5400,8 @@ def scan_daily(
         stage2_gate_counts=stage2_rejects,
         stage2_gate_reasons=stage2_gate_reasons,
         stage2_gate_diag=stage2_gate_diag,
+        data_stage1=stage1_data_audit_counts,
+        data_stage2=data_stage2_audit,
         strategy_matched=strategy_matched,
         strategy_failed=strategy_failed,
         strategy_blockers=strategy_blockers,

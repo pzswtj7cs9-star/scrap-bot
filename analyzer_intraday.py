@@ -73,13 +73,34 @@ _AUDIT_LOCK = Lock()
 # scan_intraday() can persist them in the cumulative audit. Diagnostic only.
 _INTRADAY_NO_SIGNAL_AUDIT: dict[str, dict[str, int]] = {}
 _INTRADAY_NO_SIGNAL_LOCK = Lock()
+_INTRADAY_DATA_AUDIT: dict[str, dict[str, int]] = {}
+_INTRADAY_DATA_AUDIT_LOCK = Lock()
+
+def _intraday_data_audit_record(symbol: str, *reasons: str) -> None:
+    if not symbol:
+        return
+    with _INTRADAY_DATA_AUDIT_LOCK:
+        dst = _INTRADAY_DATA_AUDIT.setdefault(str(symbol).upper(), {})
+        for reason in reasons:
+            if reason:
+                _bump_reason(dst, str(reason))
+
+def _intraday_data_audit_pop(symbol: str) -> dict[str, int]:
+    with _INTRADAY_DATA_AUDIT_LOCK:
+        return dict(_INTRADAY_DATA_AUDIT.pop(str(symbol).upper(), {}) or {})
+
 
 def _new_intraday_audit() -> dict:
     return {"schema_version": 1, "updated_at": None, "scans": 0,
             "stage1": {"passed": 0, "rejected": 0, "reasons": {}},
             "stage2": {"deep_candidates": 0, "qualified": 0, "gates": {},
                         "reason_counts_by_gate": {},
-                        "diagnostic_reason_counts_by_gate": {}}}
+                        "diagnostic_reason_counts_by_gate": {}},
+            "data": {
+                "stage1": {},
+                "stage2": {},
+                "timeframes": {},
+            }}
 
 def _load_intraday_audit() -> dict:
     base = _new_intraday_audit()
@@ -111,7 +132,8 @@ def _bump_reason(counter: dict[str, int], reason: str, amount: int = 1) -> None:
 
 def _commit_intraday_audit(*, stage1_counts=None, stage1_passed=0, stage1_rejected=0,
                            stage2_deep=0, stage2_qualified=0, stage2_gate_counts=None,
-                           stage2_gate_reasons=None, stage2_gate_diag=None) -> dict:
+                           stage2_gate_reasons=None, stage2_gate_diag=None,
+                           data_stage1=None, data_stage2=None) -> dict:
     with _AUDIT_LOCK:
         data = _load_intraday_audit()
         data["scans"] = int(data.get("scans", 0) or 0) + 1
@@ -130,6 +152,14 @@ def _commit_intraday_audit(*, stage1_counts=None, stage1_passed=0, stage1_reject
         for gate, reasons in (stage2_gate_diag or {}).items():
             dst = st2.setdefault("diagnostic_reason_counts_by_gate", {}).setdefault(gate, {})
             for reason, count in reasons.items(): _bump_reason(dst, reason, count)
+        data_audit = data.setdefault("data", {"stage1": {}, "stage2": {}, "timeframes": {}})
+        for reason, count in (data_stage1 or {}).items():
+            _bump_reason(data_audit.setdefault("stage1", {}), reason, count)
+        for reason, count in (data_stage2 or {}).items():
+            _bump_reason(data_audit.setdefault("stage2", {}), reason, count)
+            if ":" in str(reason):
+                tf, subreason = str(reason).split(":", 1)
+                _bump_reason(data_audit.setdefault("timeframes", {}).setdefault(tf, {}), subreason, count)
         _save_intraday_audit(data)
         return data
 
@@ -2492,10 +2522,16 @@ def analyze_intraday(
 
     try:
         m15 = fetch_intraday(symbol, interval="15m", period="10d")
-        ok_m15, _ = intraday_data_fresh(m15, "15m", 25)
+        ok_m15, m15_age_min = intraday_data_fresh(m15, "15m", 25)
+        if m15 is None:
+            _intraday_data_audit_record(symbol, "15m:m15_missing")
+        elif len(m15) < 30:
+            _intraday_data_audit_record(symbol, "15m:m15_bars<30")
         if not ok_m15:
+            _intraday_data_audit_record(symbol, f"15m:m15_stale(age={m15_age_min:.1f}m>25m)")
             m15 = None
     except Exception as exc:
+        _intraday_data_audit_record(symbol, "15m:m15_fetch_exception")
         m15 = None
         log.debug("INTRADAY 15M DATA UNAVAILABLE | %s | %s", symbol, str(exc))
 
@@ -4694,6 +4730,7 @@ def _prefilter_intraday(
     preloaded: tuple[pd.DataFrame, pd.DataFrame] | None = None,
     audit_counts: dict[str, int] | None = None,
     audit_lock: Lock | None = None,
+    data_audit_counts: dict[str, int] | None = None,
 ) -> tuple[float, dict[str, float], pd.DataFrame, pd.DataFrame] | None:
     """Stage 1: cheap H1+5m routing with a lane for each canonical strategy.
 
@@ -4706,6 +4743,14 @@ def _prefilter_intraday(
         if audit_lock is not None:
             with audit_lock: _bump_reason(audit_counts, reason)
         else: _bump_reason(audit_counts, reason)
+
+    def _audit_data(reason: str) -> None:
+        if data_audit_counts is None:
+            return
+        if audit_lock is not None:
+            with audit_lock: _bump_reason(data_audit_counts, reason)
+        else:
+            _bump_reason(data_audit_counts, reason)
 
     try:
         from market_data import fetch_intraday, intraday_data_fresh
@@ -4733,7 +4778,10 @@ def _prefilter_intraday(
                 reasons.append(f"h1_stale(age={h1_age_min:.1f}m>90m)")
             if not ok_m5:
                 reasons.append(f"m5_stale(age={m5_age_min:.1f}m>12m)")
-            for _reason in reasons or ["data_invalid"]: _audit_stage1(_reason)
+            for _reason in reasons or ["data_invalid"]:
+                _audit_stage1(_reason)
+                if _reason.startswith(("h1_", "m5_", "data_")):
+                    _audit_data(_reason)
             log.info(
                 "INTRADAY STAGE 1 REJECT | %s | %s | ages=h1:%.1fm/90m,m5:%.1fm/12m",
                 symbol, ";".join(reasons) or "data_invalid", float(h1_age_min), float(m5_age_min),
@@ -4744,6 +4792,7 @@ def _prefilter_intraday(
         today = m5[m5.index.date == last_day]
         if len(today) < 6:
             _audit_stage1("session_bars<6")
+            _audit_data("5m:session_bars<6")
             log.info("INTRADAY STAGE 1 REJECT | %s | session_bars<6", symbol)
             return None
         price = float(today["Close"].iloc[-1])
@@ -4913,6 +4962,7 @@ def scan_intraday(
     workers = min(8, max(2, len(symbols)))
     stage1: list[tuple[float, dict[str, float], str, pd.DataFrame, pd.DataFrame]] = []
     stage1_audit_counts: dict[str, int] = {}
+    stage1_data_audit_counts: dict[str, int] = {}
     stage1_audit_passed = 0
     stage1_audit_rejected = 0
     stage1_audit_lock = Lock()
@@ -4953,6 +5003,7 @@ def scan_intraday(
                 if sym in bulk_h1 and sym in bulk_m5 else None,
                 stage1_audit_counts,
                 stage1_audit_lock,
+                stage1_data_audit_counts,
             ): sym
             for sym in symbols
         }
@@ -5021,6 +5072,7 @@ def scan_intraday(
     rejection_samples: list[str] = []
     stage2_gate_reasons: dict[str, dict[str, int]] = {}
     stage2_gate_diag: dict[str, dict[str, int]] = {}
+    data_stage2_audit: dict[str, int] = {}
 
     def _record_stage2_gate(gate: str, reasons: list[str] | None = None) -> None:
         for reason in ([str(x) for x in (reasons or []) if str(x)] or [gate]):
@@ -5040,6 +5092,7 @@ def scan_intraday(
                 preloaded=(h1, m5),
             )
         except Exception as exc:
+            _intraday_data_audit_record(sym, f"stage2:analysis_exception:{str(exc)[:120]}")
             log.warning("INTRADAY STAGE 2 EXCEPTION | %s | %s", sym, str(exc))
             return None
 
@@ -5054,12 +5107,16 @@ def scan_intraday(
                 with _INTRADAY_NO_SIGNAL_LOCK:
                     _ns_blockers = dict(_INTRADAY_NO_SIGNAL_AUDIT.pop(_stage2_symbol, {}) or {})
                 _record_stage2_diag("no_signal", [f"{r}={c}" for r, c in _ns_blockers.items()])
+                for _dr, _dc in _intraday_data_audit_pop(_stage2_symbol).items():
+                    _bump_reason(data_stage2_audit, _dr, _dc)
                 log.info(
                     "INTRADAY NO_SIGNAL AUDIT | %s | blockers=%s",
                     _stage2_symbol,
                     ";".join(f"{r}={c}" for r, c in sorted(_ns_blockers.items(), key=lambda kv: (-kv[1], kv[0]))[:8]) or "unavailable",
                 )
                 continue
+            for _dr, _dc in _intraday_data_audit_pop(_stage2_symbol).items():
+                _bump_reason(data_stage2_audit, _dr, _dc)
             # تشخيص أول سبب فعلي للرفض، مع الاحتفاظ بأسباب الإشارة كلها داخل
             # diagnostic_reasons حتى نعرف هل المشكلة درجة أم جودة أم سوق...
             reasons = list(getattr(sig, "diagnostic_reasons", []) or [])
@@ -5173,6 +5230,7 @@ def scan_intraday(
         stage1_rejected=stage1_audit_rejected, stage2_deep=len(finalists),
         stage2_qualified=len(results), stage2_gate_counts=rejection_counts,
         stage2_gate_reasons=stage2_gate_reasons, stage2_gate_diag=stage2_gate_diag,
+        data_stage1=stage1_data_audit_counts, data_stage2=data_stage2_audit,
     )
     top_stage1 = sorted(cumulative_audit.get("stage1", {}).get("reasons", {}).items(), key=lambda x: x[1], reverse=True)[:8]
     top_stage2 = {gate: sorted(reasons.items(), key=lambda x: x[1], reverse=True)[:5]
