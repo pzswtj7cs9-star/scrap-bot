@@ -119,8 +119,8 @@ PERF_INTRA = PerformanceLog(PERF_INTRA_FILE)
 COOL = CooldownBook(COOL_FILE, days=COOLDOWN_DAYS)
 BOT_STARTED = now_ny()
 LAST_SCAN_AT: datetime | None = None
-LAST_YF_OK: bool | None = None
-LAST_YF_NOTE = ""
+LAST_DATA_OK: bool | None = None
+LAST_DATA_NOTE = ""
 
 
 def load_subs() -> set[int]:
@@ -186,7 +186,7 @@ _scan_lock = asyncio.Lock()
 _intra_scan_lock = asyncio.Lock()
 LAST_DAILY_SCAN_ATTEMPT: datetime | None = None
 LAST_INTRADAY_SCAN_ATTEMPT: datetime | None = None
-SCAN_RETRY_MINUTES = int(os.getenv("SCAN_RETRY_MINUTES", "5"))
+SCAN_RETRY_MINUTES = 1  # Daily + Intraday full scan gate: once per minute
 
 
 def load_reports() -> dict:
@@ -217,26 +217,23 @@ def save_reports(data: dict) -> None:
         log.warning("reports state: %s", exc)
 
 
-def ping_yahoo() -> tuple[bool, str]:
-    global LAST_YF_OK, LAST_YF_NOTE
+def ping_data_sources() -> tuple[bool, str]:
+    global LAST_DATA_OK, LAST_DATA_NOTE
     try:
         from market_data import ping_sources
-
         ok, note = ping_sources()
-        LAST_YF_OK = ok
-        LAST_YF_NOTE = note
+        LAST_DATA_OK = ok
+        LAST_DATA_NOTE = note
         return ok, note
     except Exception as exc:
-        LAST_YF_OK = False
-        LAST_YF_NOTE = str(exc)[:80]
-        return False, LAST_YF_NOTE
-
+        LAST_DATA_OK = False
+        LAST_DATA_NOTE = str(exc)[:120]
+        return False, LAST_DATA_NOTE
 
 def spy_day_change() -> str:
     try:
-        import yfinance as yf
-
-        df = yf.Ticker("SPY").history(period="5d", interval="1d", auto_adjust=True)
+        from market_data import fetch_intraday
+        df = fetch_intraday("SPY", interval="1d", period="5d")
         if df is None or len(df) < 2:
             return "SPY: غير متاح"
         last = float(df["Close"].iloc[-1])
@@ -245,7 +242,6 @@ def spy_day_change() -> str:
         return f"SPY: {last:.2f} ({chg:+.2f}%)"
     except Exception:
         return "SPY: غير متاح"
-
 
 def start_health_server() -> None:
     port = int(os.getenv("PORT", "10000"))
@@ -515,7 +511,7 @@ async def cmd_today(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 def health_text() -> str:
     global LAST_SCAN_AT
-    ok, note = ping_yahoo()
+    ok, note = ping_data_sources()
     up = now_ny() - BOT_STARTED
     hours = int(up.total_seconds() // 3600)
     mins = int((up.total_seconds() % 3600) // 60)

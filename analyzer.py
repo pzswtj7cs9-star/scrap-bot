@@ -30,7 +30,7 @@ from stocks import MAX_AUTO_PRICE
 
 log = logging.getLogger("halal-bot.daily")
 
-DAILY_ANALYZER_VERSION = "20260922-DATA-INTEGRITY-AUDIT-V2-PRICE-AUDIT"
+DAILY_ANALYZER_VERSION = "20260923-FINAL-END-TO-END-AUDIT-V3"
 log.info("DAILY ANALYZER VERSION | %s", DAILY_ANALYZER_VERSION)
 
 SKIP_OPEN_MIN = 0
@@ -331,6 +331,10 @@ class DailySignal:
     sma20: float = 0.0
     atr_pct: float = 0.0
     ext_sma20: float = 0.0
+    # Quality-only metrics: execution-frame volatility/extension. These do not
+    # replace the higher-timeframe regime metrics above.
+    quality_atr_pct: float = 0.0
+    quality_ext_pct: float = 0.0
     # سعر التنفيذ النهائي وقت قبول التنبيه؛ لا يغيّر سعر التحليل أو Stop/TP.
     alert_entry_price: float = 0.0
     h4_state: str = "محايد"
@@ -2080,7 +2084,7 @@ def _market_alignment(fetch_intraday) -> tuple[bool, str]:
                 e20 = float(_ema(c, 20).iloc[-1])
                 e50 = float(_ema(c, 50).iloc[-1])
                 p = float(c.iloc[-1])
-                vwap_series = _vwap(valid)
+                vwap_series = _vwap(valid.tail(20))
                 vwap = float(vwap_series.iloc[-1])
 
                 if not all(np.isfinite(x) for x in (e20, e50, p, vwap)) or vwap <= 0:
@@ -2245,7 +2249,7 @@ def _atr(df: pd.DataFrame, n: int = 14) -> pd.Series:
 
 
 def _vwap(df: pd.DataFrame) -> pd.Series:
-    """Daily anchored VWAP: rolling 20-bar volume-weighted typical price."""
+    """Rolling 20-session VWAP: volume-weighted typical price over the supplied bars."""
     tp = (df["High"].astype(float) + df["Low"].astype(float) + df["Close"].astype(float)) / 3
     vol = df["Volume"].astype(float).replace(0, np.nan)
     return (tp * vol).rolling(20, min_periods=5).sum() / vol.rolling(20, min_periods=5).sum()
@@ -2314,7 +2318,7 @@ def _find_prior_resistance(
 _QUOTE_CACHE: dict[str, tuple[datetime, dict]] = {}
 QUOTE_CACHE_SECONDS = 30
 def _quote_liquidity(symbol: str, price: float) -> dict:
-    """يومي: Bid/Ask من Alpaca فقط؛ لا نستخدم Yahoo كبديل للتنفيذ اليومي."""
+    """يومي: Bid/Ask من Alpaca فقط؛ لا نستخدم Twelve Data كبديل لبيانات Bid/Ask التنفيذية؛ التنفيذ يبقى من Alpaca فقط."""
     now = datetime.now(timezone.utc)
     cached = _QUOTE_CACHE.get(symbol)
     if cached:
@@ -2436,7 +2440,16 @@ def _daily_volume_ratio_time_of_day(symbol: str, fetch_intraday, now_ny) -> floa
     try:
         bars = fetch_intraday(symbol, interval="5m", period="30d")
         if bars is None or bars.empty or "Volume" not in bars.columns:
-            return float("nan")
+            log.warning("DAILY VOLUME NEUTRAL | %s | missing/empty 5m volume data", symbol)
+            return 1.0
+        try:
+            from market_data import intraday_data_fresh
+            _fresh_ok, _age_min = intraday_data_fresh(bars, "5m", 12.0)
+            if not _fresh_ok:
+                log.warning("DAILY VOLUME NEUTRAL | %s | 5m age=%.1fm>12m", symbol, float(_age_min))
+                return 1.0
+        except Exception as _fresh_exc:
+            log.debug("DAILY VOLUME FRESHNESS CHECK FAILED | %s | %s", symbol, _fresh_exc)
         df = bars.copy().sort_index()
         idx = pd.DatetimeIndex(df.index)
         if idx.tz is None:
@@ -2453,18 +2466,20 @@ def _daily_volume_ratio_time_of_day(symbol: str, fetch_intraday, now_ny) -> floa
         session_date = now.date()
         session_open = now.normalize() + pd.Timedelta(hours=9, minutes=30)
         if now < session_open:
-            return float("nan")
+            return 1.0
 
         # Use only regular-session bars through the current clock time.
         work = df[(df.index.time >= pd.Timestamp("09:30").time()) &
                   (df.index.time <= pd.Timestamp("16:00").time()) &
                   (df.index <= now)]
         if work.empty:
-            return float("nan")
+            log.warning("DAILY VOLUME NEUTRAL | %s | no regular-session bars through current time", symbol)
+            return 1.0
 
         current = work[work.index.date == session_date]["Volume"].sum()
         if current <= 0:
-            return float("nan")
+            log.warning("DAILY VOLUME INVALID | %s | current cumulative volume=%.4f", symbol, float(current))
+            return 0.0
 
         cutoff = now.time()
         prior = []
@@ -2479,12 +2494,16 @@ def _daily_volume_ratio_time_of_day(symbol: str, fetch_intraday, now_ny) -> floa
             prior.append(float(g["Volume"].sum()))
 
         if not prior:
-            return float("nan")
+            log.warning("DAILY VOLUME NEUTRAL | %s | no prior-session baseline", symbol)
+            return 1.0
         baseline = float(pd.Series(prior[-20:]).mean())
-        return float(current / baseline) if baseline > 0 and np.isfinite(baseline) and np.isfinite(current) else float("nan")
+        if baseline > 0 and np.isfinite(baseline) and np.isfinite(current):
+            return float(current / baseline)
+        log.warning("DAILY VOLUME NEUTRAL | %s | invalid baseline/current", symbol)
+        return 1.0
     except Exception as exc:
-        log.debug("DAILY time-of-day volume ratio fallback | %s | %s", symbol, exc)
-        return float("nan")
+        log.warning("DAILY VOLUME NEUTRAL | %s | exception=%s", symbol, exc)
+        return 1.0
 
 
 def _aligned_relative_strength_metrics(
@@ -2669,7 +2688,42 @@ def analyze_daily(
         weekly = fetch_intraday(symbol, interval="1wk", period="5y")
         daily = fetch_intraday(symbol, interval="1d", period="2y")
 
+    # Hard data-integrity gate: preloaded bulk frames are only an optimization.
+    # A stale frame must be reloaded through the unified Alpaca -> Twelve Data
+    # chain before ANY strategy calculation is allowed to consume it.
+    try:
+        from market_data import data_age_minutes
+        weekly_age = data_age_minutes(weekly)
+        daily_age = data_age_minutes(daily)
+        weekly_fresh = np.isfinite(weekly_age) and weekly_age <= (10.0 * 24.0 * 60.0)
+        daily_fresh = np.isfinite(daily_age) and daily_age <= (96.0 * 60.0)
+        if not weekly_fresh:
+            _daily_data_audit_record(symbol, f"1wk:stale(age={weekly_age:.1f}m>14400m)")
+            weekly = fetch_intraday(symbol, interval="1wk", period="5y")
+        if not daily_fresh:
+            _daily_data_audit_record(symbol, f"1d:stale(age={daily_age:.1f}m>5760m)")
+            daily = fetch_intraday(symbol, interval="1d", period="2y")
+    except Exception as exc:
+        _daily_data_audit_record(symbol, "daily_preloaded_freshness_exception")
+        log.warning("DAILY DATA FRESHNESS/RELOAD FAILED | %s | %s", symbol, str(exc))
+        return None
+
     if weekly is None or len(weekly) < 60 or daily is None or len(daily) < 80:
+        return None
+
+    # Re-check after any reload. fetch_intraday itself enforces freshness, but
+    # this keeps the analyzer safe even if a custom provider is substituted.
+    try:
+        from market_data import data_age_minutes
+        _wa = data_age_minutes(weekly)
+        _da = data_age_minutes(daily)
+        if not (np.isfinite(_wa) and _wa <= 10.0 * 24.0 * 60.0):
+            _daily_data_audit_record(symbol, f"1wk:stale_after_reload(age={_wa:.1f}m)")
+            return None
+        if not (np.isfinite(_da) and _da <= 96.0 * 60.0):
+            _daily_data_audit_record(symbol, f"1d:stale_after_reload(age={_da:.1f}m)")
+            return None
+    except Exception:
         return None
 
     # Daily bars can be current during regular session. The engine is deliberately
@@ -2679,6 +2733,9 @@ def analyze_daily(
     # During the regular session the latest daily bar is still forming.
     # Structural breakout/continuation triggers use the latest CLOSED candle.
     closed_idx = -2 if is_us_regular_session(now_ny()) and len(today_d) >= 2 else -1
+    # Convert the negative closed-candle index to a positive slice endpoint.
+    # This avoids iloc[:0] after the session has closed when closed_idx == -1.
+    closed_end_pos = (len(today_d) + closed_idx) if closed_idx < 0 else closed_idx
     closed_prev_idx = closed_idx - 1 if abs(closed_idx) <= len(today_d) - 1 else -2
     try:
         h4_60m = fetch_intraday(symbol, interval="60m", period="60d")
@@ -2723,7 +2780,7 @@ def analyze_daily(
     prev_close = float(prev_days["Close"].iloc[-1]) if not prev_days.empty else price
     change_pct = (price - prev_close) / prev_close * 100 if prev_close else 0.0
 
-    vwap_s = _vwap(today_d)
+    vwap_s = _vwap(today_d.tail(20))
     vwap_last = float(vwap_s.iloc[-1]) if pd.notna(vwap_s.iloc[-1]) else price
     above_vwap = price >= vwap_last
     vwap_note = "فوق VWAP 20 يوم" if above_vwap else "تحت VWAP 20 يوم"
@@ -2748,10 +2805,10 @@ def analyze_daily(
     c5 = today_d["Close"]
     e5 = float(_ema(c5, 20).iloc[-1])
     r5 = float(_rsi(c5, 14).iloc[-1])
-    _closed_d = today_d.iloc[:closed_idx + 1].copy()
+    _closed_d = today_d.iloc[:closed_end_pos + 1].copy()
     _closed_c5 = _closed_d["Close"].astype(float)
     e5_closed = float(_ema(_closed_c5, 20).iloc[-1]) if len(_closed_c5) else e5
-    vwap_closed_s = _vwap(_closed_d)
+    vwap_closed_s = _vwap(_closed_d.tail(20))
     vwap_last_closed = float(vwap_closed_s.iloc[-1]) if len(vwap_closed_s) and pd.notna(vwap_closed_s.iloc[-1]) else vwap_last
     last_green = float(today_d["Close"].iloc[closed_idx]) >= float(today_d["Open"].iloc[closed_idx])
     mom = (price - float(c5.iloc[-6])) / float(c5.iloc[-6]) * 100 if len(c5) >= 6 else 0.0
@@ -2832,7 +2889,7 @@ def analyze_daily(
     recent4 = today_d.iloc[max(0, closed_idx - 4):closed_idx]
     vwap_touch = False
     try:
-        vwap_touch = bool((recent4["Low"].astype(float) <= vwap_last * 1.006).any())
+        vwap_touch = bool((recent4["Low"].astype(float) <= vwap_last_closed * 1.006).any())
     except Exception:
         vwap_touch = False
     vwap_bounce = bool(vwap_touch and closed_close >= vwap_last_closed * 1.001)
@@ -3125,7 +3182,7 @@ def analyze_daily(
     abc_continuation = False
     try:
         if len(today_d) >= 9:
-            closed_today_d = today_d.iloc[:closed_idx + 1]
+            closed_today_d = today_d.iloc[:closed_end_pos + 1]
             a = closed_today_d.iloc[-9:-6]
             b = closed_today_d.iloc[-6:-3]
             c = closed_today_d.iloc[-3:]
@@ -3182,6 +3239,11 @@ def analyze_daily(
         try:
             spy60 = fetch_intraday("SPY", interval="60m", period="10d")
             qqq60 = fetch_intraday("QQQ", interval="60m", period="10d")
+            from market_data import intraday_data_fresh
+            _spy_fresh, _spy_age = intraday_data_fresh(spy60, "60m", 90.0)
+            _qqq_fresh, _qqq_age = intraday_data_fresh(qqq60, "60m", 90.0)
+            if not (_spy_fresh and _qqq_fresh):
+                raise ValueError(f"RS benchmark stale: SPY={float(_spy_age):.1f}m, QQQ={float(_qqq_age):.1f}m")
             rs_vs_spy, rs_vs_qqq, rs_persistence, _rs_stock_return, _rs_valid = _aligned_relative_strength_metrics(
                 new_setup_df, spy60, qqq60, lookback=3, persistence_bars=3
             )
@@ -3210,7 +3272,7 @@ def analyze_daily(
     # improving price action and no already-confirmed strategy trigger.
     early = False
     try:
-        recent3 = today_d.iloc[:closed_idx + 1].tail(3)
+        recent3 = today_d.iloc[:closed_end_pos + 1].tail(3)
         early_range = (float(recent3["High"].max()) - float(recent3["Low"].min())) / max(price, 1e-9) * 100
         early_near_resistance = level_high > 0 and abs(price - level_high) / max(price, 1e-9) * 100 <= 1.5
         early_holding = float(recent3["Close"].iloc[-1]) >= float(recent3["Close"].iloc[0])
@@ -3371,7 +3433,7 @@ def analyze_daily(
             add("لم يحدث لمس EMA20", v("ema_touch", False))
             try:
                 # Audit mirrors the EMA20 Core trigger: latest completed candle close.
-                p, ema = float(v("closed_close", 0.0) or 0.0), float(v("e5", v("e20", 0.0)) or 0.0)
+                p, ema = float(v("closed_close", 0.0) or 0.0), float(v("e5_closed", v("e5", v("e20", 0.0))) or 0.0)
                 add("لم تتم استعادة EMA20", ema > 0 and p >= ema * 1.001)
             except Exception: add("تعذر فحص استعادة EMA20", False)
             common(mom_min=0.05, vol_min=1.0, trend=False, vwap=False, opening=False, green=True, market=False, state=True, no_failed=True)
@@ -3658,19 +3720,6 @@ def analyze_daily(
         # A Core component is NEVER reused in Confirmation. Confirmation can
         # validate the quality of the already-matched setup, but it cannot
         # award points again for the event that created the match.
-        def _bar_quality(df):
-            try:
-                if df is None or len(df) < 1:
-                    return 0.0, 0.0
-                b = df.iloc[-1]
-                o, h, l, cc = map(float, (b["Open"], b["High"], b["Low"], b["Close"]))
-                rng = max(h - l, 1e-9)
-                body = abs(cc - o) / rng
-                close_pos = (cc - l) / rng
-                return clip(body * 0.55 + close_pos * 0.45), clip(close_pos * 100.0)
-            except Exception:
-                return 0.0, 0.0
-
         _df = None
         try:
             _raw_df = strategy_closed_df
@@ -3679,7 +3728,6 @@ def analyze_daily(
             _df = _raw_df.iloc[:_cp + 1].copy() if _raw_df is not None and _cp >= 0 else _raw_df
         except Exception:
             _df = c.get("today_d")
-        _bar_q, _close_pos = _bar_quality(_df)
         _vol = clip((vr - 0.90) / 0.60 * 100)
         _trend = 100.0 if bool(c.get("trend_up", False)) else 0.0
         _vwap = 100.0 if bool(c.get("above_vwap", False)) else 0.0
@@ -3848,7 +3896,7 @@ def analyze_daily(
         contract=_range_contraction()
         atr=_median_range(8)
         level=float(c.get("level_high",0.0) or 0.0)
-        vwap_level=float(c.get("vwap_last",0.0) or 0.0)
+        vwap_level=float(c.get("vwap_last_closed", c.get("vwap_last",0.0)) or 0.0)
         ema_level=float(c.get("e20",c.get("e5",0.0)) or 0.0)
         orb_level=float(c.get("orb_high",0.0) or 0.0)
         hod_level=float(c.get("hod_level",0.0) or 0.0)
@@ -4447,6 +4495,20 @@ def analyze_daily(
 
     atr = float(_atr(weekly, 14).iloc[-1] or price * 0.01)
     atr_pct = atr / price * 100
+
+    # QUALITY FIX: daily Quality uses the DAILY execution frame, never the weekly
+    # regime frame. Only completed daily bars are used. Stage-1 already requires
+    # sufficient daily history, so there is no valid fallback to weekly ATR/EMA.
+    _quality_daily = today_d.iloc[:closed_end_pos + 1].copy()
+    _quality_daily_close = _quality_daily["Close"].astype(float)
+    _quality_e20 = float(_ema(_quality_daily_close, 20).iloc[-1]) if len(_quality_daily_close) else float(e5_closed or price)
+    _quality_atr_series = _atr(_quality_daily, 14)
+    _quality_atr_value = float(_quality_atr_series.iloc[-1]) if len(_quality_atr_series) and pd.notna(_quality_atr_series.iloc[-1]) else 0.0
+    quality_ext_pct = ((price - _quality_e20) / _quality_e20 * 100.0) if _quality_e20 else 0.0
+    quality_atr_pct = (_quality_atr_value / price * 100.0) if price and _quality_atr_value > 0 else 0.0
+    quality_atr_ready = bool(_quality_atr_value > 0)
+    quality_min_tp1_r = float(EXIT_TP_MIN_R)
+
     market_regime = _classify_regime(
         trend_up, h4_state, chop, market_ok, atr_pct, news_state
     )
@@ -4621,8 +4683,8 @@ def analyze_daily(
     quality_ok = (
         (not dump)
         and (not failed)
-        and ext <= 8.0
-        and atr_pct <= 8.0
+        and quality_ext_pct <= 8.0
+        and (not quality_atr_ready or quality_atr_pct <= 8.0)
         and vol_ratio >= float(policy.get("min_volume_ratio", 0.85))
         and not chop
         and news_momentum_ok
@@ -4630,7 +4692,8 @@ def analyze_daily(
         and market_permission
     )
 
-    recent_low = float(today_d["Low"].tail(12).min())
+    _closed_quality_lows = _quality_daily["Low"].astype(float) if len(_quality_daily) else today_d["Low"].astype(float)
+    recent_low = float(_closed_quality_lows.tail(12).min())
 
     # Structure-aware daily stop. The stop is placed behind the structure
     # that actually justifies the entry, then constrained to a practical
@@ -4639,9 +4702,9 @@ def analyze_daily(
     # references are fallback-only and never compete with the strategy stop.
     strategy_stop = 0.0
     if entry_type == "ارتداد VWAP":
-        strategy_stop = float(today_d["Low"].iloc[max(0, closed_idx - 4):closed_idx].min()) * 0.997 if closed_idx > 0 else vwap_last * 0.997
+        strategy_stop = float(today_d["Low"].iloc[max(0, closed_idx - 4):closed_idx + 1].min()) * 0.997 if closed_idx > 0 else vwap_last * 0.997
     elif entry_type == "ارتداد EMA20":
-        strategy_stop = float(today_d["Low"].iloc[max(0, closed_idx - 4):closed_idx].min()) * 0.997 if closed_idx > 0 else e5 * 0.997
+        strategy_stop = float(today_d["Low"].iloc[max(0, closed_idx - 4):closed_idx + 1].min()) * 0.997 if closed_idx > 0 else e5 * 0.997
     elif entry_type in {"سحب سيولة", "سحب سيولة مع Displacement"}:
         sweep_extreme = float(today_d["Low"].iloc[max(0, closed_idx - 3):closed_idx].min()) if closed_idx > 0 else 0.0
         strategy_stop = sweep_extreme * 0.997 if sweep_extreme > 0 else (support_level * 0.997 if support_level > 0 else recent_low * 0.997)
@@ -4661,28 +4724,29 @@ def analyze_daily(
         strategy_stop = float(_setup_lows.tail(3).min()) * 0.997
     elif entry_type == "دخول مبكر":
         try:
-            strategy_stop = float(today_d["Low"].tail(3).min()) * 0.997
+            strategy_stop = float(_closed_quality_lows.tail(3).min()) * 0.997
         except Exception:
             strategy_stop = recent_low * 0.997
     elif entry_type == "علم صاعد":
-        strategy_stop = float(flag["Low"].min()) * 0.997 if "flag" in locals() and len(flag) else float(today_d["Low"].tail(5).min()) * 0.997
+        strategy_stop = float(flag["Low"].min()) * 0.997 if "flag" in locals() and len(flag) else float(_closed_quality_lows.tail(5).min()) * 0.997
     elif entry_type == "استعادة مستوى":
         strategy_stop = reclaim_level * 0.997 if reclaim_level > 0 else recent_low * 0.997
     elif entry_type == "استعادة بعد فشل ORB":
         strategy_stop = float(post_orb["Low"].min()) * 0.997 if "post_orb" in locals() and len(post_orb) else (orb_high * 0.997 if orb_high > 0 else recent_low * 0.997)
     elif entry_type == "استمرار ABC":
-        strategy_stop = float(b["Low"].min()) * 0.997 if "b" in locals() and len(b) else float(today_d["Low"].tail(4).min()) * 0.997
+        strategy_stop = float(b["Low"].min()) * 0.997 if "b" in locals() and len(b) else float(_closed_quality_lows.tail(4).min()) * 0.997
     elif entry_type == "دخول بعد Opening Drive":
         strategy_stop = drive_level * 0.997 if drive_level > 0 else recent_low * 0.997
     elif entry_type == "استعادة قمة اليوم":
         strategy_stop = float(prior["Low"].min()) * 0.997 if "prior" in locals() and len(prior) else (hod_level * 0.997 if hod_level > 0 else recent_low * 0.997)
     elif entry_type in {"ضغط ثم انفجار", "استمرار الزخم"}:
-        strategy_stop = float(today_d["Low"].tail(5).min()) * 0.997
+        strategy_stop = float(_closed_quality_lows.tail(5).min()) * 0.997
 
     if np.isfinite(float(strategy_stop)) and 0 < float(strategy_stop) < price:
         structural_stop = float(strategy_stop)
     else:
-        fallback_stops = [float(price - 1.5 * atr), float(recent_low * 0.997)]
+        _fallback_atr = _quality_atr_value if _quality_atr_value > 0 else price * 0.01
+        fallback_stops = [float(price - 1.5 * _fallback_atr), float(recent_low * 0.997)]
         valid_fallback_stops = [x for x in fallback_stops if np.isfinite(x) and 0 < x < price]
         structural_stop = max(valid_fallback_stops) if valid_fallback_stops else price * 0.985
     stop = structural_stop
@@ -4752,7 +4816,10 @@ def analyze_daily(
     if tp1_distance_pct < 0.8:
         quality_ok = False
         warnings.append("TP1 قريب جدًا من الدخول")
-    if reward_r + 1e-9 < float(policy.get("min_tp1_r", 1.2)):
+    # Quality baseline is fixed at the same 1.20R floor used by the TP1
+    # constructor. Adaptive policy values must not retroactively tighten the
+    # baseline Quality Gate while exit_active is false.
+    if reward_r + 1e-9 < quality_min_tp1_r:
         quality_ok = False
         warnings.append("العائد إلى TP1 ضعيف")
     if news_state == "positive_strong" and news_momentum_ok:
@@ -4777,8 +4844,8 @@ def analyze_daily(
         and raw_score >= 97.0
         and not dump
         and not failed
-        and ext <= 5.0
-        and atr_pct <= 8.0
+        and quality_ext_pct <= 5.0
+        and (not quality_atr_ready or quality_atr_pct <= 8.0)
         and vol_ratio >= max(1.25, float(policy.get("min_volume_ratio", 0.85)))
         and not chop
         and news_momentum_ok
@@ -4786,7 +4853,7 @@ def analyze_daily(
         and risk <= price * (DAILY_MAX_RISK_PCT / 100.0)
         and tp1 > price
         and tp1_distance_pct >= 0.8
-        and reward_r >= float(policy.get("min_tp1_r", 1.2))
+        and reward_r >= quality_min_tp1_r
     )
     # The weak-market override may bypass ONLY the market blocker. It must
     # never erase another quality failure (wide stop, volume, chop, failed
@@ -4794,8 +4861,8 @@ def analyze_daily(
     non_market_quality_ok = bool(
         (not dump)
         and (not failed)
-        and ext <= 8.0
-        and atr_pct <= 8.0
+        and quality_ext_pct <= 8.0
+        and (not quality_atr_ready or quality_atr_pct <= 8.0)
         and vol_ratio >= float(policy.get("min_volume_ratio", 0.85))
         and not chop
         and news_momentum_ok
@@ -4826,9 +4893,9 @@ def analyze_daily(
         quality_reasons.append("dump")
     if failed:
         quality_reasons.append("failed_breakout")
-    if ext > 8.0:
+    if quality_ext_pct > 8.0:
         quality_reasons.append(f"extension>{8.0:.0f}%")
-    if atr_pct > 8.0:
+    if quality_atr_ready and quality_atr_pct > 8.0:
         quality_reasons.append(f"atr>{8.0:.0f}%")
     if vol_ratio < float(policy.get("min_volume_ratio", 0.85)):
         quality_reasons.append("volume")
@@ -4855,7 +4922,7 @@ def analyze_daily(
         quality_reasons.append("invalid_tp1")
     if tp1_distance_pct < 0.8:
         quality_reasons.append("tp1_too_close")
-    if reward_r < float(policy.get("min_tp1_r", 1.2)):
+    if reward_r < quality_min_tp1_r:
         quality_reasons.append("weak_tp1_r")
 
     return DailySignal(
@@ -4888,6 +4955,8 @@ def analyze_daily(
         sma20=round(e20, 4),
         atr_pct=round(atr_pct, 2),
         ext_sma20=round(ext, 2),
+        quality_atr_pct=round(quality_atr_pct, 2),
+        quality_ext_pct=round(quality_ext_pct, 2),
         alert_entry_price=0.0,
         entry_type=entry_type,
         entry_emoji=entry_emoji,
@@ -4971,7 +5040,7 @@ def _daily_strategy_route_scores(*, price: float, trend: bool, above_vwap: bool,
     """Cheap Stage-1 routing proxies for all canonical daily strategies. Exact gates remain in analyze_daily."""
     dc=daily["Close"].astype(float); op=daily["Open"].astype(float); hi=daily["High"].astype(float); lo=daily["Low"].astype(float)
     prev_close=float(dc.iloc[-2]) if len(dc)>=2 else float(op.iloc[-1]); last_high=float(hi.iloc[-1]); last_low=float(lo.iloc[-1])
-    vw_s=_vwap(daily.tail(60)); vw=float(vw_s.iloc[-1]) if pd.notna(vw_s.iloc[-1]) else price
+    vw_s=_vwap(daily.tail(20)); vw=float(vw_s.iloc[-1]) if pd.notna(vw_s.iloc[-1]) else price
     e20=float(_ema(dc,20).iloc[-1]); recent_high=float(hi.tail(20).max()); recent_low=float(lo.tail(20).min())
     near_high=abs(price-recent_high)/max(price,1e-9)*100<=1.0; near_vwap=abs(price-vw)/max(price,1e-9)*100<=1.0; near_ema=abs(price-e20)/max(price,1e-9)*100<=1.0
     breakout=price>=max(float(hi.iloc[-2]) if len(hi)>=2 else recent_high,recent_high*0.995); reclaim=price>=recent_high*0.998 and prev_close<recent_high*0.998
@@ -5061,14 +5130,14 @@ def _prefilter_daily(symbol: str, audit_counts: dict[str, int] | None = None, au
         de20 = float(_ema(dc,20).iloc[-1]); de50 = float(_ema(dc,50).iloc[-1])
         wrsi = float(_rsi(wc,14).iloc[-1]); drsi = float(_rsi(dc,14).iloc[-1])
         trend = price >= we20 * 0.99 and we20 >= we50 * 0.995 and drsi >= 42
-        v = _vwap(daily.tail(60)); vw = float(v.iloc[-1]) if pd.notna(v.iloc[-1]) else price
+        v = _vwap(daily.tail(20)); vw = float(v.iloc[-1]) if pd.notna(v.iloc[-1]) else price
         above_vwap = price >= vw * 0.995
         above_open = price >= float(daily["Open"].iloc[-1]) * 0.995
         vol_ratio = _daily_volume_ratio_time_of_day(symbol, fetch_intraday, now_ny())
         if not np.isfinite(vol_ratio):
-            _audit_stage1("volume_data_unavailable")
-            _audit_data("volume_data_unavailable")
-            return None
+            vol_ratio = 1.0
+            _audit_stage1("volume_data_neutral")
+            _audit_data("volume_data_neutral")
         mom = (price - float(dc.iloc[-6])) / max(float(dc.iloc[-6]),1e-9) * 100 if len(dc)>=6 else 0.0
         route = 0.0
         route += 3.0 if trend else 0.0
@@ -5109,7 +5178,19 @@ def _prefilter_daily_from_frames(symbol: str, weekly: pd.DataFrame, daily: pd.Da
         else:
             _daily_bump(data_audit_counts, reason)
     try:
-        from market_data import fetch_intraday
+        from market_data import fetch_intraday, data_age_minutes
+        # Bulk frames are an optimization only. Never route stale data into
+        # Stage 1; reload the affected timeframe through Alpaca -> Twelve Data.
+        if weekly is not None:
+            _wa = data_age_minutes(weekly)
+            if not (np.isfinite(_wa) and _wa <= 10.0 * 24.0 * 60.0):
+                _audit_data(f"1wk:stale(age={_wa:.1f}m>14400m)")
+                weekly = fetch_intraday(symbol, interval="1wk", period="5y")
+        if daily is not None:
+            _da = data_age_minutes(daily)
+            if not (np.isfinite(_da) and _da <= 96.0 * 60.0):
+                _audit_data(f"1d:stale(age={_da:.1f}m>5760m)")
+                daily = fetch_intraday(symbol, interval="1d", period="2y")
         if weekly is None or daily is None or len(weekly) < 60 or len(daily) < 80:
             if weekly is None:
                 _audit_stage1("weekly_missing"); _audit_data("weekly_missing")
@@ -5141,14 +5222,14 @@ def _prefilter_daily_from_frames(symbol: str, weekly: pd.DataFrame, daily: pd.Da
         we20 = float(_ema(wc,20).iloc[-1]); we50 = float(_ema(wc,50).iloc[-1])
         wrsi = float(_rsi(wc,14).iloc[-1]); drsi = float(_rsi(dc,14).iloc[-1])
         trend = price >= we20 * 0.99 and we20 >= we50 * 0.995 and drsi >= 42
-        v = _vwap(daily.tail(60)); vw = float(v.iloc[-1]) if pd.notna(v.iloc[-1]) else price
+        v = _vwap(daily.tail(20)); vw = float(v.iloc[-1]) if pd.notna(v.iloc[-1]) else price
         above_vwap = price >= vw * 0.995
         above_open = price >= float(daily["Open"].iloc[-1]) * 0.995
         vol_ratio = _daily_volume_ratio_time_of_day(symbol, fetch_intraday, now_ny())
         if not np.isfinite(vol_ratio):
-            _audit_stage1("volume_data_unavailable")
-            _audit_data("volume_data_unavailable")
-            return None
+            vol_ratio = 1.0
+            _audit_stage1("volume_data_neutral")
+            _audit_data("volume_data_neutral")
         mom = (price - float(dc.iloc[-6])) / max(float(dc.iloc[-6]),1e-9) * 100 if len(dc)>=6 else 0.0
         route = (3.0 if trend else 0.0) + (2.0 if above_vwap else 0.0) + (1.5 if above_open else 0.0)
         route += min(2.5,max(0.0,mom)) + min(2.0,max(0.0,vol_ratio-0.75)*2.0) + (1.0 if we20 > we50 else 0.0)
@@ -5351,8 +5432,11 @@ def scan_daily(
                 stage2_rejects["quality"] += 1
                 qreasons = getattr(sig, "quality_reasons", None) or []
                 log.info(
-                    "DAILY QUALITY REJECT | %s | score=%s | reasons=%s | ext=%.2f%% | atr=%.2f%% | vol=%.2fx | h4=%s | market=%s | tp1R=%.2f",
+                    "DAILY QUALITY REJECT | %s | score=%s | reasons=%s | q_ext=%.2f%% | q_atr=%.2f%% | q_atr_ready=%s | regime_ext=%.2f%% | regime_atr=%.2f%% | vol=%.2fx | h4=%s | market=%s | tp1R=%.2f",
                     sig.symbol, sig.score, qreasons or ["unspecified"],
+                    float(getattr(sig, "quality_ext_pct", 0) or 0),
+                    float(getattr(sig, "quality_atr_pct", 0) or 0),
+                    float(getattr(sig, "quality_atr_pct", 0) or 0) > 0,
                     float(getattr(sig, "ext_sma20", 0) or 0),
                     float(getattr(sig, "atr_pct", 0) or 0),
                     float(getattr(sig, "volume_ratio", 0) or 0),

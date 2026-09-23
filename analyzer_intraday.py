@@ -30,7 +30,7 @@ from stocks import MAX_AUTO_PRICE
 log = logging.getLogger(__name__)
 
 # Deployment marker: proves which analyzer_intraday build Render actually loaded.
-INTRADAY_ANALYZER_VERSION = "20260921-210000-FINAL-AUDIT-VWAP-EARLYFIX6-CUMULATIVE"
+INTRADAY_ANALYZER_VERSION = "20260923-FINAL-END-TO-END-AUDIT-V3"
 log.info("INTRADAY ANALYZER VERSION | %s", INTRADAY_ANALYZER_VERSION)
 
 SKIP_OPEN_MIN = 20
@@ -305,6 +305,10 @@ class IntradaySignal:
     sma20: float = 0.0
     atr_pct: float = 0.0
     ext_sma20: float = 0.0
+    # Quality-only metrics: execution-frame volatility/extension. These do not
+    # replace the H1 regime metrics above.
+    quality_atr_pct: float = 0.0
+    quality_ext_pct: float = 0.0
     # سعر الدخول الفعلي وقت إرسال التنبيه؛ لا يغيّر سعر التحليل الأصلي
     alert_entry_price: float = 0.0
     m15_state: str = "محايد"
@@ -1984,6 +1988,15 @@ def _market_relative_returns(fetch_intraday) -> tuple[float | None, float | None
             if d is None or len(d) < 6:
                 log.warning("INTRADAY RELATIVE MARKET INCOMPLETE | %s | insufficient bars", sym)
                 continue
+            try:
+                from market_data import intraday_data_fresh
+                _fresh_ok, _age_min = intraday_data_fresh(d, "5m", 12.0)
+                if not _fresh_ok:
+                    log.warning("INTRADAY RELATIVE MARKET STALE | %s | age=%.1fm>12m", sym, float(_age_min))
+                    continue
+            except Exception as _fresh_exc:
+                log.warning("INTRADAY RELATIVE MARKET FRESHNESS CHECK FAILED | %s | %s", sym, _fresh_exc)
+                continue
             day = d.index[-1].date()
             cur = d[d.index.date == day]
             prev = d[d.index.date < day]
@@ -2022,6 +2035,13 @@ def _market_alignment(fetch_intraday) -> tuple[bool, str]:
                 d = fetch_intraday(sym, interval="5m", period="2d")
                 if d is None or len(d) < 20:
                     raise ValueError("market data unavailable/incomplete")
+                try:
+                    from market_data import intraday_data_fresh
+                    _fresh_ok, _age_min = intraday_data_fresh(d, "5m", 12.0)
+                    if not _fresh_ok:
+                        raise ValueError(f"market data stale: age={float(_age_min):.1f}m > 12m")
+                except ImportError:
+                    raise
                 day = d.index[-1].date()
                 cur = d[d.index.date == day]
                 if len(cur) < 6:
@@ -2079,7 +2099,7 @@ def session_window_ok(dt=None) -> tuple[bool, str]:
     close_cut = time(15, 40)
     if t < open_ok_after:
         return False, "داخل أول 20 دقيقة — ضجيج افتتاح"
-    if t > close_cut:
+    if t >= close_cut:
         return False, "آخر 20 دقيقة — تجنب التبييت"
     if t < REGULAR_OPEN or t > REGULAR_CLOSE:
         return False, "خارج الجلسة النظامية"
@@ -2231,7 +2251,7 @@ def _find_prior_resistance(
 _QUOTE_CACHE: dict[str, tuple[datetime, dict]] = {}
 QUOTE_CACHE_SECONDS = 30
 def _quote_liquidity(symbol: str, price: float) -> dict:
-    """لحظي: Bid/Ask من Alpaca فقط؛ لا نستخدم Yahoo كبديل للتنفيذ اللحظي."""
+    """لحظي: Bid/Ask من Alpaca فقط؛ لا نستخدم Twelve Data كبديل لبيانات Bid/Ask التنفيذية؛ التنفيذ يبقى من Alpaca فقط."""
     now = datetime.now(timezone.utc)
     cached = _QUOTE_CACHE.get(symbol)
     if cached:
@@ -2559,7 +2579,7 @@ def analyze_intraday(
     above_open = price >= day_open
 
     hist_5 = m5[m5.index.date < last_day]
-    vol_session_ratio = _intraday_volume_ratio(today_5, hist_5, max_days=20)
+    vol_session_ratio = _intraday_volume_ratio(_closed_d, hist_5, max_days=20)
     vol_session_ok = vol_session_ratio >= 0.90
 
     hc = h1["Close"]
@@ -2695,7 +2715,7 @@ def analyze_intraday(
     try:
         rh = recent4["High"].astype(float)
         rl = recent4["Low"].astype(float)
-        vwap_touch = bool(((rl <= vwap_last * 1.006) & (rh >= vwap_last * 0.994)).any())
+        vwap_touch = bool(((rl <= vwap_last_closed * 1.006) & (rh >= vwap_last_closed * 0.994)).any())
     except Exception:
         vwap_touch = False
     vwap_bounce = bool(vwap_touch and closed_close >= vwap_last_closed * 1.001)
@@ -2977,6 +2997,11 @@ def analyze_intraday(
         try:
             spy5 = fetch_intraday("SPY", interval="5m", period="2d")
             qqq5 = fetch_intraday("QQQ", interval="5m", period="2d")
+            from market_data import intraday_data_fresh
+            _spy_fresh, _spy_age = intraday_data_fresh(spy5, "5m", 12.0)
+            _qqq_fresh, _qqq_age = intraday_data_fresh(qqq5, "5m", 12.0)
+            if not (_spy_fresh and _qqq_fresh):
+                raise ValueError(f"RS benchmark stale: SPY={float(_spy_age):.1f}m, QQQ={float(_qqq_age):.1f}m")
             rs_vs_spy, rs_vs_qqq, rs_persistence, _rs_stock_return, _rs_valid = _aligned_relative_strength_metrics(
                 today_5.iloc[:closed_idx + 1], spy5, qqq5, lookback=5, persistence_bars=5
             )
@@ -3155,7 +3180,7 @@ def analyze_intraday(
             add("لم يحدث لمس EMA20", v("ema_touch", False))
             try:
                 # Audit mirrors the EMA20 Core trigger: latest completed candle close.
-                p, ema = float(v("closed_close", 0.0) or 0.0), float(v("e5", v("e20", 0.0)) or 0.0)
+                p, ema = float(v("closed_close", 0.0) or 0.0), float(v("e5_closed", v("e5", v("e20", 0.0))) or 0.0)
                 add("لم تتم استعادة EMA20", ema > 0 and p >= ema * 1.001)
             except Exception: add("تعذر فحص استعادة EMA20", False)
             common(mom_min=0.05, vol_min=1.0, trend=False, vwap=False, opening=False, green=True, market=False, state=True, no_failed=True)
@@ -3298,7 +3323,7 @@ def analyze_intraday(
             q = 0.30*touch + 0.30*reclaim + 0.20*(100 if green else 0) + 0.10*clip((mom-0.05)/0.20*100) + 0.10*clip((vr-0.9)/0.6*100)
         elif name == "ارتداد EMA20":
             touch = 100 if c.get("ema_touch", False) else 0
-            ema = float(c.get("e20", 0.0) or 0.0)
+            ema = float(c.get("e5_closed", c.get("e5", c.get("e20", 0.0))) or 0.0)
             reclaim = clip((price_v/max(ema,1e-9)-1.001)/0.004*100) if ema > 0 else 0
             q = 0.30*touch + 0.30*reclaim + 0.20*(100 if green else 0) + 0.10*(100 if mstate == "داعم" else 0) + 0.10*clip((vr-0.9)/0.6*100)
         elif name == "سحب سيولة":
@@ -3655,7 +3680,7 @@ def analyze_intraday(
         contract=_range_contraction()
         atr=_median_range(8)
         level=float(c.get("level_high",0.0) or 0.0)
-        vwap_level=float(c.get("vwap_last",0.0) or 0.0)
+        vwap_level=float(c.get("vwap_last_closed", c.get("vwap_last",0.0)) or 0.0)
         ema_level=float(c.get("e20",c.get("e5",0.0)) or 0.0)
         orb_level=float(c.get("orb_high",0.0) or 0.0)
         hod_level=float(c.get("hod_level",0.0) or 0.0)
@@ -4235,6 +4260,22 @@ def analyze_intraday(
 
     atr = float(_atr(h1, 14).iloc[-1] or price * 0.01)
     atr_pct = atr / price * 100
+
+    # QUALITY FIX: intraday Quality uses the 5m execution frame, never H1.
+    # Only completed 5m candles are used. Until ATR(14) is actually ready in
+    # today's session, ATR cannot reject a setup; other safety gates remain active.
+    _quality_m5 = m5.copy()
+    if is_us_regular_session(now_ny()) and len(_quality_m5) > 1:
+        _quality_m5 = _quality_m5.iloc[:-1].copy()
+    _quality_m5_close = _quality_m5["Close"].astype(float)
+    _quality_e20 = float(_ema(_quality_m5_close, 20).iloc[-1]) if len(_quality_m5_close) else float(e5_closed or price)
+    _quality_atr_series = _atr(_quality_m5, 14)
+    _quality_atr_value = float(_quality_atr_series.iloc[-1]) if len(_quality_atr_series) and pd.notna(_quality_atr_series.iloc[-1]) else 0.0
+    quality_ext_pct = ((price - _quality_e20) / _quality_e20 * 100.0) if _quality_e20 else 0.0
+    quality_atr_pct = (_quality_atr_value / price * 100.0) if price and _quality_atr_value > 0 else 0.0
+    quality_atr_ready = bool(_quality_atr_value > 0)
+    quality_min_tp1_r = float(EXIT_TP_MIN_R)
+
     market_regime = _classify_regime(
         trend_up, m15_state, chop, market_ok, atr_pct, news_state, market_condition
     )
@@ -4390,8 +4431,8 @@ def analyze_intraday(
     quality_ok = (
         (not dump)
         and (not failed)
-        and ext <= 4.5
-        and atr_pct <= 6.5
+        and quality_ext_pct <= 4.5
+        and (not quality_atr_ready or quality_atr_pct <= 6.5)
         and vol_session_ratio >= float(policy.get("min_volume_ratio", 0.85))
         and not chop
         and news_momentum_ok
@@ -4399,7 +4440,8 @@ def analyze_intraday(
         and market_permission
     )
 
-    recent_low = float(today_5["Low"].tail(12).min())
+    _closed_quality_lows = _quality_m5["Low"].astype(float) if len(_quality_m5) else today_5["Low"].astype(float)
+    recent_low = float(_closed_quality_lows.tail(12).min())
 
     # Structure-aware intraday stop. The stop is placed behind the structure
     # that actually justifies the entry, then constrained to a practical
@@ -4408,9 +4450,9 @@ def analyze_intraday(
     # references are fallback-only and never compete with the strategy stop.
     strategy_stop = 0.0
     if entry_type == "ارتداد VWAP":
-        strategy_stop = float(today_5["Low"].iloc[max(0, closed_idx - 4):closed_idx].min()) * 0.997 if closed_idx > 0 else vwap_last * 0.997
+        strategy_stop = float(today_5["Low"].iloc[max(0, closed_idx - 4):closed_idx + 1].min()) * 0.997 if closed_idx > 0 else vwap_last * 0.997
     elif entry_type == "ارتداد EMA20":
-        strategy_stop = float(today_5["Low"].iloc[max(0, closed_idx - 4):closed_idx].min()) * 0.997 if closed_idx > 0 else e5 * 0.997
+        strategy_stop = float(today_5["Low"].iloc[max(0, closed_idx - 4):closed_idx + 1].min()) * 0.997 if closed_idx > 0 else e5 * 0.997
     elif entry_type in {"سحب سيولة", "سحب سيولة مع Displacement"}:
         sweep_extreme = float(today_5["Low"].iloc[max(0, closed_idx - 3):closed_idx].min()) if closed_idx > 0 else 0.0
         strategy_stop = sweep_extreme * 0.997 if sweep_extreme > 0 else (support_level * 0.997 if support_level > 0 else recent_low * 0.997)
@@ -4421,35 +4463,36 @@ def analyze_intraday(
     elif entry_type == "إعادة اختبار":
         strategy_stop = level_high * 0.997 if level_high > 0 else 0.0
     elif entry_type == "استمرار/استعادة الفجوة":
-        strategy_stop = gap_mid * 0.997 if gap_mid > 0 else float(today_5["Low"].tail(4).min()) * 0.997
+        strategy_stop = gap_mid * 0.997 if gap_mid > 0 else float(_closed_quality_lows.tail(4).min()) * 0.997
     elif entry_type == "استعادة بعد فشل كسر دعم":
         strategy_stop = failed_breakdown_low * 0.997 if failed_breakdown_low > 0 else (failed_breakdown_support * 0.997 if failed_breakdown_support > 0 else recent_low * 0.997)
     elif entry_type == "ارتداد بعد تفوق نسبي":
-        strategy_stop = float(today_5["Low"].tail(3).min()) * 0.997
+        strategy_stop = float(_closed_quality_lows.tail(3).min()) * 0.997
     elif entry_type == "دخول مبكر":
         try:
-            strategy_stop = float(today_5["Low"].tail(3).min()) * 0.997
+            strategy_stop = float(_closed_quality_lows.tail(3).min()) * 0.997
         except Exception:
             strategy_stop = recent_low * 0.997
     elif entry_type == "علم صاعد":
-        strategy_stop = float(flag["Low"].min()) * 0.997 if "flag" in locals() and len(flag) else float(today_5["Low"].tail(5).min()) * 0.997
+        strategy_stop = float(flag["Low"].min()) * 0.997 if "flag" in locals() and len(flag) else float(_closed_quality_lows.tail(5).min()) * 0.997
     elif entry_type == "استعادة مستوى":
         strategy_stop = reclaim_level * 0.997 if reclaim_level > 0 else recent_low * 0.997
     elif entry_type == "استعادة بعد فشل ORB":
         strategy_stop = float(post_orb["Low"].min()) * 0.997 if "post_orb" in locals() and len(post_orb) else (orb_high * 0.997 if orb_high > 0 else recent_low * 0.997)
     elif entry_type == "استمرار ABC":
-        strategy_stop = float(b["Low"].min()) * 0.997 if "b" in locals() and len(b) else float(today_5["Low"].tail(4).min()) * 0.997
+        strategy_stop = float(b["Low"].min()) * 0.997 if "b" in locals() and len(b) else float(_closed_quality_lows.tail(4).min()) * 0.997
     elif entry_type == "دخول بعد Opening Drive":
         strategy_stop = drive_level * 0.997 if drive_level > 0 else recent_low * 0.997
     elif entry_type == "استعادة قمة اليوم":
         strategy_stop = float(prior["Low"].min()) * 0.997 if "prior" in locals() and len(prior) else (hod_level * 0.997 if hod_level > 0 else recent_low * 0.997)
     elif entry_type in {"ضغط ثم انفجار", "استمرار الزخم"}:
-        strategy_stop = float(today_5["Low"].tail(5).min()) * 0.997
+        strategy_stop = float(_closed_quality_lows.tail(5).min()) * 0.997
 
     if np.isfinite(float(strategy_stop)) and 0 < float(strategy_stop) < price:
         structural_stop = float(strategy_stop)
     else:
-        fallback_stops = [float(price - 1.5 * atr), float(recent_low * 0.997)]
+        _fallback_atr = _quality_atr_value if _quality_atr_value > 0 else price * 0.01
+        fallback_stops = [float(price - 1.5 * _fallback_atr), float(recent_low * 0.997)]
         valid_fallback_stops = [x for x in fallback_stops if np.isfinite(x) and 0 < x < price]
         structural_stop = max(valid_fallback_stops) if valid_fallback_stops else price * 0.985
     stop = structural_stop
@@ -4518,7 +4561,10 @@ def analyze_intraday(
         quality_tp1_distance = True
         quality_ok = False
         warnings.append("TP1 قريب جدًا من الدخول")
-    if reward_r + 1e-9 < float(policy.get("min_tp1_r", 1.2)):
+    # Quality baseline is fixed at the same 1.20R floor used by the TP1
+    # constructor. Adaptive policy values must not retroactively tighten the
+    # baseline Quality Gate while exit_active is false.
+    if reward_r + 1e-9 < quality_min_tp1_r:
         quality_tp1_r = True
         quality_ok = False
         warnings.append("العائد إلى TP1 ضعيف")
@@ -4570,9 +4616,9 @@ def analyze_intraday(
         diagnostic_reasons.append("dump")
     if failed:
         diagnostic_reasons.append("failed_breakout")
-    if ext > 4.5:
+    if quality_ext_pct > 4.5:
         diagnostic_reasons.append("extension>4.5%")
-    if atr_pct > 6.5:
+    if quality_atr_ready and quality_atr_pct > 6.5:
         diagnostic_reasons.append("atr>6.5%")
     if vol_session_ratio < float(policy.get("min_volume_ratio", 0.85)):
         diagnostic_reasons.append("volume<policy")
@@ -4587,7 +4633,7 @@ def analyze_intraday(
     if quality_tp1_distance:
         diagnostic_reasons.append("tp1_distance<0.8%")
     if quality_tp1_r:
-        diagnostic_reasons.append(f"tp1_r<{float(policy.get('min_tp1_r', 1.2)):.2f}")
+        diagnostic_reasons.append(f"tp1_r<{quality_min_tp1_r:.2f}")
 
     return IntradaySignal(
         symbol=symbol,
@@ -4619,6 +4665,8 @@ def analyze_intraday(
         sma20=round(e20, 4),
         atr_pct=round(atr_pct, 2),
         ext_sma20=round(ext, 2),
+        quality_atr_pct=round(quality_atr_pct, 2),
+        quality_ext_pct=round(quality_ext_pct, 2),
         entry_type=entry_type,
         entry_emoji=entry_emoji,
         m15_state=m15_state,
@@ -4653,7 +4701,7 @@ def _intraday_diagnostic_metrics(sig: IntradaySignal, min_score: int = INTRADAY_
     except Exception:
         policy = {}
     min_vol = float(policy.get("min_volume_ratio", 0.85) or 0.85)
-    min_r = float(policy.get("min_tp1_r", 1.20) or 1.20)
+    min_r = float(EXIT_TP_MIN_R)
     price = float(getattr(sig, "price", 0.0) or 0.0)
     tp1 = float(getattr(sig, "tp1", 0.0) or 0.0)
     stop = float(getattr(sig, "stop_loss", 0.0) or 0.0)
@@ -4665,8 +4713,8 @@ def _intraday_diagnostic_metrics(sig: IntradaySignal, min_score: int = INTRADAY_
         f"| MKT={float(getattr(sig, 'market_avg_change', 0.0) or 0.0):+.2f}% "
         f"| score={float(sig.score):.0f}/{min_score} "
         f"| vol={float(getattr(sig, 'volume_ratio', 0.0) or 0.0):.2f}x/{min_vol:.2f}x "
-        f"| ext={float(getattr(sig, 'ext_sma20', 0.0) or 0.0):.2f}%/4.50% "
-        f"| ATR={float(getattr(sig, 'atr_pct', 0.0) or 0.0):.2f}%/6.50% "
+        f"| Q_EXT={float(getattr(sig, 'quality_ext_pct', 0.0) or 0.0):.2f}%/4.50% "
+        f"| Q_ATR={float(getattr(sig, 'quality_atr_pct', 0.0) or 0.0):.2f}%/6.50% "
         f"| TP1dist={tp1_dist:.2f}%/0.80% "
         f"| TP1R={float(getattr(sig, 'reward_r', 0.0) or 0.0):.2f}R/{min_r:.2f}R "
         f"| risk={stop_risk:.2f}%/4.50%"
@@ -4756,6 +4804,15 @@ def _prefilter_intraday(
         from market_data import fetch_intraday, intraday_data_fresh
         if preloaded is not None:
             h1, m5 = preloaded
+            # Bulk Alpaca data is only a preload optimization. If either frame is
+            # missing/stale, re-enter the unified loader so its Twelve Data fallback
+            # can repair the symbol before Stage 1 decides whether to reject it.
+            _pre_h1_ok, _ = intraday_data_fresh(h1, "60m", 90)
+            _pre_m5_ok, _ = intraday_data_fresh(m5, "5m", 12)
+            if h1 is None or not _pre_h1_ok:
+                h1 = fetch_intraday(symbol, interval="60m", period="10d")
+            if m5 is None or not _pre_m5_ok:
+                m5 = fetch_intraday(symbol, interval="5m", period="5d")
         else:
             h1 = fetch_intraday(symbol, interval="60m", period="10d")
             m5 = fetch_intraday(symbol, interval="5m", period="5d")
@@ -4834,7 +4891,11 @@ def _prefilter_intraday(
         hist = m5[m5.index.date < last_day].copy()
         # Time-of-day RVOL: compare cumulative volume through the current
         # session position with the same number of 5m bars in prior sessions.
-        current_today = today["Volume"].astype(float).fillna(0.0)
+        _stage1_closed_idx = -2 if is_us_regular_session(now_ny()) and len(today) >= 2 else -1
+        _stage1_today = today.iloc[:_stage1_closed_idx + 1].copy()
+        if len(_stage1_today) < 1:
+            _stage1_today = today.copy()
+        current_today = _stage1_today["Volume"].astype(float).fillna(0.0)
         n_bars = len(current_today)
         current_cum = float(current_today.sum())
         prior_cums = []

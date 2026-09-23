@@ -1,4 +1,4 @@
-"""طبقة بيانات موحّدة: Alpaca أولاً ثم Yahoo كاحتياطي."""
+"""طبقة بيانات موحّدة: Alpaca أولاً ثم Twelve Data كاحتياطي فقط."""
 
 from __future__ import annotations
 
@@ -11,17 +11,23 @@ from typing import Optional
 
 import pandas as pd
 import requests
-import yfinance as yf
 
 log = logging.getLogger("halal-bot.data")
 
 APCA_KEY = os.getenv("APCA_API_KEY_ID", "").strip()
 APCA_SECRET = os.getenv("APCA_API_SECRET_KEY", "").strip()
 DATA_URL = os.getenv("APCA_DATA_URL", "https://data.alpaca.markets").rstrip("/")
-# حساب Alpaca الحالي يستخدم IEX. لا نستخدم SIP أو delayed_sip في هذا البناء.
-# IEX بيانات لحظية من بورصة IEX؛ القيد هو التغطية (بورصة واحدة) وليس تأخير 15 دقيقة.
+# Alpaca execution/data feed is intentionally pinned to IEX for this deployment.
+# Twelve Data is the only external fallback when Alpaca is unavailable or stale.
 APCA_FEED = "iex"
 _LAST_ALPACA_FEED = "iex"
+TWELVE_API_KEY = (os.getenv("TWELVE_DATA_API_KEY") or os.getenv("TWELVEDATA_API_KEY") or "").strip()
+TWELVE_URL = os.getenv("TWELVE_DATA_URL", "https://api.twelvedata.com").rstrip("/")
+TWELVE_TIMEOUT = float(os.getenv("TWELVE_DATA_TIMEOUT", "10"))
+TWELVE_429_RETRIES = int(os.getenv("TWELVE_DATA_429_RETRIES", "2"))
+_TWELVE_RATE_LOCK = threading.Lock()
+_TWELVE_NEXT_REQUEST_AT = 0.0
+
 
 _LAST_SOURCE = "none"
 _LAST_ERROR = ""
@@ -68,6 +74,105 @@ def _alpaca_get(url: str, *, params: dict, timeout: float) -> requests.Response:
     if last_exc:
         raise last_exc
     raise RuntimeError("Alpaca request failed")
+
+
+def twelve_configured() -> bool:
+    return bool(TWELVE_API_KEY)
+
+
+def _twelve_get(endpoint: str, params: dict, timeout: float | None = None) -> requests.Response:
+    """Twelve Data GET with bounded 429 backoff and process-wide pacing."""
+    global _TWELVE_NEXT_REQUEST_AT
+    url = f"{TWELVE_URL.rstrip('/')}/{endpoint.lstrip('/')}"
+    params = dict(params or {})
+    params.setdefault("apikey", TWELVE_API_KEY)
+    last_exc = None
+    for attempt in range(TWELVE_429_RETRIES + 1):
+        with _TWELVE_RATE_LOCK:
+            now = _time.monotonic()
+            wait = _TWELVE_NEXT_REQUEST_AT - now
+            if wait > 0:
+                _time.sleep(wait)
+            _TWELVE_NEXT_REQUEST_AT = _time.monotonic() + 0.25
+            try:
+                r = requests.get(url, params=params, timeout=timeout or TWELVE_TIMEOUT)
+            except Exception as exc:
+                last_exc = exc
+                continue
+        if r.status_code != 429:
+            return r
+        if attempt >= TWELVE_429_RETRIES:
+            return r
+        retry_after = r.headers.get("Retry-After")
+        try:
+            delay = float(retry_after) if retry_after else min(8.0, 1.0 * (2 ** attempt))
+        except Exception:
+            delay = min(8.0, 1.0 * (2 ** attempt))
+        log.warning("Twelve Data 429: انتظار %.1fs ثم إعادة المحاولة (%d/%d)", delay, attempt + 1, TWELVE_429_RETRIES)
+        _time.sleep(delay)
+    if last_exc:
+        raise last_exc
+    raise RuntimeError("Twelve Data request failed")
+
+
+def _twelve_time_series(symbol: str, interval: str, start: datetime, end: datetime, outputsize: int = 5000) -> pd.DataFrame:
+    """Fetch Twelve Data OHLCV and normalize it to the bot's DataFrame schema."""
+    if not twelve_configured():
+        raise RuntimeError("Twelve Data API key missing")
+    td_interval = {
+        "1m": "1min", "1Min": "1min", "5m": "5min", "5Min": "5min",
+        "15m": "15min", "15Min": "15min", "60m": "1h", "1h": "1h", "1Hour": "1h",
+        "1d": "1day", "1D": "1day", "1Day": "1day",
+        "1wk": "1week", "1w": "1week", "1Week": "1week",
+    }.get(interval, str(interval).lower())
+    params = {
+        "symbol": symbol.upper().strip(),
+        "interval": td_interval,
+        "start_date": start.astimezone(timezone.utc).isoformat(),
+        "end_date": end.astimezone(timezone.utc).isoformat(),
+        "outputsize": min(int(outputsize), 5000),
+        "order": "asc",
+        "timezone": "America/New_York",
+    }
+    r = _twelve_get("time_series", params)
+    if r.status_code >= 400:
+        raise RuntimeError(f"Twelve Data {r.status_code}: {r.text[:180]}")
+    data = r.json() or {}
+    if data.get("status") == "error" or "values" not in data:
+        raise RuntimeError(f"Twelve Data error: {data.get('message') or data.get('code') or 'no values'}")
+    values = data.get("values") or []
+    rows = []
+    idx = []
+    for v in values:
+        try:
+            ts = pd.Timestamp(v.get("datetime"))
+            if ts.tzinfo is None:
+                ts = ts.tz_localize("America/New_York")
+            else:
+                ts = ts.tz_convert("America/New_York")
+            rows.append({
+                "Open": float(v["open"]), "High": float(v["high"]),
+                "Low": float(v["low"]), "Close": float(v["close"]),
+                "Volume": float(v.get("volume") or 0),
+            })
+            idx.append(ts)
+        except Exception:
+            continue
+    if not rows:
+        raise RuntimeError("Twelve Data returned no valid bars")
+    df = pd.DataFrame(rows, index=pd.DatetimeIndex(idx))
+    df = df[~df.index.duplicated(keep="last")].sort_index()
+    df.attrs["data_source"] = "twelve-data"
+    return df
+
+
+def _twelve_fresh(df: pd.DataFrame, interval: str) -> tuple[bool, float]:
+    """Hard freshness gate for fallback data; stale fallback is never returned."""
+    if interval in {"1m", "5m", "15m", "60m", "1h", "1Hour", "1Min", "5Min", "15Min"}:
+        return intraday_data_fresh(df, {"1Min":"1m","5Min":"5m","15Min":"15m","1Hour":"60m"}.get(interval, interval), None)
+    age = data_age_minutes(df)
+    limits = {"1d": 96 * 60, "1D": 96 * 60, "1Day": 96 * 60, "1wk": 10 * 24 * 60, "1w": 10 * 24 * 60, "1Week": 10 * 24 * 60}
+    return age <= float(limits.get(interval, 96 * 60)), age
 
 
 def alpaca_configured() -> bool:
@@ -168,17 +273,14 @@ def fetch_alpaca_bars(
     if end.tzinfo is None:
         end = end.replace(tzinfo=timezone.utc)
 
-    # Explicit IEX-only path. This prevents an environment variable such as
-    # APCA_FEED=auto/sip from accidentally requesting a feed unavailable to the
-    # user's account and turning a data problem into a symbol rejection.
     feed = "iex"
     try:
         df = _alpaca_request_bars(symbol, timeframe, start, end, limit, feed)
         _LAST_ALPACA_FEED = feed
         if df is not None:
-            df.attrs["data_source"] = f"alpaca-{feed}"
-            df.attrs["feed"] = feed
-        _set_status(f"alpaca-{feed}")
+            df.attrs["data_source"] = "alpaca-iex"
+            df.attrs["feed"] = "iex"
+        _set_status("alpaca-iex")
         return df
     except Exception:
         raise
@@ -210,50 +312,63 @@ def intraday_data_fresh(df: pd.DataFrame, interval: str, max_age_minutes: Option
 
 
 def fetch_latest_quote(symbol: str, feed: Optional[str] = None) -> dict:
-    """أفضل Bid/Ask من Alpaca عند توفره، بدون اختراع قيم عند غياب الاقتباس."""
+    """Latest Alpaca quote, pinned to IEX for deterministic execution data."""
     if not alpaca_configured():
         return {}
-    # IEX-only: لا نسمح لمسار quote أن يتحول إلى SIP/delayed_sip.
     use_feed = "iex"
     url = f"{DATA_URL}/v2/stocks/{symbol.upper()}/quotes/latest"
-    params = {"feed": use_feed}
-    r = _alpaca_get(url, params=params, timeout=5)
+    r = _alpaca_get(url, params={"feed": use_feed}, timeout=5)
     if r.status_code >= 400:
         raise RuntimeError(f"Alpaca quote {r.status_code}: {r.text[:160]}")
     data = r.json() or {}
     q = data.get("quote") or {}
+    _set_status("alpaca-iex")
     return {
         "bid": float(q.get("bp") or 0),
         "ask": float(q.get("ap") or 0),
         "timestamp": q.get("t"),
-        "feed": use_feed,
+        "feed": "iex",
     }
 
-
 def fetch_history(symbol: str, period: str = "1y") -> pd.DataFrame:
-    """يومي: Alpaca ثم Yahoo."""
+    """Daily history: Alpaca first, then Twelve Data only if Alpaca fails/stales."""
     days = {"6mo": 190, "1y": 400, "2y": 800, "5d": 10, "1mo": 40, "3mo": 100}.get(period, 400)
     start = datetime.now(timezone.utc) - timedelta(days=days)
+    last_errors = []
 
     if alpaca_configured():
         try:
             df = fetch_alpaca_bars(symbol, "1Day", start)
             if df is not None and len(df) >= 30:
-                _set_status(df.attrs.get("data_source", "alpaca"))
-                return df
+                fresh_ok, age = _twelve_fresh(df, "1Day")
+                if fresh_ok:
+                    _set_status(df.attrs.get("data_source", "alpaca-iex"))
+                    return df
+                last_errors.append(f"Alpaca stale age={age:.1f}m")
+                log.warning("DATA STALE | %s | Alpaca daily age=%.1fm", symbol, float(age))
+            else:
+                last_errors.append("Alpaca daily incomplete")
         except Exception as exc:
+            last_errors.append(f"Alpaca: {str(exc)[:100]}")
             log.warning("Alpaca daily %s: %s", symbol, exc)
-            _set_status("yahoo", str(exc)[:120])
 
-    try:
-        df = yf.Ticker(symbol).history(period=period, interval="1d", auto_adjust=True)
-        if df is None or df.empty:
-            raise RuntimeError("Yahoo empty")
-        _set_status("yahoo" if not alpaca_configured() else "yahoo-fallback")
-        return df
-    except Exception as exc:
-        _set_status("none", str(exc)[:120])
-        raise
+    if twelve_configured():
+        try:
+            df = _twelve_time_series(symbol, "1Day", start, datetime.now(timezone.utc), outputsize=min(days + 10, 5000))
+            if len(df) >= 30:
+                fresh_ok, age = _twelve_fresh(df, "1Day")
+                if fresh_ok:
+                    _set_status("twelve-data")
+                    log.info("DATA FALLBACK | %s | Twelve Data daily | age=%.1fm", symbol, float(age))
+                    return df
+                last_errors.append(f"Twelve Data stale age={age:.1f}m")
+        except Exception as exc:
+            last_errors.append(f"Twelve Data: {str(exc)[:100]}")
+            log.warning("Twelve Data daily %s: %s", symbol, exc)
+
+    _set_status("none", " | ".join(last_errors)[-240:])
+    raise RuntimeError(f"No fresh daily data for {symbol}: {' | '.join(last_errors)}")
+
 
 
 def _period_days(period: str, default: int = 5) -> int:
@@ -279,11 +394,7 @@ def fetch_alpaca_bars_multi(
     limit: int = 10000,
     chunk_size: int = 50,
 ) -> dict[str, pd.DataFrame]:
-    """Fetch many symbols in batches from Alpaca's multi-symbol bars endpoint.
-
-    This is used by the scanners so 200 symbols do not become 400 individual
-    HTTP requests.  The per-symbol fetch API remains unchanged for compatibility.
-    """
+    global _LAST_ALPACA_FEED
     if not alpaca_configured():
         raise RuntimeError("Alpaca keys missing")
     end = end or datetime.now(timezone.utc)
@@ -300,6 +411,7 @@ def fetch_alpaca_bars_multi(
             clean.append(sym); seen.add(sym)
 
     out: dict[str, pd.DataFrame] = {}
+    feed = "iex"
     for i in range(0, len(clean), max(1, int(chunk_size))):
         chunk = clean[i:i + max(1, int(chunk_size))]
         params = {
@@ -309,7 +421,7 @@ def fetch_alpaca_bars_multi(
             "end": end.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
             "limit": min(limit, 10000),
             "adjustment": "split",
-            "feed": "iex",
+            "feed": feed,
         }
         url = f"{DATA_URL}/v2/stocks/bars"
         r = _alpaca_get(url, params=params, timeout=15)
@@ -327,118 +439,136 @@ def fetch_alpaca_bars_multi(
             for sym, bars in (page.get("bars") or {}).items():
                 bars_by_symbol.setdefault(sym, []).extend(bars or [])
             next_token = page.get("next_page_token")
-
         for sym, bars in bars_by_symbol.items():
             df = _bars_to_df(bars or [])
             if df is not None and not df.empty:
-                df.attrs["data_source"] = f"alpaca-{params['feed']}"
-                df.attrs["feed"] = params["feed"]
+                df.attrs["data_source"] = "alpaca-iex"
+                df.attrs["feed"] = "iex"
                 out[str(sym).upper()] = df
+        _LAST_ALPACA_FEED = "iex"
 
-    _set_status(f"alpaca-{params['feed']}")
+    _set_status("alpaca-iex")
     return out
 
+
+def _refresh_recent_5m_from_1m(symbol: str, base: pd.DataFrame, feed: Optional[str] = None) -> pd.DataFrame:
+    """Refresh the most recent 5m bucket from 1m bars when the 5m endpoint lags.
+
+    This is a data-layer repair only: no strategy, score, VWAP or gate is changed.
+    If the 1m source is not fresh, the original frame is returned unchanged.
+    """
+    if base is None or base.empty or not alpaca_configured():
+        return base
+    try:
+        now = datetime.now(timezone.utc)
+        one_min = fetch_alpaca_bars(
+            symbol, "1Min", now - timedelta(minutes=20), now, limit=100,
+        )
+        if one_min is None or one_min.empty:
+            return base
+        ok, age = intraday_data_fresh(one_min, "1m", 4.0)
+        if not ok:
+            log.warning("DATA REFRESH 1m STALE | %s | age=%.1fm", symbol, float(age))
+            return base
+        idx = pd.DatetimeIndex(one_min.index)
+        bucket = idx.floor("5min")
+        tmp = one_min.copy()
+        tmp["_bucket"] = bucket
+        agg = tmp.groupby("_bucket", sort=True).agg(
+            Open=("Open", "first"), High=("High", "max"),
+            Low=("Low", "min"), Close=("Close", "last"), Volume=("Volume", "sum")
+        )
+        if agg.empty:
+            return base
+        base2 = base.copy()
+        base2.index = pd.DatetimeIndex(base2.index)
+        latest_bucket = agg.index[-1]
+        base2 = base2[base2.index.floor("5min") < latest_bucket]
+        refreshed = pd.concat([base2, agg])
+        refreshed = refreshed[~refreshed.index.duplicated(keep="last")].sort_index()
+        refreshed.attrs.update(base.attrs)
+        refreshed.attrs["data_source"] = str(base.attrs.get("data_source", "alpaca")) + "+1m-refresh"
+        refreshed.attrs["recent_1m_age_min"] = float(age)
+        log.info("DATA REFRESH 5m | %s | rebuilt_latest_bucket=%s | 1m_age=%.1fm", symbol, str(latest_bucket), float(age))
+        return refreshed
+    except Exception as exc:
+        log.warning("DATA REFRESH 5m FAILED | %s | %s", symbol, str(exc))
+        return base
+
 def fetch_intraday(symbol: str, period: str = "5d", interval: str = "5m") -> pd.DataFrame:
-    """Unified timeframe loader. Keeps the old API but now correctly supports
-    intraday + daily + weekly frames used by Daily V2."""
+    """Unified timeframe loader with freshness-aware recent 5m repair."""
     interval = str(interval or "5m")
     period = str(period or "5d")
 
     tf_map = {
-        "1m": "1Min",
-        "5m": "5Min",
-        "15m": "15Min",
-        "60m": "1Hour",
-        "1h": "1Hour",
-        "1Hour": "1Hour",
-        "1d": "1Day",
-        "1D": "1Day",
-        "1wk": "1Week",
-        "1w": "1Week",
-        "1Week": "1Week",
+        "1m": "1Min", "5m": "5Min", "15m": "15Min",
+        "60m": "1Hour", "1h": "1Hour", "1Hour": "1Hour",
+        "1d": "1Day", "1D": "1Day", "1wk": "1Week",
+        "1w": "1Week", "1Week": "1Week",
     }
     alpaca_tf = tf_map.get(interval, "5Min")
     days = _period_days(period, 5)
-    # Intraday needs a little calendar buffer for weekends/holidays;
-    # daily/weekly use the requested lookback directly.
     if alpaca_tf in {"1Min", "5Min", "15Min", "1Hour"}:
         lookback_days = max(days + 3, 3)
     else:
         lookback_days = max(days + 5, 10)
     start = datetime.now(timezone.utc) - timedelta(days=lookback_days)
 
+    last_errors = []
     if alpaca_configured():
-        last_exc = None
-        for attempt in range(2):
-            try:
-                df = fetch_alpaca_bars(symbol, alpaca_tf, start)
-                if df is not None and len(df) >= 10:
-                    # Retry once when a live intraday response is materially old.
-                    # The retry does not relax the analyzer's hard freshness gate.
-                    if alpaca_tf in {"1Min", "5Min", "15Min", "1Hour"}:
-                        fresh_ok, age_min = intraday_data_fresh(df, interval)
-                        if not fresh_ok and attempt == 0:
-                            log.warning("Alpaca intraday stale; retrying %s %s | age=%.1fm", symbol, interval, float(age_min))
-                            _time.sleep(0.8)
-                            continue
-                        if not fresh_ok:
-                            log.warning("Alpaca intraday still stale %s %s | age=%.1fm", symbol, interval, float(age_min))
+        try:
+            df = fetch_alpaca_bars(symbol, alpaca_tf, start)
+            if df is not None and len(df) >= 10:
+                fresh_ok, age = _twelve_fresh(df, interval)
+                if alpaca_tf == "5Min" and not fresh_ok:
+                    repaired = _refresh_recent_5m_from_1m(symbol, df)
+                    if repaired is not None and not repaired.empty:
+                        df = repaired
+                        fresh_ok, age = _twelve_fresh(df, interval)
+                log.info("DATA HEALTH | %s | %s | interval=%s | age=%.1fm | fresh=%s",
+                          symbol, df.attrs.get("data_source", "alpaca-iex"), interval, float(age), bool(fresh_ok))
+                if fresh_ok:
                     _set_status(df.attrs.get("data_source", "alpaca-iex"))
                     return df
-            except Exception as exc:
-                last_exc = exc
-                if attempt == 0:
-                    _time.sleep(0.5)
-                    continue
-                log.warning("Alpaca intra %s %s: %s", symbol, interval, exc)
-        _set_status("yahoo", str(last_exc)[:120] if last_exc else "alpaca stale/empty")
+                last_errors.append(f"Alpaca stale age={age:.1f}m")
+        except Exception as exc:
+            last_errors.append(f"Alpaca: {str(exc)[:100]}")
+            log.warning("Alpaca intra %s %s: %s", symbol, interval, exc)
 
-    try:
-        df = yf.Ticker(symbol).history(
-            period=period, interval=interval, auto_adjust=True, prepost=False
-        )
-        if df is None or df.empty:
-            raise RuntimeError("Yahoo empty")
-        _set_status("yahoo" if not alpaca_configured() else "yahoo-fallback")
-        return df
-    except Exception as exc:
-        _set_status("none", str(exc)[:120])
-        raise
+    if twelve_configured():
+        try:
+            df = _twelve_time_series(symbol, interval, start, datetime.now(timezone.utc), outputsize=5000)
+            if df is not None and len(df) >= 10:
+                fresh_ok, age = _twelve_fresh(df, interval)
+                log.info("DATA FALLBACK | %s | Twelve Data | interval=%s | age=%.1fm | fresh=%s",
+                          symbol, interval, float(age), bool(fresh_ok))
+                if fresh_ok:
+                    _set_status("twelve-data")
+                    return df
+                last_errors.append(f"Twelve Data stale age={age:.1f}m")
+        except Exception as exc:
+            last_errors.append(f"Twelve Data: {str(exc)[:100]}")
+            log.warning("Twelve Data intra %s %s: %s", symbol, interval, exc)
+
+    _set_status("none", " | ".join(last_errors)[-240:])
+    raise RuntimeError(f"No fresh {interval} data for {symbol}: {' | '.join(last_errors)}")
 
 
 def ping_sources() -> tuple[bool, str]:
-    """فحص سريع لـ /health."""
+    """Health check for the live data chain: Alpaca -> Twelve Data."""
     notes = []
     ok = False
-    if alpaca_configured():
-        try:
-            df = fetch_alpaca_bars("SPY", "1Day", datetime.now(timezone.utc) - timedelta(days=10))
-            if df is not None and not df.empty:
-                last = float(df["Close"].iloc[-1])
-                notes.append(f"Alpaca يعمل — SPY ≈ {last:.2f}")
-                ok = True
-                _set_status("alpaca")
-            else:
-                notes.append("Alpaca: فارغ")
-        except Exception as exc:
-            notes.append(f"Alpaca تعثر: {str(exc)[:80]}")
-    else:
-        notes.append("Alpaca: غير مُعد")
-
     try:
-        info = yf.Ticker("SPY").fast_info
-        last = getattr(info, "last_price", None)
-        if last:
-            notes.append(f"Yahoo يعمل — SPY ≈ {float(last):.2f}")
+        df = fetch_intraday("SPY", interval="1d", period="5d")
+        if df is not None and not df.empty:
+            last = float(df["Close"].iloc[-1])
+            source = str(df.attrs.get("data_source", last_source()))
+            notes.append(f"مصدر البيانات يعمل ({source}) — SPY ≈ {last:.2f}")
             ok = True
-        else:
-            df = yf.Ticker("SPY").history(period="5d", interval="1d")
-            if df is not None and not df.empty:
-                notes.append(f"Yahoo يعمل — SPY ≈ {float(df['Close'].iloc[-1]):.2f}")
-                ok = True
-            else:
-                notes.append("Yahoo: بدون سعر")
     except Exception as exc:
-        notes.append(f"Yahoo تعثر: {str(exc)[:80]}")
-
+        notes.append(f"مصدر البيانات تعثر: {str(exc)[:100]}")
+    if not alpaca_configured():
+        notes.append("Alpaca: غير مُعد")
+    if not twelve_configured():
+        notes.append("Twelve Data: API key غير مُعد")
     return ok, " | ".join(notes)
