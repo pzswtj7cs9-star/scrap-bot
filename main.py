@@ -705,9 +705,12 @@ async def run_scan_message(target_message, symbols: list[str]) -> None:
     if not is_us_trading_day():
         await target_message.reply_text(session_label())
         return
+    # Manual /scan requests are queued behind an active automatic scan instead
+    # of being rejected. The same lock is retained so scans never run in parallel.
     if _scan_lock.locked():
-        await target_message.reply_text("⏳ يوجد مسح يومي جارٍ الآن؛ انتظر نتيجته بدل بدء مسح موازٍ.")
-        return
+        await target_message.reply_text(
+            "⏳ المسح اليومي التلقائي جارٍ الآن — تم وضع /scan في الانتظار وسيُنفذ بعد انتهائه."
+        )
     async with _scan_lock:
         await _run_scan_message_locked(target_message, symbols)
 
