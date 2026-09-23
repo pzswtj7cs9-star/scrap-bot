@@ -1138,10 +1138,22 @@ def _apply_adaptive_exit(sig_price: float, structural_stop: float, regime: str,
     0.60%–4.50% risk band.
     """
     if policy.get("kill_switch"):
-        return float(structural_stop), float(sig_price), 1.20
+        # Kill Switch disables adaptive changes only; it must NOT invalidate
+        # the base engine by returning TP1 at entry. Restore the baseline 1.20R
+        # target from the validated structural risk.
+        _entry = float(sig_price)
+        _base_risk = max(_entry - float(structural_stop), _entry * (DAILY_MIN_RISK_PCT / 100.0))
+        return float(structural_stop), _entry + _base_risk * EXIT_TP_MIN_R, EXIT_TP_MIN_R
     entry = float(sig_price)
     stop = float(structural_stop)
-    risk = max(entry - stop, entry * (DAILY_MIN_RISK_PCT / 100.0))
+    base_structural_risk = entry - stop
+
+    # A structural stop wider than the hard risk ceiling is a final rejection.
+    # Adaptive Exit must never compress it to manufacture a passing trade.
+    if base_structural_risk > entry * (DAILY_MAX_RISK_PCT / 100.0):
+        return stop, entry + base_structural_risk * EXIT_TP_MIN_R, EXIT_TP_MIN_R
+
+    risk = max(base_structural_risk, entry * (DAILY_MIN_RISK_PCT / 100.0))
     tp1_r = 1.20
     sl_mult = 1.00
 
@@ -2338,6 +2350,10 @@ def _quote_liquidity(symbol: str, price: float) -> dict:
         "slippage_pct": 0.0,
         "quote_source": "none",
         "quote_age_min": float("inf"),
+        "bid": 0.0,
+        "ask": 0.0,
+        "quote_timestamp": None,
+        "quote_feed": "none",
     }
     try:
         from market_data import fetch_latest_quote, data_age_minutes
@@ -2345,6 +2361,10 @@ def _quote_liquidity(symbol: str, price: float) -> dict:
         bid, ask = float(q.get("bid") or 0), float(q.get("ask") or 0)
         px = float(price or 0)
         ts = q.get("timestamp")
+        result["bid"] = bid
+        result["ask"] = ask
+        result["quote_timestamp"] = ts
+        result["quote_feed"] = str(q.get("feed") or "unknown")
         if ts:
             qdf = pd.DataFrame({"Close": [px]}, index=[pd.Timestamp(ts)])
             age = data_age_minutes(qdf)
@@ -2362,7 +2382,7 @@ def _quote_liquidity(symbol: str, price: float) -> dict:
     return result
 
 
-def _final_execution_snapshot(symbol: str, reference_price: float) -> dict:
+def _final_execution_snapshot(symbol: str, reference_price: float, quote_snapshot: dict | None = None) -> dict:
     """لقطة تنفيذ نهائية مستقلة عن التحليل. لا تعيد حساب Stop/TP."""
     result = {
         "ok": False,
@@ -2372,8 +2392,10 @@ def _final_execution_snapshot(symbol: str, reference_price: float) -> dict:
         "quote_source": "none",
     }
     try:
-        from market_data import fetch_latest_quote, data_age_minutes
-        q = fetch_latest_quote(symbol)
+        q = quote_snapshot if isinstance(quote_snapshot, dict) else None
+        if not q:
+            from market_data import fetch_latest_quote
+            q = fetch_latest_quote(symbol)
         bid = float(q.get("bid") or 0)
         ask = float(q.get("ask") or 0)
         if bid <= 0 or ask <= bid or float(reference_price or 0) <= 0:
@@ -2382,6 +2404,7 @@ def _final_execution_snapshot(symbol: str, reference_price: float) -> dict:
         ts = q.get("timestamp")
         if ts:
             qdf = pd.DataFrame({"Close": [mid]}, index=[pd.Timestamp(ts)])
+            from market_data import data_age_minutes
             result["quote_age_min"] = float(data_age_minutes(qdf))
         if result["quote_age_min"] > QUOTE_MAX_AGE_MIN:
             return result
@@ -2541,7 +2564,9 @@ def _aligned_relative_strength_metrics(
         ).join(qq.rename(columns={"Close":"qqq"}), how="inner").dropna()
         if len(x) < max(lookback + 1, persistence_bars + 1):
             return 0.0, 0.0, 0.0, 0.0, False
-        x = x.iloc[:-1] if len(x) > 1 else x
+        # Callers pass the stock series already trimmed to its latest completed bar.
+        # The timestamp join therefore already removes an unaligned benchmark partial;
+        # dropping one more row would incorrectly discard a valid completed bar.
         if len(x) < lookback + 1:
             return 0.0, 0.0, 0.0, 0.0, False
         sret = (float(x["stock"].iloc[-1]) / float(x["stock"].iloc[-1-lookback]) - 1.0) * 100.0
@@ -2678,6 +2703,7 @@ def analyze_daily(
     live: bool = True,
     market_context: tuple[bool, str] | None = None,
     preloaded: tuple[pd.DataFrame, pd.DataFrame] | None = None,
+    preloaded_volume_ratio: float | None = None,
 ) -> Optional[DailySignal]:
     from market_data import fetch_intraday
     from market_data import intraday_data_fresh
@@ -2788,7 +2814,11 @@ def analyze_daily(
 
     # Time-of-day relative volume: compare cumulative volume through the
     # current session time with the same point in prior sessions.
-    vol_ratio = _daily_volume_ratio_time_of_day(symbol, fetch_intraday, now_ny)
+    vol_ratio = (
+        float(preloaded_volume_ratio)
+        if preloaded_volume_ratio is not None and np.isfinite(float(preloaded_volume_ratio))
+        else _daily_volume_ratio_time_of_day(symbol, fetch_intraday, now_ny)
+    )
     if not np.isfinite(vol_ratio):
         _daily_data_audit_record(symbol, "volume_data_unavailable")
         return None
@@ -2861,12 +2891,13 @@ def analyze_daily(
     # A real retest requires a prior close above the broken resistance,
     # followed by a return toward that same level. A mere historical touch is
     # not enough to label the setup as Retest.
-    break_window = today_d.iloc[max(0, closed_idx - 5):closed_idx]
+    _closed_pos = len(today_d) + closed_idx if closed_idx < 0 else closed_idx
+    break_window = today_d.iloc[max(0, _closed_pos - 5):_closed_pos]
     prior_break = bool(
         len(break_window) > 0
         and (break_window["Close"].astype(float) >= level_high * 1.001).any()
     )
-    retest_window = today_d.iloc[max(0, closed_idx - 3):closed_idx] if "closed_idx" in locals() else today_d.tail(4)
+    retest_window = today_d.iloc[max(0, _closed_pos - 3):_closed_pos]
     retest_touch = bool(
         len(retest_window) > 0
         and (retest_window["Low"].astype(float) <= level_high * 1.007).any()
@@ -2886,7 +2917,7 @@ def analyze_daily(
     retest = prior_break and near_level and closed_close >= level_high * 0.997
 
     # 1) VWAP Bounce/Reclaim: رجوع منظم إلى VWAP ثم استعادة المستوى.
-    recent4 = today_d.iloc[max(0, closed_idx - 4):closed_idx]
+    recent4 = today_d.iloc[max(0, _closed_pos - 4):_closed_pos]
     vwap_touch = False
     try:
         vwap_touch = bool((recent4["Low"].astype(float) <= vwap_last_closed * 1.006).any())
@@ -2897,7 +2928,10 @@ def analyze_daily(
     # 2) EMA20 Pullback: ترند صاعد + تصحيح صحي إلى EMA20 + استعادة.
     ema_touch = False
     try:
-        ema_touch = bool((recent4["Low"].astype(float) <= e5 * 1.006).any())
+        # Strategy structure is based on completed candles; do not let the
+        # currently forming EMA20 change whether the EMA20 setup matches.
+        _ema_touch_level = float(e5_closed or e5)
+        ema_touch = bool((recent4["Low"].astype(float) <= _ema_touch_level * 1.006).any())
     except Exception:
         ema_touch = False
     ema_pullback = bool(ema_touch and closed_close >= e5_closed * 1.001)
@@ -2909,7 +2943,7 @@ def analyze_daily(
         support_window = today_d["Low"].astype(float).iloc[-10:-2]
         if len(support_window) >= 5:
             support_level = float(support_window.min())
-            recent3 = today_d.iloc[max(0, closed_idx - 3):closed_idx]
+            recent3 = today_d.iloc[max(0, _closed_pos - 3):_closed_pos]
             swept = len(recent3) > 0 and (recent3["Low"].astype(float) < support_level * 0.998).any()
             reclaimed = closed_close >= support_level * 1.002
             liquidity_sweep = bool(swept and reclaimed)
@@ -2968,9 +3002,12 @@ def analyze_daily(
         cur_pos = len(today_d) + closed_idx
         if cur_pos >= 5:
             # True continuation = impulse -> controlled pause/pullback -> resume.
-            impulse = today_d.iloc[cur_pos - 5:cur_pos - 3]
-            pause = today_d.iloc[cur_pos - 3:cur_pos - 1]
-            resume = today_d.iloc[cur_pos - 1:cur_pos].iloc[0]
+            # The trigger must be the latest CLOSED candle itself. The previous
+            # implementation used cur_pos - 1, which skipped the latest
+            # completed candle by one bar and could delay/lose a valid trigger.
+            impulse = today_d.iloc[cur_pos - 4:cur_pos - 2]
+            pause = today_d.iloc[cur_pos - 2:cur_pos]
+            resume = today_d.iloc[cur_pos]
 
             impulse_open = float(impulse["Open"].iloc[0])
             impulse_close = float(impulse["Close"].iloc[-1])
@@ -2996,7 +3033,7 @@ def analyze_daily(
                 and pause_hold
                 and resume_green
                 and resume_above_pause
-                and mom > 0.08
+                and ((float(resume_close) - float(today_d["Close"].iloc[max(0, cur_pos - 5)])) / max(float(today_d["Close"].iloc[max(0, cur_pos - 5)]), 1e-9) * 100.0) > 0.08
             )
     except Exception:
         momentum_continuation = False
@@ -3168,10 +3205,22 @@ def analyze_daily(
     try:
         if orb_high > 0:
             _month_completed = completed_month.copy()
-            _post_orb = _month_completed.iloc[3:] if len(_month_completed) >= 4 else _month_completed.iloc[0:0]
-            post_orb = _post_orb
-            broke = bool(len(post_orb) and (post_orb["High"].astype(float) >= orb_high * 1.002).any())
-            failure = bool(len(post_orb) and (post_orb["Close"].astype(float) <= orb_high * 0.998).any())
+            post_orb = _month_completed.iloc[3:] if len(_month_completed) >= 4 else _month_completed.iloc[0:0]
+            # Keep the failure tied to the same ORB-break cycle: a historical
+            # break and an unrelated later failure must not manufacture a reclaim.
+            _latest_failure_pos = None
+            for _i in range(len(post_orb) - 1, -1, -1):
+                if float(post_orb["Close"].iloc[_i]) <= orb_high * 0.998:
+                    _latest_failure_pos = _i
+                    break
+            if _latest_failure_pos is not None:
+                _pre_failure = post_orb.iloc[:_latest_failure_pos]
+                broke = bool(len(_pre_failure) and (
+                    _pre_failure["High"].astype(float) >= orb_high * 1.002
+                ).any())
+                failure = True
+            else:
+                broke = failure = False
             reclaim = closed_close >= orb_high * 1.001
             orb_failed_reclaim = bool(broke and failure and reclaim)
     except Exception:
@@ -4473,6 +4522,15 @@ def analyze_daily(
     elif entry_type == "استعادة قمة اليوم":
         reasons.append("استعادة قمة اليوم بعد تراجع تحتها")
         factors.append("hod_reclaim")
+    elif entry_type == "استمرار/استعادة الفجوة":
+        reasons.append("استمرار/استعادة الفجوة مع ثبات الفجوة ومحفز الاستعادة")
+        factors.append("gap_setup")
+    elif entry_type == "استعادة بعد فشل كسر دعم":
+        reasons.append("استعادة بعد فشل كسر دعم مع تأكيد الاستعادة")
+        factors.append("failed_breakdown_reclaim")
+    elif entry_type == "ارتداد بعد تفوق نسبي":
+        reasons.append("ارتداد بعد تفوق نسبي مع قوة نسبية وبنية Higher Low")
+        factors.append("rs_pullback")
     else:
         reasons.append("دخول مبكر فوق VWAP")
         factors.append("early")
@@ -4636,7 +4694,6 @@ def analyze_daily(
         market_condition == "ضعيف"
         and not market_ok
         and raw_score >= 97.0
-        and entry_type != "دخول مبكر"
         and strong_alignment
         and relative_strength_ok
         and vol_ratio >= 1.25
@@ -4702,11 +4759,11 @@ def analyze_daily(
     # references are fallback-only and never compete with the strategy stop.
     strategy_stop = 0.0
     if entry_type == "ارتداد VWAP":
-        strategy_stop = float(today_d["Low"].iloc[max(0, closed_idx - 4):closed_idx + 1].min()) * 0.997 if closed_idx > 0 else vwap_last * 0.997
+        strategy_stop = float(today_d["Low"].iloc[max(0, _closed_pos - 4):_closed_pos + 1].min()) * 0.997 if _closed_pos >= 0 else vwap_last * 0.997
     elif entry_type == "ارتداد EMA20":
-        strategy_stop = float(today_d["Low"].iloc[max(0, closed_idx - 4):closed_idx + 1].min()) * 0.997 if closed_idx > 0 else e5 * 0.997
+        strategy_stop = float(today_d["Low"].iloc[max(0, _closed_pos - 4):_closed_pos + 1].min()) * 0.997 if _closed_pos >= 0 else e5 * 0.997
     elif entry_type in {"سحب سيولة", "سحب سيولة مع Displacement"}:
-        sweep_extreme = float(today_d["Low"].iloc[max(0, closed_idx - 3):closed_idx].min()) if closed_idx > 0 else 0.0
+        sweep_extreme = float(today_d["Low"].iloc[max(0, _closed_pos - 3):_closed_pos].min()) if _closed_pos > 0 else 0.0
         strategy_stop = sweep_extreme * 0.997 if sweep_extreme > 0 else (support_level * 0.997 if support_level > 0 else recent_low * 0.997)
     elif entry_type in {"اختراق مؤكد", "اختراق نطاق الافتتاح"}:
         level = orb_high if entry_type == "اختراق نطاق الافتتاح" else level_high
@@ -4790,7 +4847,11 @@ def analyze_daily(
     adaptive_stop, adaptive_tp1, adaptive_tp1_r = _apply_adaptive_exit(
         price, structural_stop, market_regime, entry_type, policy_now, atr
     )
-    if policy_now.get("exit_active"):
+    # A structural stop wider than the hard risk ceiling is a real quality
+    # failure. Adaptive Exit must never "repair" it by compressing the stop,
+    # because that would change the strategy's structural invalidation point.
+    _wide_structural_stop = bool(risk > max_risk)
+    if policy_now.get("exit_active") and not _wide_structural_stop:
         stop = adaptive_stop
         tp1 = adaptive_tp1
         risk = price - stop
@@ -4840,7 +4901,6 @@ def analyze_daily(
     # blocker is market_block may pass.
     strong_stock_market_override = bool(
         strong_stock_market_candidate
-        and entry_type != "دخول مبكر"
         and raw_score >= 97.0
         and not dump
         and not failed
@@ -4869,7 +4929,9 @@ def analyze_daily(
         and not (h4_state == "معاكس" and raw_score < 92)
     )
     strong_stock_market_override = bool(
-        strong_stock_market_override and non_market_quality_ok
+        strong_stock_market_override
+        and non_market_quality_ok
+        and not _wide_structural_stop
     )
     market_permission = bool(
         strong_market_ok
@@ -5151,7 +5213,7 @@ def _prefilter_daily(symbol: str, audit_counts: dict[str, int] | None = None, au
             _audit_stage1("low_volume_ratio<0.55x")
             return None
         routes=_daily_strategy_route_scores(price=price, trend=trend, above_vwap=above_vwap, above_open=above_open, vol_ratio=vol_ratio, mom=mom, wrsi=wrsi, we20=we20, we50=we50, daily=daily, weekly=weekly)
-        return route, routes, weekly, daily
+        return route, routes, weekly, daily, float(vol_ratio)
     except Exception as exc:
         _audit_stage1("exception")
         log.info("DAILY STAGE 1 REJECT | %s | exception=%s", symbol, str(exc))
@@ -5181,12 +5243,18 @@ def _prefilter_daily_from_frames(symbol: str, weekly: pd.DataFrame, daily: pd.Da
         from market_data import fetch_intraday, data_age_minutes
         # Bulk frames are an optimization only. Never route stale data into
         # Stage 1; reload the affected timeframe through Alpaca -> Twelve Data.
-        if weekly is not None:
+        if weekly is None:
+            _audit_data("1wk:missing")
+            weekly = fetch_intraday(symbol, interval="1wk", period="5y")
+        else:
             _wa = data_age_minutes(weekly)
             if not (np.isfinite(_wa) and _wa <= 10.0 * 24.0 * 60.0):
                 _audit_data(f"1wk:stale(age={_wa:.1f}m>14400m)")
                 weekly = fetch_intraday(symbol, interval="1wk", period="5y")
-        if daily is not None:
+        if daily is None:
+            _audit_data("1d:missing")
+            daily = fetch_intraday(symbol, interval="1d", period="2y")
+        else:
             _da = data_age_minutes(daily)
             if not (np.isfinite(_da) and _da <= 96.0 * 60.0):
                 _audit_data(f"1d:stale(age={_da:.1f}m>5760m)")
@@ -5238,7 +5306,7 @@ def _prefilter_daily_from_frames(symbol: str, weekly: pd.DataFrame, daily: pd.Da
             _audit_stage1("low_volume_ratio<0.55x")
             return None
         routes=_daily_strategy_route_scores(price=price, trend=trend, above_vwap=above_vwap, above_open=above_open, vol_ratio=vol_ratio, mom=mom, wrsi=wrsi, we20=we20, we50=we50, daily=daily, weekly=weekly)
-        return route, routes, weekly, daily
+        return route, routes, weekly, daily, float(vol_ratio)
     except Exception as exc:
         _audit_stage1("exception")
         log.info("DAILY STAGE 1 REJECT | %s | exception=%s", symbol, str(exc))
@@ -5288,7 +5356,7 @@ def scan_daily(
             daily_map = fetch_alpaca_bars_multi(symbols, "1Day", now_utc - timedelta(days=days_d + 5), now_utc)
             def _route_from_frames(sym):
                 weekly = weekly_map.get(sym.upper()); daily = daily_map.get(sym.upper())
-                if weekly is None or daily is None or len(weekly) < 60 or len(daily) < 80:
+                if weekly is None and daily is None:
                     return None
                 return _prefilter_daily_from_frames(sym, weekly, daily, stage1_audit_counts, stage1_audit_lock, stage1_data_audit_counts)
             for sym in symbols:
@@ -5304,7 +5372,7 @@ def scan_daily(
                         log.warning("DAILY INDIVIDUAL FALLBACK FAILED | %s | %s", sym, exc)
                         item = None
                 if item:
-                    route, routes, weekly, daily = item; stage1.append((route, routes, sym, weekly, daily))
+                    route, routes, weekly, daily, vol_ratio = item; stage1.append((route, routes, sym, weekly, daily, vol_ratio))
                     with stage1_audit_lock: stage1_audit_passed += 1
                 else:
                     with stage1_audit_lock: stage1_audit_rejected += 1
@@ -5321,7 +5389,7 @@ def scan_daily(
                     log.warning("DAILY STAGE 1 FUTURE EXCEPTION | %s | %s", sym, str(exc))
                     item=None
                 if item:
-                    route,routes,weekly,daily=item; stage1.append((route,routes,sym,weekly,daily))
+                    route,routes,sym,weekly,daily,vol_ratio=item; stage1.append((route,routes,sym,weekly,daily,vol_ratio))
                     with stage1_audit_lock: stage1_audit_passed += 1
                 else:
                     with stage1_audit_lock: stage1_audit_rejected += 1
@@ -5376,9 +5444,12 @@ def scan_daily(
                 _daily_bump(strategy_failed, _et)
                 _daily_bump(strategy_blockers.setdefault(_et, {}), "not_matched")
     def one(item):
-        _,_,sym,weekly,daily=item
+        _,_,sym,weekly,daily,vol_ratio=item
         try:
-            return analyze_daily(sym,names.get(sym,sym),True,market_context,(weekly,daily))
+            return analyze_daily(
+                sym, names.get(sym,sym), True, market_context, (weekly,daily),
+                preloaded_volume_ratio=vol_ratio,
+            )
         except Exception as exc:
             log.warning("DAILY STAGE 2 EXCEPTION | %s | %s", sym, str(exc))
             return None
@@ -5486,7 +5557,7 @@ def scan_daily(
 
             # Final execution gate: آخر Quote مستقل قبل قبول التنبيه.
             # لا يغيّر سعر التحليل أو Stop/TP.
-            execution = _final_execution_snapshot(sig.symbol, sig.price)
+            execution = _final_execution_snapshot(sig.symbol, sig.price, quote_snapshot=liq)
             if not execution.get("ok"):
                 stage2_rejects["final_execution"] += 1
                 _stage2_reason("final_execution", "execution_ok_false")

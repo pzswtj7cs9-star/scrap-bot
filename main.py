@@ -47,7 +47,6 @@ from analyzer_intraday import (
     scan_intraday,
     session_window_ok,
     monthly_self_optimization,
-    get_live_entry_price,
     ADAPTIVE_POLICY_FILE as INTRADAY_ADAPTIVE_POLICY_FILE,
     get_intraday_market_context,
 )
@@ -1005,11 +1004,9 @@ async def live_scan_intraday_job(context: ContextTypes.DEFAULT_TYPE) -> None:
         # ولا نفرض أولوية يدوية على 3 استراتيجيات فقط هنا.
         sig = fresh[0]
         # لا نسجل الإشارة كـ"مُرسلة" قبل نجاح Telegram فعلياً.
-        # نأخذ سعرًا لحظيًا واحدًا وقت الإرسال لسعر الدخول والحساب والتعلّم،
-        # مع إبقاء sig.price محفوظًا كسعر التحليل الأصلي.
-        live_entry = await asyncio.to_thread(get_live_entry_price, sig.symbol)
-        if live_entry > 0:
-            sig.alert_entry_price = live_entry
+        # سعر التنبيه اللحظي تم التحقق منه داخل Final Execution Gate.
+        # لا نعيد طلب Bid/Ask هنا؛ نستخدم نفس Quote Snapshot الذي اجتاز
+        # Liquidity + Final Execution، مع إبقاء sig.price كسعر التحليل الأصلي.
         slot = len(state.get("sent_intraday") or []) + 1
         market_labels = {
             "قوي": "🟢 قوي",

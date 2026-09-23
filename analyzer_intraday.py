@@ -1126,10 +1126,22 @@ def _apply_adaptive_exit(sig_price: float, structural_stop: float, regime: str,
     0.60%–4.50% risk band.
     """
     if policy.get("kill_switch"):
-        return float(structural_stop), float(sig_price), 1.20
+        # Kill Switch disables adaptive changes only; it must NOT invalidate
+        # the base engine by returning TP1 at entry. Restore the baseline 1.20R
+        # target from the validated structural risk.
+        _entry = float(sig_price)
+        _base_risk = max(_entry - float(structural_stop), _entry * (INTRADAY_MIN_RISK_PCT / 100.0))
+        return float(structural_stop), _entry + _base_risk * EXIT_TP_MIN_R, EXIT_TP_MIN_R
     entry = float(sig_price)
     stop = float(structural_stop)
-    risk = max(entry - stop, entry * (INTRADAY_MIN_RISK_PCT / 100.0))
+    base_structural_risk = entry - stop
+
+    # A structural stop wider than the hard risk ceiling is a final rejection.
+    # Adaptive Exit must never compress it to manufacture a passing trade.
+    if base_structural_risk > entry * (INTRADAY_MAX_RISK_PCT / 100.0):
+        return stop, entry + base_structural_risk * EXIT_TP_MIN_R, EXIT_TP_MIN_R
+
+    risk = max(base_structural_risk, entry * (INTRADAY_MIN_RISK_PCT / 100.0))
     tp1_r = 1.20
     sl_mult = 1.00
 
@@ -2271,6 +2283,10 @@ def _quote_liquidity(symbol: str, price: float) -> dict:
         "slippage_pct": 0.0,
         "quote_source": "none",
         "quote_age_min": float("inf"),
+        "bid": 0.0,
+        "ask": 0.0,
+        "quote_timestamp": None,
+        "quote_feed": "none",
     }
     try:
         from market_data import fetch_latest_quote, data_age_minutes
@@ -2278,6 +2294,10 @@ def _quote_liquidity(symbol: str, price: float) -> dict:
         bid, ask = float(q.get("bid") or 0), float(q.get("ask") or 0)
         px = float(price or 0)
         ts = q.get("timestamp")
+        result["bid"] = bid
+        result["ask"] = ask
+        result["quote_timestamp"] = ts
+        result["quote_feed"] = str(q.get("feed") or "unknown")
         if ts:
             qdf = pd.DataFrame({"Close": [px]}, index=[pd.Timestamp(ts)])
             age = data_age_minutes(qdf)
@@ -2295,7 +2315,7 @@ def _quote_liquidity(symbol: str, price: float) -> dict:
     return result
 
 
-def _final_execution_snapshot(symbol: str, reference_price: float) -> dict:
+def _final_execution_snapshot(symbol: str, reference_price: float, quote_snapshot: dict | None = None) -> dict:
     """لقطة تنفيذ نهائية مستقلة عن التحليل. لا تعيد حساب Stop/TP."""
     result = {
         "ok": False,
@@ -2305,8 +2325,10 @@ def _final_execution_snapshot(symbol: str, reference_price: float) -> dict:
         "quote_source": "none",
     }
     try:
-        from market_data import fetch_latest_quote, data_age_minutes
-        q = fetch_latest_quote(symbol)
+        q = quote_snapshot if isinstance(quote_snapshot, dict) else None
+        if not q:
+            from market_data import fetch_latest_quote
+            q = fetch_latest_quote(symbol)
         bid = float(q.get("bid") or 0)
         ask = float(q.get("ask") or 0)
         if bid <= 0 or ask <= bid or float(reference_price or 0) <= 0:
@@ -2315,6 +2337,7 @@ def _final_execution_snapshot(symbol: str, reference_price: float) -> dict:
         ts = q.get("timestamp")
         if ts:
             qdf = pd.DataFrame({"Close": [mid]}, index=[pd.Timestamp(ts)])
+            from market_data import data_age_minutes
             result["quote_age_min"] = float(data_age_minutes(qdf))
         if result["quote_age_min"] > QUOTE_MAX_AGE_MIN:
             return result
@@ -2386,7 +2409,9 @@ def _aligned_relative_strength_metrics(
         ).join(qq.rename(columns={"Close":"qqq"}), how="inner").dropna()
         if len(x) < max(lookback + 1, persistence_bars + 1):
             return 0.0, 0.0, 0.0, 0.0, False
-        x = x.iloc[:-1] if len(x) > 1 else x
+        # Callers pass the stock series already trimmed to its latest completed bar.
+        # The timestamp join therefore already removes an unaligned benchmark partial;
+        # dropping one more row would incorrectly discard a valid completed bar.
         if len(x) < lookback + 1:
             return 0.0, 0.0, 0.0, 0.0, False
         sret = (float(x["stock"].iloc[-1]) / float(x["stock"].iloc[-1-lookback]) - 1.0) * 100.0
@@ -2561,6 +2586,7 @@ def analyze_intraday(
         return None
 
     closed_idx = -2 if is_us_regular_session(now_ny()) and len(today_5) >= 2 else -1
+    _closed_pos = len(today_5) + closed_idx if closed_idx < 0 else closed_idx
     closed_prev_idx = closed_idx - 1 if abs(closed_idx) <= len(today_5) - 1 else -2
 
     price = float(today_5["Close"].iloc[-1])
@@ -2593,7 +2619,7 @@ def analyze_intraday(
     c5 = today_5["Close"]
     e5 = float(_ema(c5, 20).iloc[-1])
     r5 = float(_rsi(c5, 14).iloc[-1])
-    _closed_d = today_5.iloc[:closed_idx + 1].copy()
+    _closed_d = today_5.iloc[:_closed_pos + 1].copy()
     _closed_c5 = _closed_d["Close"].astype(float)
     e5_closed = float(_ema(_closed_c5, 20).iloc[-1]) if len(_closed_c5) else e5
     vwap_closed_s = _vwap(_closed_d)
@@ -2632,12 +2658,13 @@ def analyze_intraday(
     # A real retest requires a prior close above the broken resistance,
     # followed by a return toward that same level. A mere historical touch is
     # not enough to label the setup as Retest.
-    break_window = today_5.iloc[max(0, closed_idx - 5):closed_idx]
+    _closed_pos = len(today_5) + closed_idx if closed_idx < 0 else closed_idx
+    break_window = today_5.iloc[max(0, _closed_pos - 5):_closed_pos]
     prior_break = bool(
         len(break_window) > 0
         and (break_window["Close"].astype(float) >= level_high * 1.001).any()
     )
-    retest_window = today_5.iloc[max(0, closed_idx - 3):closed_idx] if "closed_idx" in locals() else today_5.tail(4)
+    retest_window = today_5.iloc[max(0, _closed_pos - 3):_closed_pos]
     retest_touch = bool(
         len(retest_window) > 0
         and (retest_window["Low"].astype(float) <= level_high * 1.007).any()
@@ -2709,7 +2736,7 @@ def analyze_intraday(
 
     retest = prior_break and near_level and closed_close >= level_high * 0.997
 
-    recent4 = today_5.iloc[max(0, closed_idx - 4):closed_idx]
+    recent4 = today_5.iloc[max(0, _closed_pos - 4):_closed_pos]
     closed_close = float(today_5["Close"].iloc[closed_idx])
     vwap_touch = False
     try:
@@ -2724,7 +2751,10 @@ def analyze_intraday(
     try:
         rh = recent4["High"].astype(float)
         rl = recent4["Low"].astype(float)
-        ema_touch = bool(((rl <= e5 * 1.006) & (rh >= e5 * 0.994)).any())
+        # Strategy structure is based on completed candles; do not let the
+        # currently forming EMA20 change whether the EMA20 setup matches.
+        _ema_touch_level = float(e5_closed or e5)
+        ema_touch = bool(((rl <= _ema_touch_level * 1.006) & (rh >= _ema_touch_level * 0.994)).any())
     except Exception:
         ema_touch = False
     ema_pullback = bool(ema_touch and closed_close >= e5_closed * 1.001)
@@ -2735,7 +2765,7 @@ def analyze_intraday(
         support_window = today_5["Low"].astype(float).iloc[-10:-2]
         if len(support_window) >= 5:
             support_level = float(support_window.min())
-            recent3 = today_5.iloc[max(0, closed_idx - 3):closed_idx]
+            recent3 = today_5.iloc[max(0, _closed_pos - 3):_closed_pos]
             swept = len(recent3) > 0 and (recent3["Low"].astype(float) < support_level * 0.998).any()
             reclaimed = closed_close >= support_level * 1.002
             liquidity_sweep = bool(swept and reclaimed)
@@ -2786,9 +2816,12 @@ def analyze_intraday(
         cur_bar_pos = len(today_5) + closed_idx
         if cur_bar_pos >= 5:
             # True continuation = impulse -> controlled pause/pullback -> resume.
-            impulse = today_5.iloc[cur_bar_pos - 5:cur_bar_pos - 3]
-            pause = today_5.iloc[cur_bar_pos - 3:cur_bar_pos - 1]
-            resume = today_5.iloc[cur_bar_pos - 1:cur_bar_pos].iloc[0]
+            # The trigger must be the latest CLOSED candle itself. The previous
+            # implementation used cur_bar_pos - 1, which skipped the latest
+            # completed candle by one bar and could delay/lose a valid trigger.
+            impulse = today_5.iloc[cur_bar_pos - 4:cur_bar_pos - 2]
+            pause = today_5.iloc[cur_bar_pos - 2:cur_bar_pos]
+            resume = today_5.iloc[cur_bar_pos]
 
             impulse_open = float(impulse["Open"].iloc[0])
             impulse_close = float(impulse["Close"].iloc[-1])
@@ -2814,7 +2847,7 @@ def analyze_intraday(
                 and pause_hold
                 and resume_green
                 and resume_above_pause
-                and mom > 0.08
+                and ((float(resume_close) - float(today_5["Close"].iloc[max(0, cur_bar_pos - 5)])) / max(float(today_5["Close"].iloc[max(0, cur_bar_pos - 5)]), 1e-9) * 100.0) > 0.08
             )
     except Exception:
         momentum_continuation = False
@@ -2857,7 +2890,7 @@ def analyze_intraday(
     early_holding = False
     early = False
     try:
-        recent3 = today_5.iloc[:closed_idx + 1].tail(3)
+        recent3 = today_5.iloc[:_closed_pos + 1].tail(3)
         early_range = (float(recent3["High"].max()) - float(recent3["Low"].min())) / max(price, 1e-9) * 100
         early_near_resistance = level_high > 0 and abs(price - level_high) / max(price, 1e-9) * 100 <= 1.5
         early_holding = float(recent3["Close"].iloc[-1]) >= float(recent3["Close"].iloc[0])
@@ -2912,7 +2945,7 @@ def analyze_intraday(
             drive_return = (drive_high - drive_open) / max(drive_open, 1e-9) * 100
             drive_level = drive_high
             drive_is_recent = len(today_5) <= 12
-            recent = today_5.iloc[max(0, closed_idx - 3):closed_idx]
+            recent = today_5.iloc[max(0, _closed_pos - 3):_closed_pos]
             recent_low = float(recent["Low"].min()) if len(recent) else price
             pullback_from_high = (drive_high - recent_low) / max(drive_high, 1e-9) * 100
             reclaim_drive = closed_close >= drive_high * 0.999
@@ -2949,17 +2982,28 @@ def analyze_intraday(
         else:
             hod_level = 0.0
 
-        if len(today_5) >= 7 and orb_high > 0:
-            post_orb = today_5.iloc[3:min(len(today_5)-1, 7)]
-            broke = bool((post_orb["High"].astype(float) >= orb_high * 1.002).any())
-            failure = bool((post_orb["Close"].astype(float) <= orb_high * 0.998).any())
+        if _closed_pos >= 7 and orb_high > 0:
+            post_orb = today_5.iloc[3:_closed_pos]
+            _latest_failure_pos = None
+            for _i in range(len(post_orb) - 1, -1, -1):
+                if float(post_orb["Close"].iloc[_i]) <= orb_high * 0.998:
+                    _latest_failure_pos = _i
+                    break
+            if _latest_failure_pos is not None:
+                _pre_failure = post_orb.iloc[:_latest_failure_pos]
+                broke = bool(len(_pre_failure) and (
+                    _pre_failure["High"].astype(float) >= orb_high * 1.002
+                ).any())
+                failure = True
+            else:
+                broke = failure = False
             reclaim = closed_close >= orb_high * 1.001
             orb_failed_reclaim = bool(broke and failure and reclaim)
         else:
             post_orb = today_5.iloc[0:0]
 
         if len(today_5) >= 9:
-            closed_today_5 = today_5.iloc[:closed_idx + 1]
+            closed_today_5 = today_5.iloc[:_closed_pos + 1]
             a = closed_today_5.iloc[-9:-6]
             b = closed_today_5.iloc[-6:-3]
             c = closed_today_5.iloc[-3:]
@@ -3003,7 +3047,7 @@ def analyze_intraday(
             if not (_spy_fresh and _qqq_fresh):
                 raise ValueError(f"RS benchmark stale: SPY={float(_spy_age):.1f}m, QQQ={float(_qqq_age):.1f}m")
             rs_vs_spy, rs_vs_qqq, rs_persistence, _rs_stock_return, _rs_valid = _aligned_relative_strength_metrics(
-                today_5.iloc[:closed_idx + 1], spy5, qqq5, lookback=5, persistence_bars=5
+                today_5.iloc[:_closed_pos + 1], spy5, qqq5, lookback=5, persistence_bars=5
             )
             rs_strategy_ok = bool(_rs_valid and rs_vs_spy >= 1.0 and rs_vs_qqq >= 1.0 and rs_persistence >= 60.0)
         except Exception as exc:
@@ -4238,6 +4282,15 @@ def analyze_intraday(
     elif entry_type == "استعادة قمة اليوم":
         reasons.append("استعادة قمة اليوم بعد تراجع تحتها")
         factors.append("hod_reclaim")
+    elif entry_type == "استمرار/استعادة الفجوة":
+        reasons.append("استمرار/استعادة الفجوة مع ثبات الفجوة ومحفز الاستعادة")
+        factors.append("gap_setup")
+    elif entry_type == "استعادة بعد فشل كسر دعم":
+        reasons.append("استعادة بعد فشل كسر دعم مع تأكيد الاستعادة")
+        factors.append("failed_breakdown_reclaim")
+    elif entry_type == "ارتداد بعد تفوق نسبي":
+        reasons.append("ارتداد بعد تفوق نسبي مع قوة نسبية وبنية Higher Low")
+        factors.append("rs_pullback")
     else:
         reasons.append("دخول مبكر فوق VWAP")
         factors.append("early")
@@ -4366,7 +4419,6 @@ def analyze_intraday(
             and not chop
             and ext_tmp <= 3.5
             and override_score >= 97.0
-            and entry_type != "دخول مبكر"
         )
     else:
         strong_stock_market_override = False
@@ -4450,11 +4502,11 @@ def analyze_intraday(
     # references are fallback-only and never compete with the strategy stop.
     strategy_stop = 0.0
     if entry_type == "ارتداد VWAP":
-        strategy_stop = float(today_5["Low"].iloc[max(0, closed_idx - 4):closed_idx + 1].min()) * 0.997 if closed_idx > 0 else vwap_last * 0.997
+        strategy_stop = float(today_5["Low"].iloc[max(0, _closed_pos - 4):_closed_pos + 1].min()) * 0.997 if _closed_pos >= 0 else vwap_last * 0.997
     elif entry_type == "ارتداد EMA20":
-        strategy_stop = float(today_5["Low"].iloc[max(0, closed_idx - 4):closed_idx + 1].min()) * 0.997 if closed_idx > 0 else e5 * 0.997
+        strategy_stop = float(today_5["Low"].iloc[max(0, _closed_pos - 4):_closed_pos + 1].min()) * 0.997 if _closed_pos >= 0 else e5 * 0.997
     elif entry_type in {"سحب سيولة", "سحب سيولة مع Displacement"}:
-        sweep_extreme = float(today_5["Low"].iloc[max(0, closed_idx - 3):closed_idx].min()) if closed_idx > 0 else 0.0
+        sweep_extreme = float(today_5["Low"].iloc[max(0, _closed_pos - 3):_closed_pos].min()) if _closed_pos > 0 else 0.0
         strategy_stop = sweep_extreme * 0.997 if sweep_extreme > 0 else (support_level * 0.997 if support_level > 0 else recent_low * 0.997)
     elif entry_type in {"اختراق مؤكد", "اختراق نطاق الافتتاح"}:
         level = orb_high if entry_type == "اختراق نطاق الافتتاح" else level_high
@@ -4538,7 +4590,11 @@ def analyze_intraday(
     adaptive_stop, adaptive_tp1, adaptive_tp1_r = _apply_adaptive_exit(
         price, structural_stop, market_regime, entry_type, policy_now, atr
     )
-    if policy_now.get("exit_active"):
+    # A structural stop wider than the hard risk ceiling is a real quality
+    # failure. Adaptive Exit must never "repair" it by compressing the stop,
+    # because that would change the strategy's structural invalidation point.
+    _wide_structural_stop = bool(quality_wide_stop)
+    if policy_now.get("exit_active") and not _wide_structural_stop:
         stop = adaptive_stop
         tp1 = adaptive_tp1
         risk = price - stop
@@ -4892,7 +4948,8 @@ def _prefilter_intraday(
         # Time-of-day RVOL: compare cumulative volume through the current
         # session position with the same number of 5m bars in prior sessions.
         _stage1_closed_idx = -2 if is_us_regular_session(now_ny()) and len(today) >= 2 else -1
-        _stage1_today = today.iloc[:_stage1_closed_idx + 1].copy()
+        _stage1_closed_pos = len(today) + _stage1_closed_idx if _stage1_closed_idx < 0 else _stage1_closed_idx
+        _stage1_today = today.iloc[:_stage1_closed_pos + 1].copy()
         if len(_stage1_today) < 1:
             _stage1_today = today.copy()
         current_today = _stage1_today["Volume"].astype(float).fillna(0.0)
@@ -5075,7 +5132,7 @@ def scan_intraday(
                 _prefilter_intraday,
                 sym,
                 (bulk_h1.get(sym), bulk_m5.get(sym))
-                if sym in bulk_h1 and sym in bulk_m5 else None,
+                if (sym in bulk_h1 or sym in bulk_m5) else None,
                 stage1_audit_counts,
                 stage1_audit_lock,
                 stage1_data_audit_counts,
@@ -5271,7 +5328,7 @@ def scan_intraday(
 
             # Final execution gate: آخر Quote مستقل قبل قبول التنبيه.
             # لا يعيد حساب الوقف أو الأهداف ولا يغيّر سعر التحليل الأصلي (sig.price).
-            execution = _final_execution_snapshot(sig.symbol, sig.price)
+            execution = _final_execution_snapshot(sig.symbol, sig.price, quote_snapshot=liq)
             if not execution.get("ok"):
                 rejection_counts["final_execution"] += 1
                 _exec_reason = str(execution.get("reason", "unspecified") or "unspecified")
