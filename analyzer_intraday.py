@@ -2287,30 +2287,65 @@ def _quote_liquidity(symbol: str, price: float) -> dict:
         "ask": 0.0,
         "quote_timestamp": None,
         "quote_feed": "none",
+        "reason": "not_attempted",
     }
     try:
         from market_data import fetch_latest_quote, data_age_minutes
         q = fetch_latest_quote(symbol)
-        bid, ask = float(q.get("bid") or 0), float(q.get("ask") or 0)
-        px = float(price or 0)
-        ts = q.get("timestamp")
-        result["bid"] = bid
-        result["ask"] = ask
-        result["quote_timestamp"] = ts
-        result["quote_feed"] = str(q.get("feed") or "unknown")
-        if ts:
-            qdf = pd.DataFrame({"Close": [px]}, index=[pd.Timestamp(ts)])
-            age = data_age_minutes(qdf)
-            result["quote_age_min"] = age
-        if bid > 0 and ask > bid and px > 0 and result["quote_age_min"] <= QUOTE_MAX_AGE_MIN:
-            mid = (bid + ask) / 2.0
-            spread = (ask - bid) / mid * 100.0
-            result["spread_pct"] = spread
-            result["slippage_pct"] = (ask - mid) / mid * 100.0
-            result["ok"] = spread <= HARD_MAX_SPREAD_PCT
-            result["quote_source"] = "alpaca-" + str(q.get("feed") or "unknown")
+        if not isinstance(q, dict):
+            result["reason"] = "quote_response_not_dict"
+            log.warning("INTRADAY QUOTE REJECT | %s | reason=%s response_type=%s",
+                        symbol, result["reason"], type(q).__name__)
+        else:
+            bid, ask = float(q.get("bid") or 0), float(q.get("ask") or 0)
+            px = float(price or 0)
+            ts = q.get("timestamp")
+            result["bid"] = bid
+            result["ask"] = ask
+            result["quote_timestamp"] = ts
+            result["quote_feed"] = str(q.get("feed") or "unknown")
+            if not q:
+                result["reason"] = "empty_quote_response"
+            elif bid <= 0:
+                result["reason"] = "invalid_bid"
+            elif ask <= 0:
+                result["reason"] = "invalid_ask"
+            elif ask <= bid:
+                result["reason"] = "ask_not_above_bid"
+            elif px <= 0:
+                result["reason"] = "invalid_reference_price"
+            elif not ts:
+                result["reason"] = "missing_quote_timestamp"
+            else:
+                qdf = pd.DataFrame({"Close": [px]}, index=[pd.Timestamp(ts)])
+                age = data_age_minutes(qdf)
+                result["quote_age_min"] = age
+                if age > QUOTE_MAX_AGE_MIN:
+                    result["reason"] = f"quote_stale>{QUOTE_MAX_AGE_MIN}m"
+                else:
+                    mid = (bid + ask) / 2.0
+                    spread = (ask - bid) / mid * 100.0
+                    result["spread_pct"] = spread
+                    result["slippage_pct"] = (ask - mid) / mid * 100.0
+                    result["quote_source"] = "alpaca-" + str(q.get("feed") or "unknown")
+                    if spread > HARD_MAX_SPREAD_PCT:
+                        result["reason"] = f"spread>{HARD_MAX_SPREAD_PCT:.2f}%"
+                    else:
+                        result["ok"] = True
+                        result["reason"] = "ok"
+            if not result["ok"]:
+                log.warning(
+                    "INTRADAY QUOTE REJECT | %s | reason=%s bid=%s ask=%s age=%.3fm feed=%s source=%s ts=%s",
+                    symbol, result["reason"], result["bid"], result["ask"],
+                    float(result["quote_age_min"]), result["quote_feed"],
+                    result["quote_source"], result["quote_timestamp"],
+                )
     except Exception as exc:
-        log.debug("INTRADAY non-critical fallback exception: %s", exc)
+        result["reason"] = f"exception:{type(exc).__name__}:{str(exc)[:220]}"
+        log.warning(
+            "INTRADAY QUOTE EXCEPTION | %s | %s | feed=IEX",
+            symbol, result["reason"], exc_info=True,
+        )
     _QUOTE_CACHE[symbol] = (now, result)
     return result
 
@@ -2323,6 +2358,7 @@ def _final_execution_snapshot(symbol: str, reference_price: float, quote_snapsho
         "spread_pct": float("inf"),
         "quote_age_min": float("inf"),
         "quote_source": "none",
+        "reason": "not_attempted",
     }
     try:
         q = quote_snapshot if isinstance(quote_snapshot, dict) else None
@@ -2331,7 +2367,17 @@ def _final_execution_snapshot(symbol: str, reference_price: float, quote_snapsho
             q = fetch_latest_quote(symbol)
         bid = float(q.get("bid") or 0)
         ask = float(q.get("ask") or 0)
-        if bid <= 0 or ask <= bid or float(reference_price or 0) <= 0:
+        if bid <= 0:
+            result["reason"] = "invalid_bid"
+            return result
+        if ask <= 0:
+            result["reason"] = "invalid_ask"
+            return result
+        if ask <= bid:
+            result["reason"] = "ask_not_above_bid"
+            return result
+        if float(reference_price or 0) <= 0:
+            result["reason"] = "invalid_reference_price"
             return result
         mid = (bid + ask) / 2.0
         ts = q.get("timestamp")
@@ -2340,6 +2386,7 @@ def _final_execution_snapshot(symbol: str, reference_price: float, quote_snapsho
             from market_data import data_age_minutes
             result["quote_age_min"] = float(data_age_minutes(qdf))
         if result["quote_age_min"] > QUOTE_MAX_AGE_MIN:
+            result["reason"] = f"quote_stale>{QUOTE_MAX_AGE_MIN}m"
             return result
         spread = (ask - bid) / mid * 100.0
         result.update({
@@ -2347,9 +2394,11 @@ def _final_execution_snapshot(symbol: str, reference_price: float, quote_snapsho
             "entry_price": round(mid, 4),
             "quote_source": "alpaca-" + str(q.get("feed") or "unknown"),
             "ok": spread <= HARD_MAX_SPREAD_PCT,
+            "reason": "ok" if spread <= HARD_MAX_SPREAD_PCT else f"spread>{HARD_MAX_SPREAD_PCT:.2f}%",
         })
     except Exception as exc:
-        log.debug("INTRADAY FINAL EXECUTION SNAPSHOT FAILED | %s | %s", symbol, str(exc))
+        result["reason"] = f"exception:{type(exc).__name__}:{str(exc)[:220]}"
+        log.warning("INTRADAY FINAL EXECUTION SNAPSHOT FAILED | %s | %s", symbol, result["reason"], exc_info=True)
     return result
 
 
