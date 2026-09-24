@@ -27,6 +27,12 @@ TWELVE_TIMEOUT = float(os.getenv("TWELVE_DATA_TIMEOUT", "10"))
 TWELVE_429_RETRIES = int(os.getenv("TWELVE_DATA_429_RETRIES", "2"))
 _TWELVE_RATE_LOCK = threading.Lock()
 _TWELVE_NEXT_REQUEST_AT = 0.0
+# Once Twelve Data reports that the daily quota is exhausted, retrying every
+# symbol is guaranteed to fail and only wastes time/credits. Keep a process-wide
+# circuit breaker until the process restarts or an operator resets the quota.
+_TWELVE_QUOTA_LOCK = threading.Lock()
+_TWELVE_QUOTA_EXHAUSTED = False
+_TWELVE_QUOTA_REASON = ""
 
 
 _LAST_SOURCE = "none"
@@ -81,8 +87,11 @@ def twelve_configured() -> bool:
 
 
 def _twelve_get(endpoint: str, params: dict, timeout: float | None = None) -> requests.Response:
-    """Twelve Data GET with bounded 429 backoff and process-wide pacing."""
-    global _TWELVE_NEXT_REQUEST_AT
+    """Twelve Data GET with pacing plus a quota-exhaustion circuit breaker."""
+    global _TWELVE_NEXT_REQUEST_AT, _TWELVE_QUOTA_EXHAUSTED, _TWELVE_QUOTA_REASON
+    with _TWELVE_QUOTA_LOCK:
+        if _TWELVE_QUOTA_EXHAUSTED:
+            raise RuntimeError(f"Twelve Data quota exhausted: {_TWELVE_QUOTA_REASON or 'daily API credits exhausted'}")
     url = f"{TWELVE_URL.rstrip('/')}/{endpoint.lstrip('/')}"
     params = dict(params or {})
     params.setdefault("apikey", TWELVE_API_KEY)
@@ -101,6 +110,17 @@ def _twelve_get(endpoint: str, params: dict, timeout: float | None = None) -> re
                 continue
         if r.status_code != 429:
             return r
+
+        # A quota-exhausted 429 is not a transient rate-limit event. Do not
+        # retry it and do not let every symbol repeat the same failed request.
+        body = (r.text or "").lower()
+        if "run out of api credits" in body or "api credits for the day" in body or "quota" in body:
+            with _TWELVE_QUOTA_LOCK:
+                _TWELVE_QUOTA_EXHAUSTED = True
+                _TWELVE_QUOTA_REASON = (r.text or "daily API credits exhausted")[:180]
+            log.error("Twelve Data quota exhausted; disabling further fallback requests for this process")
+            raise RuntimeError("Twelve Data quota exhausted")
+
         if attempt >= TWELVE_429_RETRIES:
             return r
         retry_after = r.headers.get("Retry-After")
@@ -537,7 +557,20 @@ def fetch_intraday(symbol: str, period: str = "5d", interval: str = "5m") -> pd.
 
     if twelve_configured():
         try:
-            df = _twelve_time_series(symbol, interval, start, datetime.now(timezone.utc), outputsize=5000)
+            # Keep fallback payloads tight. Twelve Data usage is quota-sensitive;
+            # the analyzer only needs enough bars for the requested lookback,
+            # not the 5000-bar maximum.
+            if interval in {"5m", "5Min"}:
+                td_outputsize = min(max(days * 78 + 30, 120), 800)
+            elif interval in {"15m", "15Min"}:
+                td_outputsize = min(max(days * 26 + 20, 80), 400)
+            elif interval in {"60m", "1h", "1Hour"}:
+                td_outputsize = min(max(days * 7 + 10, 60), 150)
+            elif interval in {"1m", "1Min"}:
+                td_outputsize = min(max(days * 390 + 30, 300), 2000)
+            else:
+                td_outputsize = min(max(days * 2 + 10, 30), 500)
+            df = _twelve_time_series(symbol, interval, start, datetime.now(timezone.utc), outputsize=td_outputsize)
             if df is not None and len(df) >= 10:
                 fresh_ok, age = _twelve_fresh(df, interval)
                 log.info("DATA FALLBACK | %s | Twelve Data | interval=%s | age=%.1fm | fresh=%s",

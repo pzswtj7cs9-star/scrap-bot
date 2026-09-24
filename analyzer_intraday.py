@@ -2654,6 +2654,10 @@ def analyze_intraday(
     above_open = price >= day_open
 
     hist_5 = m5[m5.index.date < last_day]
+    # Define the completed 5m session slice before any volume/structure
+    # calculation uses it. The live candle remains available in today_5 for
+    # execution proximity, but must not leak into completed-bar analysis.
+    _closed_d = today_5.iloc[:_closed_pos + 1].copy()
     vol_session_ratio = _intraday_volume_ratio(_closed_d, hist_5, max_days=20)
     vol_session_ok = vol_session_ratio >= 0.90
 
@@ -2668,7 +2672,6 @@ def analyze_intraday(
     c5 = today_5["Close"]
     e5 = float(_ema(c5, 20).iloc[-1])
     r5 = float(_rsi(c5, 14).iloc[-1])
-    _closed_d = today_5.iloc[:_closed_pos + 1].copy()
     _closed_c5 = _closed_d["Close"].astype(float)
     e5_closed = float(_ema(_closed_c5, 20).iloc[-1]) if len(_closed_c5) else e5
     vwap_closed_s = _vwap(_closed_d)
