@@ -57,6 +57,10 @@ _WS_BARS: dict[str, deque] = {}
 _WS_CONNECTED = False
 _WS_LAST_ERROR = ""
 _WS_MAX_BARS_PER_SYMBOL = 10
+# The reader thread owns the live socket.  Desired symbols are updated by
+# set_intraday_ws_symbols(); _ws_loop applies only the add/remove delta on the
+# existing connection instead of closing and reconnecting on every Top-30 change.
+_WS_SUBSCRIBED_SYMBOLS: set[str] = set()
 
 def _ws_normalize_symbols(symbols) -> list[str]:
     out = []
@@ -97,28 +101,63 @@ def _ws_loop() -> None:
             _WS_LAST_ERROR = f"websocket-client unavailable: {exc}"
         log.error("ALPACA IEX WS UNAVAILABLE | %s", _WS_LAST_ERROR)
         return
+
     url = "wss://stream.data.alpaca.markets/v2/iex"
     while not _WS_STOP.is_set():
         with _WS_LOCK:
-            symbols = sorted(_WS_SYMBOLS)
-        if not symbols or not alpaca_configured():
+            desired = set(_WS_SYMBOLS)
+        if not desired or not alpaca_configured():
             _WS_STOP.wait(1.0)
             continue
+
         ws = None
+        subscribed: set[str] = set()
         try:
             ws = websocket.create_connection(url, timeout=5, enable_multithread=True)
             ws.send(json.dumps({"action": "auth", "key": APCA_KEY, "secret": APCA_SECRET}))
-            ws.recv()
-            ws.send(json.dumps({"action": "subscribe", "bars": symbols}))
+            auth_raw = ws.recv()
+            auth_payload = json.loads(auth_raw) if auth_raw else []
+            if isinstance(auth_payload, dict):
+                auth_payload = [auth_payload]
+            if not any(isinstance(m, dict) and m.get("T") == "success" for m in (auth_payload or [])):
+                raise RuntimeError(f"WebSocket auth failed: {auth_raw}")
+
+            # Initial subscription for the current desired Top-30.
+            ws.send(json.dumps({"action": "subscribe", "bars": sorted(desired)}))
+            subscribed = set(desired)
             with _WS_LOCK:
+                _WS_SUBSCRIBED_SYMBOLS.clear()
+                _WS_SUBSCRIBED_SYMBOLS.update(subscribed)
                 _WS_CONNECTED = True
                 _WS_LAST_ERROR = ""
-            log.info("ALPACA IEX WS CONNECTED | symbols=%d", len(symbols))
+            log.info("ALPACA IEX WS CONNECTED | symbols=%d", len(subscribed))
+
             while not _WS_STOP.is_set():
+                # Keep one persistent connection.  If Top-30 membership changes,
+                # update only the delta on this same socket.
                 with _WS_LOCK:
-                    current = sorted(_WS_SYMBOLS)
-                if current != symbols:
-                    break
+                    desired = set(_WS_SYMBOLS)
+
+                to_remove = subscribed - desired
+                to_add = desired - subscribed
+
+                if to_remove:
+                    ws.send(json.dumps({"action": "unsubscribe", "bars": sorted(to_remove)}))
+                    subscribed -= to_remove
+
+                if to_add:
+                    ws.send(json.dumps({"action": "subscribe", "bars": sorted(to_add)}))
+                    subscribed |= to_add
+
+                if to_remove or to_add:
+                    with _WS_LOCK:
+                        _WS_SUBSCRIBED_SYMBOLS.clear()
+                        _WS_SUBSCRIBED_SYMBOLS.update(subscribed)
+                    log.info(
+                        "ALPACA IEX WS SUBSCRIPTION UPDATED | symbols=%d | added=%d | removed=%d",
+                        len(subscribed), len(to_add), len(to_remove),
+                    )
+
                 ws.settimeout(2.0)
                 try:
                     raw = ws.recv()
@@ -132,17 +171,26 @@ def _ws_loop() -> None:
                 if isinstance(payload, dict):
                     payload = [payload]
                 for msg in payload if isinstance(payload, list) else []:
-                    if isinstance(msg, dict) and msg.get("T") == "b":
+                    if not isinstance(msg, dict):
+                        continue
+                    msg_type = msg.get("T")
+                    if msg_type == "b":
                         _ws_store_bar(msg)
+                    elif msg_type == "subscription":
+                        bars = msg.get("bars") or []
+                        log.debug("ALPACA IEX WS SUBSCRIPTION ACK | bars=%d", len(bars))
+
         except Exception as exc:
             with _WS_LOCK:
                 _WS_CONNECTED = False
+                _WS_SUBSCRIBED_SYMBOLS.clear()
                 _WS_LAST_ERROR = str(exc)[:240]
             log.warning("ALPACA IEX WS ERROR | %s", _WS_LAST_ERROR)
             _WS_STOP.wait(2.0)
         finally:
             with _WS_LOCK:
                 _WS_CONNECTED = False
+                _WS_SUBSCRIBED_SYMBOLS.clear()
             try:
                 if ws is not None:
                     ws.close()
