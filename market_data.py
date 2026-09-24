@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import logging
+import json
 import os
 import threading
+from collections import deque
 import time as _time
 from datetime import datetime, timedelta, timezone
 from typing import Optional
@@ -44,6 +46,169 @@ APCA_MIN_REQUEST_INTERVAL = float(os.getenv("APCA_MIN_REQUEST_INTERVAL", "0.35")
 APCA_429_RETRIES = int(os.getenv("APCA_429_RETRIES", "3"))
 _APCA_RATE_LOCK = threading.Lock()
 _APCA_NEXT_REQUEST_AT = 0.0
+
+# Rolling Alpaca IEX WebSocket cache for the dynamically selected intraday Top-30.
+# This is a data-layer cache only; it never changes strategy/scoring logic.
+_WS_LOCK = threading.RLock()
+_WS_STOP = threading.Event()
+_WS_THREAD = None
+_WS_SYMBOLS: set[str] = set()
+_WS_BARS: dict[str, deque] = {}
+_WS_CONNECTED = False
+_WS_LAST_ERROR = ""
+_WS_MAX_BARS_PER_SYMBOL = 10
+
+def _ws_normalize_symbols(symbols) -> list[str]:
+    out = []
+    seen = set()
+    for sym in symbols or []:
+        s = str(sym).upper().strip()
+        if s and s not in seen:
+            out.append(s); seen.add(s)
+    return out
+
+def _ws_store_bar(msg: dict) -> None:
+    sym = str(msg.get("S") or msg.get("symbol") or "").upper().strip()
+    ts = msg.get("t") or msg.get("timestamp")
+    if not sym or not ts:
+        return
+    try:
+        dt = pd.Timestamp(ts)
+        if dt.tzinfo is None:
+            dt = dt.tz_localize("UTC")
+        dt = dt.tz_convert("America/New_York")
+        row = {
+            "Open": float(msg["o"]), "High": float(msg["h"]),
+            "Low": float(msg["l"]), "Close": float(msg["c"]),
+            "Volume": float(msg.get("v") or 0),
+        }
+    except Exception:
+        return
+    with _WS_LOCK:
+        q = _WS_BARS.setdefault(sym, deque(maxlen=_WS_MAX_BARS_PER_SYMBOL))
+        q.append((dt, row))
+
+def _ws_loop() -> None:
+    global _WS_CONNECTED, _WS_LAST_ERROR
+    try:
+        import websocket
+    except Exception as exc:
+        with _WS_LOCK:
+            _WS_LAST_ERROR = f"websocket-client unavailable: {exc}"
+        log.error("ALPACA IEX WS UNAVAILABLE | %s", _WS_LAST_ERROR)
+        return
+    url = "wss://stream.data.alpaca.markets/v2/iex"
+    while not _WS_STOP.is_set():
+        with _WS_LOCK:
+            symbols = sorted(_WS_SYMBOLS)
+        if not symbols or not alpaca_configured():
+            _WS_STOP.wait(1.0)
+            continue
+        ws = None
+        try:
+            ws = websocket.create_connection(url, timeout=5, enable_multithread=True)
+            ws.send(json.dumps({"action": "auth", "key": APCA_KEY, "secret": APCA_SECRET}))
+            ws.recv()
+            ws.send(json.dumps({"action": "subscribe", "bars": symbols}))
+            with _WS_LOCK:
+                _WS_CONNECTED = True
+                _WS_LAST_ERROR = ""
+            log.info("ALPACA IEX WS CONNECTED | symbols=%d", len(symbols))
+            while not _WS_STOP.is_set():
+                with _WS_LOCK:
+                    current = sorted(_WS_SYMBOLS)
+                if current != symbols:
+                    break
+                ws.settimeout(2.0)
+                try:
+                    raw = ws.recv()
+                except Exception as exc:
+                    if "timed out" in str(exc).lower():
+                        continue
+                    raise
+                if not raw:
+                    continue
+                payload = json.loads(raw)
+                if isinstance(payload, dict):
+                    payload = [payload]
+                for msg in payload if isinstance(payload, list) else []:
+                    if isinstance(msg, dict) and msg.get("T") == "b":
+                        _ws_store_bar(msg)
+        except Exception as exc:
+            with _WS_LOCK:
+                _WS_CONNECTED = False
+                _WS_LAST_ERROR = str(exc)[:240]
+            log.warning("ALPACA IEX WS ERROR | %s", _WS_LAST_ERROR)
+            _WS_STOP.wait(2.0)
+        finally:
+            with _WS_LOCK:
+                _WS_CONNECTED = False
+            try:
+                if ws is not None:
+                    ws.close()
+            except Exception:
+                pass
+
+def set_intraday_ws_symbols(symbols: list[str]) -> None:
+    """Update the rolling IEX WebSocket subscription for the current Top-30."""
+    global _WS_THREAD
+    clean = _ws_normalize_symbols(symbols)[:30]
+    with _WS_LOCK:
+        changed = set(clean) != _WS_SYMBOLS
+        _WS_SYMBOLS.clear()
+        _WS_SYMBOLS.update(clean)
+        for sym in clean:
+            _WS_BARS.setdefault(sym, deque(maxlen=_WS_MAX_BARS_PER_SYMBOL))
+        if _WS_THREAD is None or not _WS_THREAD.is_alive():
+            _WS_STOP.clear()
+            _WS_THREAD = threading.Thread(target=_ws_loop, name="alpaca-iex-top30", daemon=True)
+            _WS_THREAD.start()
+    if changed:
+        log.info("ALPACA IEX WS SUBSCRIPTION UPDATED | symbols=%d", len(clean))
+
+def get_intraday_ws_bars(symbol: str) -> pd.DataFrame:
+    """Return cached recent 1m IEX bars for one subscribed symbol."""
+    sym = str(symbol).upper().strip()
+    with _WS_LOCK:
+        rows = list(_WS_BARS.get(sym, ()))
+    if not rows:
+        return pd.DataFrame()
+    data = pd.DataFrame([row for _, row in rows], index=pd.DatetimeIndex([ts for ts, _ in rows]))
+    data = data[~data.index.duplicated(keep="last")].sort_index()
+    data.attrs["data_source"] = "alpaca-iex-websocket"
+    data.attrs["feed"] = "iex"
+    return data
+
+def websocket_5m_patch(symbol: str, base: pd.DataFrame) -> pd.DataFrame:
+    """Patch only the latest completed 5m bucket from cached IEX 1m bars."""
+    if base is None or base.empty:
+        return base
+    one = get_intraday_ws_bars(symbol)
+    if one is None or one.empty:
+        return base
+    idx = pd.DatetimeIndex(one.index)
+    bucket = idx.floor("5min")
+    tmp = one.copy(); tmp["_bucket"] = bucket
+    agg = tmp.groupby("_bucket", sort=True).agg(
+        Open=("Open", "first"), High=("High", "max"), Low=("Low", "min"),
+        Close=("Close", "last"), Volume=("Volume", "sum")
+    )
+    if agg.empty:
+        return base
+    latest = agg.index[-1]
+    # Only replace a bucket when all five minute bars are present; otherwise
+    # leave the historical REST candle untouched until the bucket completes.
+    count = int((bucket == latest).sum())
+    if count < 5:
+        return base
+    out = base.copy(); out.index = pd.DatetimeIndex(out.index)
+    out = out[out.index.floor("5min") != latest]
+    out = pd.concat([out, agg.loc[[latest]]])
+    out = out[~out.index.duplicated(keep="last")].sort_index()
+    out.attrs.update(base.attrs)
+    out.attrs["data_source"] = "alpaca-iex+websocket"
+    out.attrs["websocket_1m_count"] = count
+    return out
 
 
 def _alpaca_get(url: str, *, params: dict, timeout: float) -> requests.Response:

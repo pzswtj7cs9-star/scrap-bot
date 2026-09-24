@@ -30,7 +30,7 @@ from stocks import MAX_AUTO_PRICE
 log = logging.getLogger(__name__)
 
 # Deployment marker: proves which analyzer_intraday build Render actually loaded.
-INTRADAY_ANALYZER_VERSION = "20260923-FINAL-END-TO-END-AUDIT-V3"
+INTRADAY_ANALYZER_VERSION = "20260924-DYNAMIC-TOP30-SNAPSHOT-V1"
 log.info("INTRADAY ANALYZER VERSION | %s", INTRADAY_ANALYZER_VERSION)
 
 SKIP_OPEN_MIN = 20
@@ -75,6 +75,10 @@ _INTRADAY_NO_SIGNAL_AUDIT: dict[str, dict[str, int]] = {}
 _INTRADAY_NO_SIGNAL_LOCK = Lock()
 _INTRADAY_DATA_AUDIT: dict[str, dict[str, int]] = {}
 _INTRADAY_DATA_AUDIT_LOCK = Lock()
+
+# Per-scan candle snapshot. After construction, strategy/gate code must only
+# consume these frames; Live Quote remains the sole execution-time exception.
+IntradaySnapshot = dict[str, object]
 
 def _intraday_data_audit_record(symbol: str, *reasons: str) -> None:
     if not symbol:
@@ -177,6 +181,7 @@ ENTRY_TYPES = (
     "استمرار/استعادة الفجوة", "استعادة بعد فشل كسر دعم", "ارتداد بعد تفوق نسبي",
 )
 PREFILTER_STRATEGY_CAP = PREFILTER_MAX_CANDIDATES + (len(ENTRY_TYPES) * PREFILTER_STRATEGY_TOP_K)
+INTRADAY_LIVE_TOP_N = 30
 ADAPTIVE_MIN_EDGE = 0.04
 ADAPTIVE_MIN_COVERAGE = 0.45
 ADAPTIVE_ROLLBACK_DROP = 0.06
@@ -2596,15 +2601,27 @@ def analyze_intraday(
     name: str = "",
     market_context: tuple[bool, str] | None = None,
     preloaded: tuple[pd.DataFrame, pd.DataFrame] | None = None,
+    snapshot: IntradaySnapshot | None = None,
 ) -> Optional[IntradaySignal]:
-    from market_data import fetch_intraday
-    from market_data import intraday_data_fresh
+    from market_data import fetch_intraday, intraday_data_fresh
 
-    if preloaded is not None:
+    # Normal scan path: consume the immutable per-scan candle snapshot.
+    # The legacy fetch path remains only for backwards-compatible direct calls
+    # that do not provide a snapshot; scan_intraday() always provides one.
+    if snapshot is not None:
+        h1 = snapshot.get("h1")
+        m5 = snapshot.get("m5")
+        m15 = snapshot.get("m15")
+        if not isinstance(h1, pd.DataFrame) or not isinstance(m5, pd.DataFrame):
+            _intraday_data_audit_record(symbol, "snapshot:h1_m5_missing")
+            return None
+    elif preloaded is not None:
         h1, m5 = preloaded
+        m15 = None
     else:
         h1 = fetch_intraday(symbol, interval="60m", period="10d")
         m5 = fetch_intraday(symbol, interval="5m", period="5d")
+        m15 = None
 
     ok_h1, _ = intraday_data_fresh(h1, "60m", 90)
     if h1 is None or len(h1) < 40 or not ok_h1:
@@ -2614,20 +2631,33 @@ def analyze_intraday(
     if m5 is None or len(m5) < 30 or not ok_m5:
         return None
 
-    try:
-        m15 = fetch_intraday(symbol, interval="15m", period="10d")
-        ok_m15, m15_age_min = intraday_data_fresh(m15, "15m", 25)
-        if m15 is None:
+    if snapshot is not None:
+        if not isinstance(m15, pd.DataFrame):
             _intraday_data_audit_record(symbol, "15m:m15_missing")
-        elif len(m15) < 30:
-            _intraday_data_audit_record(symbol, "15m:m15_bars<30")
-        if not ok_m15:
-            _intraday_data_audit_record(symbol, f"15m:m15_stale(age={m15_age_min:.1f}m>25m)")
             m15 = None
-    except Exception as exc:
-        _intraday_data_audit_record(symbol, "15m:m15_fetch_exception")
-        m15 = None
-        log.debug("INTRADAY 15M DATA UNAVAILABLE | %s | %s", symbol, str(exc))
+        else:
+            ok_m15, m15_age_min = intraday_data_fresh(m15, "15m", 25)
+            if len(m15) < 30:
+                _intraday_data_audit_record(symbol, "15m:m15_bars<30")
+            if not ok_m15:
+                _intraday_data_audit_record(symbol, f"15m:m15_stale(age={m15_age_min:.1f}m>25m)")
+                m15 = None
+    else:
+        # Direct legacy callers have no snapshot; keep the old M15 fallback.
+        try:
+            m15 = fetch_intraday(symbol, interval="15m", period="10d")
+            ok_m15, m15_age_min = intraday_data_fresh(m15, "15m", 25)
+            if m15 is None:
+                _intraday_data_audit_record(symbol, "15m:m15_missing")
+            elif len(m15) < 30:
+                _intraday_data_audit_record(symbol, "15m:m15_bars<30")
+            if not ok_m15:
+                _intraday_data_audit_record(symbol, f"15m:m15_stale(age={m15_age_min:.1f}m>25m)")
+                m15 = None
+        except Exception as exc:
+            _intraday_data_audit_record(symbol, "15m:m15_fetch_exception")
+            m15 = None
+            log.debug("INTRADAY 15M DATA UNAVAILABLE | %s | %s", symbol, str(exc))
 
     last_day = m5.index[-1].date()
     today_5 = m5[m5.index.date == last_day]
@@ -2654,10 +2684,6 @@ def analyze_intraday(
     above_open = price >= day_open
 
     hist_5 = m5[m5.index.date < last_day]
-    # Define the completed 5m session slice before any volume/structure
-    # calculation uses it. The live candle remains available in today_5 for
-    # execution proximity, but must not leak into completed-bar analysis.
-    _closed_d = today_5.iloc[:_closed_pos + 1].copy()
     vol_session_ratio = _intraday_volume_ratio(_closed_d, hist_5, max_days=20)
     vol_session_ok = vol_session_ratio >= 0.90
 
@@ -2672,6 +2698,7 @@ def analyze_intraday(
     c5 = today_5["Close"]
     e5 = float(_ema(c5, 20).iloc[-1])
     r5 = float(_rsi(c5, 14).iloc[-1])
+    _closed_d = today_5.iloc[:_closed_pos + 1].copy()
     _closed_c5 = _closed_d["Close"].astype(float)
     e5_closed = float(_ema(_closed_c5, 20).iloc[-1]) if len(_closed_c5) else e5
     vwap_closed_s = _vwap(_closed_d)
@@ -2729,7 +2756,15 @@ def analyze_intraday(
     stock_relative_strength = 0.0
     relative_strength_ok = False
     if market_condition == "ضعيف":
-        market_rel_spy, market_rel_qqq, market_rel_avg = _market_relative_returns(fetch_intraday)
+        if snapshot is not None:
+            def _relative_loader(_symbol, interval="5m", period="3d"):
+                _sym = str(_symbol).upper()
+                if str(interval).lower() in ("5m", "5min") and _sym in ("SPY", "QQQ"):
+                    return snapshot.get("spy5") if _sym == "SPY" else snapshot.get("qqq5")
+                return fetch_intraday(_symbol, interval=interval, period=period)
+            market_rel_spy, market_rel_qqq, market_rel_avg = _market_relative_returns(_relative_loader)
+        else:
+            market_rel_spy, market_rel_qqq, market_rel_avg = _market_relative_returns(fetch_intraday)
         if market_rel_spy is not None and market_rel_qqq is not None and market_rel_avg is not None:
             stock_relative_strength = change_pct - market_rel_avg
             relative_strength_ok = bool(
@@ -3091,9 +3126,12 @@ def analyze_intraday(
     rs_strategy_ok = False; rs_vs_spy = rs_vs_qqq = 0.0; rs_persistence = 0.0
     if rs_pullback:
         try:
-            spy5 = fetch_intraday("SPY", interval="5m", period="2d")
-            qqq5 = fetch_intraday("QQQ", interval="5m", period="2d")
-            from market_data import intraday_data_fresh
+            if snapshot is None:
+                spy5 = fetch_intraday("SPY", interval="5m", period="2d")
+                qqq5 = fetch_intraday("QQQ", interval="5m", period="2d")
+            else:
+                spy5 = snapshot.get("spy5")
+                qqq5 = snapshot.get("qqq5")
             _spy_fresh, _spy_age = intraday_data_fresh(spy5, "5m", 12.0)
             _qqq_fresh, _qqq_age = intraday_data_fresh(qqq5, "5m", 12.0)
             if not (_spy_fresh and _qqq_fresh):
@@ -4911,16 +4949,9 @@ def _prefilter_intraday(
     try:
         from market_data import fetch_intraday, intraday_data_fresh
         if preloaded is not None:
+            # The scan supplies the complete Stage-1 candle snapshot. Never
+            # re-fetch H1/M5 here; freshness is evaluated on this same snapshot.
             h1, m5 = preloaded
-            # Bulk Alpaca data is only a preload optimization. If either frame is
-            # missing/stale, re-enter the unified loader so its Twelve Data fallback
-            # can repair the symbol before Stage 1 decides whether to reject it.
-            _pre_h1_ok, _ = intraday_data_fresh(h1, "60m", 90)
-            _pre_m5_ok, _ = intraday_data_fresh(m5, "5m", 12)
-            if h1 is None or not _pre_h1_ok:
-                h1 = fetch_intraday(symbol, interval="60m", period="10d")
-            if m5 is None or not _pre_m5_ok:
-                m5 = fetch_intraday(symbol, interval="5m", period="5d")
         else:
             h1 = fetch_intraday(symbol, interval="60m", period="10d")
             m5 = fetch_intraday(symbol, interval="5m", period="5d")
@@ -5123,12 +5154,23 @@ def scan_intraday(
     scan_intraday.last_window = "ok"
 
     try:
-        # IMPORTANT: scan_intraday has its own scope; fetch_intraday must be
-        # imported here before calling _market_alignment. Without this import
-        # the old code raised NameError, silently fell back to "السوق غير مؤكد",
-        # and every Stage-2 signal failed market_permission.
+        # Load SPY/QQQ 5m exactly once for this scan. The same frames are reused
+        # by market alignment, relative-strength checks, and every Stage-2 symbol.
         from market_data import fetch_intraday
-        market_context = _market_alignment(fetch_intraday)
+        benchmark_frames = {}
+        for _benchmark in ("SPY", "QQQ"):
+            try:
+                benchmark_frames[_benchmark] = fetch_intraday(_benchmark, interval="5m", period="2d")
+            except Exception as _exc:
+                benchmark_frames[_benchmark] = None
+                log.warning("INTRADAY BENCHMARK SNAPSHOT FAILED | %s | %s", _benchmark, str(_exc))
+
+        def _benchmark_loader(symbol, interval="5m", period="2d"):
+            if str(interval).lower() in ("5m", "5min") and str(symbol).upper() in benchmark_frames:
+                return benchmark_frames.get(str(symbol).upper())
+            return fetch_intraday(symbol, interval=interval, period=period)
+
+        market_context = _market_alignment(_benchmark_loader)
         market_regime = _market_regime_from_state(market_context[1])
         if market_regime == "ضعيف":
             scan_intraday.last_window = "SPY+QQQ لحظيًا ضعيفان"
@@ -5234,13 +5276,74 @@ def scan_intraday(
         selected.values(),
         key=lambda item: (float(item[0]), max(item[1].values()) if item[1] else 0.0),
         reverse=True,
-    )[:min(PREFILTER_STRATEGY_CAP, base_n + len(ENTRY_TYPES) * PREFILTER_STRATEGY_TOP_K)]
+    )[:INTRADAY_LIVE_TOP_N]
     log.info(
         "STAGE 2: top %d candidates selected; strategy-aware routing reserved lanes for %d strategies",
         len(finalists), len(ENTRY_TYPES),
     )
 
-    # Stage 2 — only finalists receive 15m + full setup/confluence/news analysis.
+    # Dynamic Top-30: the current Stage-1 ranking decides which symbols receive
+    # the rolling IEX WebSocket subscription. Membership is recalculated every
+    # scan; there is no fixed symbol list.
+    live_top30 = [str(item[2]).upper() for item in finalists[:INTRADAY_LIVE_TOP_N]]
+    try:
+        from market_data import set_intraday_ws_symbols, websocket_5m_patch
+        set_intraday_ws_symbols(live_top30)
+        _patched_stage1 = []
+        for _item in finalists:
+            _score, _routes, _sym, _h1, _m5 = _item
+            if str(_sym).upper() in live_top30:
+                _m5_live = websocket_5m_patch(_sym, _m5)
+                _item = (_score, _routes, _sym, _h1, _m5_live)
+            _patched_stage1.append(_item)
+        finalists = _patched_stage1
+        log.info("INTRADAY DYNAMIC TOP30 | symbols=%d | %s", len(live_top30), ",".join(live_top30))
+    except Exception as _exc:
+        log.warning("INTRADAY TOP30 WEBSOCKET LAYER UNAVAILABLE | %s", str(_exc))
+
+    # Complete candle snapshot: one M15 load per Stage-2 symbol and one shared
+    # SPY/QQQ 5m benchmark load for the entire cycle. No strategy/gate may
+    # request candle data after this point.
+    candle_snapshots: dict[str, IntradaySnapshot] = {}
+    try:
+        from market_data import fetch_intraday, intraday_data_fresh
+        for _sym, _df in benchmark_frames.items():
+            if _df is not None:
+                _ok, _age = intraday_data_fresh(_df, "5m", 12.0)
+                if not _ok:
+                    log.warning("INTRADAY SNAPSHOT BENCHMARK STALE | %s | age=%.1fm", _sym, float(_age))
+
+        def _build_snapshot(item):
+            _, _, _sym, _h1, _m5 = item
+            try:
+                _m15 = fetch_intraday(_sym, interval="15m", period="10d")
+                return _sym, {
+                    "h1": _h1, "m5": _m5, "m15": _m15,
+                    "spy5": benchmark_frames.get("SPY"),
+                    "qqq5": benchmark_frames.get("QQQ"),
+                }
+            except Exception as _exc:
+                log.warning("INTRADAY SNAPSHOT M15 FAILED | %s | %s", _sym, str(_exc))
+                return _sym, {
+                    "h1": _h1, "m5": _m5, "m15": None,
+                    "spy5": benchmark_frames.get("SPY"),
+                    "qqq5": benchmark_frames.get("QQQ"),
+                }
+
+        with ThreadPoolExecutor(max_workers=workers) as _snap_pool:
+            _snap_futures = {_snap_pool.submit(_build_snapshot, item): str(item[2]) for item in finalists}
+            for _fut in as_completed(_snap_futures):
+                _sym, _snap = _fut.result()
+                candle_snapshots[_sym] = _snap
+        log.info(
+            "INTRADAY CANDLE SNAPSHOT | symbols=%d | M15_per_symbol=1 | SPY5=1 | QQQ5=1 | nested_candle_fetch=0",
+            len(candle_snapshots),
+        )
+    except Exception as _exc:
+        log.warning("INTRADAY CANDLE SNAPSHOT FAILED | %s", str(_exc))
+        candle_snapshots = {}
+
+    # Stage 2 — only finalists receive full setup/confluence/news analysis from the same snapshot.
     results: list[IntradaySignal] = []
     rejection_counts = {
         "no_signal": 0,
@@ -5269,11 +5372,16 @@ def scan_intraday(
     def _one_stage2(item):
         _, _, sym, h1, m5 = item
         try:
+            snap = candle_snapshots.get(sym)
+            if snap is None:
+                log.warning("INTRADAY SNAPSHOT MISSING | %s", sym)
+                return None
             return analyze_intraday(
                 sym,
                 names.get(sym, sym),
                 market_context=market_context,
                 preloaded=(h1, m5),
+                snapshot=snap,
             )
         except Exception as exc:
             _intraday_data_audit_record(sym, f"stage2:analysis_exception:{str(exc)[:120]}")
