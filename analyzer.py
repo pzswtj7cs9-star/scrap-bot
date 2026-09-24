@@ -2502,26 +2502,31 @@ def _daily_market_relative_returns(fetch_intraday) -> tuple[float | None, float 
 
 
 def _daily_volume_ratio_time_of_day(symbol: str, fetch_intraday, now_ny) -> float:
-    """Daily relative volume through the same session time.
+    """Daily relative volume through the latest completed 5-minute bar only.
 
-    Compares today's cumulative 5-minute volume from the regular-session open
-    through the current time with the average cumulative volume through that
-    same time across prior sessions. Falls back to 1.0 when intraday history
-    is unavailable so missing data cannot manufacture a weak/strong reading.
+    Compares today's cumulative regular-session volume through the latest
+    completed 5-minute bar with the average cumulative volume through the same
+    completed-bar position across prior sessions. The currently forming
+    5-minute bar is never included.
     """
     try:
         bars = fetch_intraday(symbol, interval="5m", period="30d")
         if bars is None or bars.empty or "Volume" not in bars.columns:
             log.warning("DAILY VOLUME NEUTRAL | %s | missing/empty 5m volume data", symbol)
             return 1.0
+
         try:
             from market_data import intraday_data_fresh
             _fresh_ok, _age_min = intraday_data_fresh(bars, "5m", 12.0)
             if not _fresh_ok:
-                log.warning("DAILY VOLUME NEUTRAL | %s | 5m age=%.1fm>12m", symbol, float(_age_min))
+                log.warning(
+                    "DAILY VOLUME NEUTRAL | %s | 5m age=%.1fm>12m",
+                    symbol, float(_age_min)
+                )
                 return 1.0
         except Exception as _fresh_exc:
             log.debug("DAILY VOLUME FRESHNESS CHECK FAILED | %s | %s", symbol, _fresh_exc)
+
         df = bars.copy().sort_index()
         idx = pd.DatetimeIndex(df.index)
         if idx.tz is None:
@@ -2535,48 +2540,84 @@ def _daily_volume_ratio_time_of_day(symbol: str, fetch_intraday, now_ny) -> floa
             now = now.tz_localize("America/New_York")
         else:
             now = now.tz_convert("America/New_York")
+
         session_date = now.date()
-        session_open = now.normalize() + pd.Timedelta(hours=9, minutes=30)
-        if now < session_open:
+        session_open_t = pd.Timestamp("09:30").time()
+        session_close_t = pd.Timestamp("16:00").time()
+        if now.time() < session_open_t:
             return 1.0
 
-        # Use only regular-session bars through the current clock time.
-        work = df[(df.index.time >= pd.Timestamp("09:30").time()) &
-                  (df.index.time <= pd.Timestamp("16:00").time()) &
-                  (df.index <= now)]
-        if work.empty:
-            log.warning("DAILY VOLUME NEUTRAL | %s | no regular-session bars through current time", symbol)
+        # A 5-minute bar stamped at 10:00 represents 10:00-10:05.
+        # Therefore it is completed only when the clock reaches 10:05.
+        # Exclude the currently forming bar and use the latest completed bar.
+        regular = df[
+            (df.index.time >= session_open_t) &
+            (df.index.time <= session_close_t)
+        ].copy()
+
+        if regular.empty:
+            log.warning("DAILY VOLUME NEUTRAL | %s | no regular-session 5m bars", symbol)
             return 1.0
 
-        current = work[work.index.date == session_date]["Volume"].sum()
+        completed_cutoff = now.floor("5min") - pd.Timedelta(minutes=5)
+        completed = regular[regular.index <= completed_cutoff]
+
+        if completed.empty:
+            log.warning(
+                "DAILY VOLUME NEUTRAL | %s | no completed 5m bar yet",
+                symbol
+            )
+            return 1.0
+
+        current_day = completed[completed.index.date == session_date]
+        if current_day.empty:
+            log.warning(
+                "DAILY VOLUME NEUTRAL | %s | no completed bars for current session",
+                symbol
+            )
+            return 1.0
+
+        # Number of completed regular-session bars elapsed today determines
+        # the exact comparison point for every prior session.
+        completed_bars_today = len(current_day)
+        current = float(current_day["Volume"].sum())
         if current <= 0:
-            log.warning("DAILY VOLUME INVALID | %s | current cumulative volume=%.4f", symbol, float(current))
+            log.warning(
+                "DAILY VOLUME INVALID | %s | current cumulative volume=%.4f",
+                symbol, current
+            )
             return 0.0
 
-        cutoff = now.time()
         prior = []
-        for day, group in work.groupby(work.index.date):
+        for day, group in completed.groupby(completed.index.date):
             if day >= session_date:
                 continue
-            g = group[group.index.time <= cutoff]
-            if len(g) == 0:
-                continue
-            # Require a meaningful sample and use cumulative volume to this
-            # exact time, not the full-day total.
-            prior.append(float(g["Volume"].sum()))
+
+            g = group[
+                (group.index.time >= session_open_t) &
+                (group.index.time <= session_close_t)
+            ]
+
+            # Compare the same number of completed 5m bars, not a clock-time
+            # slice that may contain a partial bar or a different session shape.
+            if len(g) >= completed_bars_today:
+                g = g.iloc[:completed_bars_today]
+                prior.append(float(g["Volume"].sum()))
 
         if not prior:
             log.warning("DAILY VOLUME NEUTRAL | %s | no prior-session baseline", symbol)
             return 1.0
+
         baseline = float(pd.Series(prior[-20:]).mean())
         if baseline > 0 and np.isfinite(baseline) and np.isfinite(current):
             return float(current / baseline)
+
         log.warning("DAILY VOLUME NEUTRAL | %s | invalid baseline/current", symbol)
         return 1.0
+
     except Exception as exc:
         log.warning("DAILY VOLUME NEUTRAL | %s | exception=%s", symbol, exc)
         return 1.0
-
 
 def _aligned_relative_strength_metrics(
     stock_df: pd.DataFrame,
