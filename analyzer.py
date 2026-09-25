@@ -2447,7 +2447,7 @@ def _final_execution_snapshot(symbol: str, reference_price: float, quote_snapsho
             result["reason"] = "invalid_reference_price"
             return result
         mid = (bid + ask) / 2.0
-        ts = q.get("timestamp")
+        ts = q.get("quote_timestamp") or q.get("timestamp")
         if ts:
             qdf = pd.DataFrame({"Close": [mid]}, index=[pd.Timestamp(ts)])
             from market_data import data_age_minutes
