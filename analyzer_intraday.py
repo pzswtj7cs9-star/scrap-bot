@@ -30,7 +30,7 @@ from stocks import MAX_AUTO_PRICE
 log = logging.getLogger(__name__)
 
 # Deployment marker: proves which analyzer_intraday build Render actually loaded.
-INTRADAY_ANALYZER_VERSION = "20260925-5M-CANONICAL-SNAPSHOT-V1"
+INTRADAY_ANALYZER_VERSION = "20260925-5M-CANONICAL-SNAPSHOT-V2"
 log.info("INTRADAY ANALYZER VERSION | %s", INTRADAY_ANALYZER_VERSION)
 
 SKIP_OPEN_MIN = 20
@@ -127,13 +127,50 @@ def _cached_5m_snapshot(symbols: list[str], fetch_bulk) -> dict[str, pd.DataFram
         log.warning("INTRADAY 5M BULK REFRESH FAILED | using cached=%d | %s", len(cached), str(exc))
         fresh = {}
     if fresh:
+        # Bulk availability is not the same as 5m freshness. Alpaca can return
+        # a valid frame for a symbol whose latest completed 5m candle is older
+        # than the existing 12-minute gate. Validate every bulk result before
+        # allowing it into the canonical snapshot. Only stale symbols are
+        # repaired individually; this avoids a 196-symbol refetch storm while
+        # preserving the existing freshness gate.
+        validated = {}
+        stale_symbols = []
+        try:
+            from market_data import fetch_intraday, intraday_data_fresh
+            for _sym, _df in fresh.items():
+                _key = str(_sym).upper()
+                if not isinstance(_df, pd.DataFrame) or _df.empty:
+                    continue
+                _ok, _age = intraday_data_fresh(_df, "5m", 12.0)
+                if _ok:
+                    validated[_key] = _df
+                else:
+                    stale_symbols.append((_key, float(_age)))
+                    _repaired = None
+                    try:
+                        _repaired = fetch_intraday(_key, interval="5m", period="5d")
+                    except Exception as _exc:
+                        log.warning("INTRADAY 5M STALE REPAIR FAILED | %s | %s", _key, str(_exc))
+                    if isinstance(_repaired, pd.DataFrame) and not _repaired.empty:
+                        _rok, _rage = intraday_data_fresh(_repaired, "5m", 12.0)
+                        if _rok:
+                            validated[_key] = _repaired
+                            log.info("INTRADAY 5M STALE REPAIRED | %s | age=%.1fm", _key, float(_rage))
+                        else:
+                            log.warning("INTRADAY 5M STALE UNRESOLVED | %s | bulk_age=%.1fm | repaired_age=%.1fm", _key, float(_age), float(_rage))
+        except Exception as _exc:
+            # If validation itself fails, do not silently promote an unchecked
+            # bulk snapshot into the canonical cache. Keep only frames already
+            # proven usable by the normal path.
+            log.warning("INTRADAY 5M BULK VALIDATION FAILED | %s", str(_exc))
+
         with _M5_CACHE_LOCK:
-            for sym, df in fresh.items():
-                if isinstance(df, pd.DataFrame) and not df.empty:
-                    _M5_CACHE[str(sym).upper()] = df
+            for sym, df in validated.items():
+                _M5_CACHE[str(sym).upper()] = df
             _M5_CACHE_UPDATED_AT = now
             cached = {sym: _copy_frame(_M5_CACHE.get(sym)) for sym in clean if sym in _M5_CACHE}
-        log.info("INTRADAY 5M CACHE REFRESH | fetched=%d | available=%d", len(fresh), len(cached))
+        log.info("INTRADAY 5M CACHE REFRESH | fetched=%d | validated=%d | stale_repair=%d | available=%d",
+                 len(fresh), len(validated), len(stale_symbols), len(cached))
     return cached
 
 def _cached_5m_benchmark(symbol: str, fetch_one):
