@@ -30,7 +30,7 @@ from stocks import MAX_AUTO_PRICE
 log = logging.getLogger(__name__)
 
 # Deployment marker: proves which analyzer_intraday build Render actually loaded.
-INTRADAY_ANALYZER_VERSION = "20260924-DYNAMIC-TOP30-SNAPSHOT-V1"
+INTRADAY_ANALYZER_VERSION = "20260925-5M-CANONICAL-SNAPSHOT-V1"
 log.info("INTRADAY ANALYZER VERSION | %s", INTRADAY_ANALYZER_VERSION)
 
 SKIP_OPEN_MIN = 20
@@ -79,6 +79,75 @@ _INTRADAY_DATA_AUDIT_LOCK = Lock()
 # Per-scan candle snapshot. After construction, strategy/gate code must only
 # consume these frames; Live Quote remains the sole execution-time exception.
 IntradaySnapshot = dict[str, object]
+
+# 5m data is immutable for the current scan bucket. Re-requesting the same
+# 5m history every minute was causing unnecessary Alpaca traffic and, when a
+# bulk request failed, could cascade into many per-symbol requests. Keep one
+# process-local 5m cache and refresh it only after the current 5m bucket has
+# had time to complete. The WebSocket layer still patches the latest completed
+# bucket for the live Top-30 after Stage 1. This is data plumbing only: no
+# strategy, score, VWAP, threshold, or gate is changed.
+M5_BULK_CACHE_TTL_SECONDS = 240.0
+_M5_CACHE_LOCK = Lock()
+_M5_CACHE_UPDATED_AT = 0.0
+_M5_CACHE: dict[str, pd.DataFrame] = {}
+_M5_BENCHMARK_CACHE: dict[str, pd.DataFrame] = {}
+_M5_BENCHMARK_UPDATED_AT = 0.0
+
+def _copy_frame(df):
+    if isinstance(df, pd.DataFrame):
+        return df.copy(deep=False)
+    return None
+
+def _cached_5m_snapshot(symbols: list[str], fetch_bulk) -> dict[str, pd.DataFrame]:
+    """Return one canonical 5m snapshot; bulk REST is refreshed at most once/4m."""
+    import time as _time
+    global _M5_CACHE_UPDATED_AT, _M5_CACHE
+    clean = [str(x).upper().strip() for x in symbols or [] if str(x).strip()]
+    now = _time.monotonic()
+    with _M5_CACHE_LOCK:
+        fresh_cache = bool(_M5_CACHE) and (now - _M5_CACHE_UPDATED_AT) < M5_BULK_CACHE_TTL_SECONDS
+        cached = {sym: _copy_frame(_M5_CACHE.get(sym)) for sym in clean if sym in _M5_CACHE}
+    if fresh_cache and len(cached) == len(set(clean)):
+        log.info("INTRADAY 5M CACHE HIT | symbols=%d | age=%.1fs", len(cached), now - _M5_CACHE_UPDATED_AT)
+        return cached
+    try:
+        fresh = fetch_bulk() or {}
+    except Exception as exc:
+        log.warning("INTRADAY 5M BULK REFRESH FAILED | using cached=%d | %s", len(cached), str(exc))
+        fresh = {}
+    if fresh:
+        with _M5_CACHE_LOCK:
+            for sym, df in fresh.items():
+                if isinstance(df, pd.DataFrame) and not df.empty:
+                    _M5_CACHE[str(sym).upper()] = df
+            _M5_CACHE_UPDATED_AT = now
+            cached = {sym: _copy_frame(_M5_CACHE.get(sym)) for sym in clean if sym in _M5_CACHE}
+        log.info("INTRADAY 5M CACHE REFRESH | fetched=%d | available=%d", len(fresh), len(cached))
+    return cached
+
+def _cached_5m_benchmark(symbol: str, fetch_one):
+    """Cache SPY/QQQ 5m for the same snapshot window; never refetch in gates."""
+    import time as _time
+    global _M5_BENCHMARK_UPDATED_AT
+    sym = str(symbol).upper().strip()
+    now = _time.monotonic()
+    with _M5_CACHE_LOCK:
+        if sym in _M5_BENCHMARK_CACHE and (now - _M5_BENCHMARK_UPDATED_AT) < M5_BULK_CACHE_TTL_SECONDS:
+            return _copy_frame(_M5_BENCHMARK_CACHE[sym])
+    try:
+        df = fetch_one()
+    except Exception as exc:
+        log.warning("INTRADAY 5M BENCHMARK FETCH FAILED | %s | %s", sym, str(exc))
+        df = None
+    if isinstance(df, pd.DataFrame) and not df.empty:
+        with _M5_CACHE_LOCK:
+            _M5_BENCHMARK_CACHE[sym] = df
+            _M5_BENCHMARK_UPDATED_AT = now
+        return _copy_frame(df)
+    with _M5_CACHE_LOCK:
+        return _copy_frame(_M5_BENCHMARK_CACHE.get(sym))
+
 
 def _intraday_data_audit_record(symbol: str, *reasons: str) -> None:
     if not symbol:
@@ -5159,11 +5228,10 @@ def scan_intraday(
         from market_data import fetch_intraday
         benchmark_frames = {}
         for _benchmark in ("SPY", "QQQ"):
-            try:
-                benchmark_frames[_benchmark] = fetch_intraday(_benchmark, interval="5m", period="2d")
-            except Exception as _exc:
-                benchmark_frames[_benchmark] = None
-                log.warning("INTRADAY BENCHMARK SNAPSHOT FAILED | %s | %s", _benchmark, str(_exc))
+            benchmark_frames[_benchmark] = _cached_5m_benchmark(
+                _benchmark,
+                lambda _b=_benchmark: fetch_intraday(_b, interval="5m", period="2d"),
+            )
 
         def _benchmark_loader(symbol, interval="5m", period="2d"):
             if str(interval).lower() in ("5m", "5min") and str(symbol).upper() in benchmark_frames:
@@ -5208,16 +5276,20 @@ def scan_intraday(
             bulk_h1 = fetch_alpaca_bars_multi(
                 symbols, "1Hour", end - timedelta(days=13), end=end, chunk_size=50
             )
-            bulk_m5 = fetch_alpaca_bars_multi(
-                symbols, "5Min", end - timedelta(days=8), end=end, chunk_size=50
-            )
+            def _load_m5_bulk():
+                return fetch_alpaca_bars_multi(
+                    symbols, "5Min", end - timedelta(days=8), end=end, chunk_size=50
+                )
+            bulk_m5 = _cached_5m_snapshot(symbols, _load_m5_bulk)
             log.info(
-                "STAGE 1 BULK: H1=%d symbols, 5m=%d symbols",
+                "STAGE 1 BULK: H1=%d symbols, 5m=%d symbols | 5m_source=canonical_cache",
                 len(bulk_h1), len(bulk_m5),
             )
     except Exception as exc:
         log.warning("STAGE 1 bulk load failed; fallback to per-symbol: %s", exc)
-        bulk_h1, bulk_m5 = {}, {}
+        bulk_h1 = {}
+        with _M5_CACHE_LOCK:
+            bulk_m5 = {str(sym).upper(): _copy_frame(df) for sym, df in _M5_CACHE.items() if str(sym).upper() in {str(x).upper() for x in symbols}}
 
     # Stage 1 — H1 + 5m only for the full universe.
     with ThreadPoolExecutor(max_workers=workers) as pool:
