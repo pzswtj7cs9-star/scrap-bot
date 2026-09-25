@@ -15,6 +15,8 @@ import pandas as pd
 import requests
 
 log = logging.getLogger("halal-bot.data")
+DATA_LAYER_VERSION = "20260925-FINAL-DATA-AUDIT-V3"
+log.info("DATA LAYER VERSION | %s", DATA_LAYER_VERSION)
 
 APCA_KEY = os.getenv("APCA_API_KEY_ID", "").strip()
 APCA_SECRET = os.getenv("APCA_API_SECRET_KEY", "").strip()
@@ -35,6 +37,14 @@ _TWELVE_NEXT_REQUEST_AT = 0.0
 _TWELVE_QUOTA_LOCK = threading.Lock()
 _TWELVE_QUOTA_EXHAUSTED = False
 _TWELVE_QUOTA_REASON = ""
+# Twelve Data Basic/Free-style accounts expose 8 API credits per minute.
+# Keep a local rolling budget so concurrent Stage-1 fallbacks never issue the
+# 9th request and trigger a 429 storm. This is a safety/data-plumbing limit;
+# it never substitutes stale data for a fresh frame.
+TWELVE_MINUTE_CREDIT_LIMIT = max(1, int(os.getenv("TWELVE_DATA_CREDITS_PER_MINUTE", "8")))
+_TWELVE_CREDIT_TIMES = deque(maxlen=64)
+_TWELVE_CREDIT_LOCK = threading.Lock()
+_TWELVE_MINUTE_BLOCKED_UNTIL = 0.0
 
 
 _LAST_SOURCE = "none"
@@ -300,53 +310,70 @@ def twelve_configured() -> bool:
 
 
 def _twelve_get(endpoint: str, params: dict, timeout: float | None = None) -> requests.Response:
-    """Twelve Data GET with pacing plus a quota-exhaustion circuit breaker."""
+    """Twelve Data GET with pacing and a rolling per-minute credit budget."""
     global _TWELVE_NEXT_REQUEST_AT, _TWELVE_QUOTA_EXHAUSTED, _TWELVE_QUOTA_REASON
+    global _TWELVE_MINUTE_BLOCKED_UNTIL
+
     with _TWELVE_QUOTA_LOCK:
         if _TWELVE_QUOTA_EXHAUSTED:
-            raise RuntimeError(f"Twelve Data quota exhausted: {_TWELVE_QUOTA_REASON or 'daily API credits exhausted'}")
+            raise RuntimeError(f"Twelve Data daily quota exhausted: {_TWELVE_QUOTA_REASON or 'daily API credits exhausted'}")
+
+    # Reserve one credit before making the HTTP request. This prevents the
+    # concurrent Stage-1 workers from crossing the provider's minute limit.
+    with _TWELVE_CREDIT_LOCK:
+        now_m = _time.monotonic()
+        if now_m < _TWELVE_MINUTE_BLOCKED_UNTIL:
+            raise RuntimeError("Twelve Data minute credit budget exhausted; retry next minute")
+        while _TWELVE_CREDIT_TIMES and now_m - _TWELVE_CREDIT_TIMES[0] >= 60.0:
+            _TWELVE_CREDIT_TIMES.popleft()
+        if len(_TWELVE_CREDIT_TIMES) >= TWELVE_MINUTE_CREDIT_LIMIT:
+            _TWELVE_MINUTE_BLOCKED_UNTIL = now_m + max(1.0, 60.0 - (now_m - _TWELVE_CREDIT_TIMES[0]))
+            log.warning("Twelve Data minute credit budget exhausted | used=%d/%d",
+                        len(_TWELVE_CREDIT_TIMES), TWELVE_MINUTE_CREDIT_LIMIT)
+            raise RuntimeError("Twelve Data minute credit budget exhausted; retry next minute")
+        _TWELVE_CREDIT_TIMES.append(now_m)
+
     url = f"{TWELVE_URL.rstrip('/')}/{endpoint.lstrip('/')}"
     params = dict(params or {})
     params.setdefault("apikey", TWELVE_API_KEY)
-    last_exc = None
-    for attempt in range(TWELVE_429_RETRIES + 1):
+    try:
         with _TWELVE_RATE_LOCK:
             now = _time.monotonic()
             wait = _TWELVE_NEXT_REQUEST_AT - now
             if wait > 0:
                 _time.sleep(wait)
             _TWELVE_NEXT_REQUEST_AT = _time.monotonic() + 0.25
-            try:
-                r = requests.get(url, params=params, timeout=timeout or TWELVE_TIMEOUT)
-            except Exception as exc:
-                last_exc = exc
-                continue
-        if r.status_code != 429:
-            return r
+            r = requests.get(url, params=params, timeout=timeout or TWELVE_TIMEOUT)
+    except Exception:
+        # The provider credit was reserved for this attempt. Do not immediately
+        # retry in the same minute from multiple workers.
+        raise
 
-        # A quota-exhausted 429 is not a transient rate-limit event. Do not
-        # retry it and do not let every symbol repeat the same failed request.
-        body = (r.text or "").lower()
-        if "run out of api credits" in body or "api credits for the day" in body or "quota" in body:
-            with _TWELVE_QUOTA_LOCK:
-                _TWELVE_QUOTA_EXHAUSTED = True
-                _TWELVE_QUOTA_REASON = (r.text or "daily API credits exhausted")[:180]
-            log.error("Twelve Data quota exhausted; disabling further fallback requests for this process")
-            raise RuntimeError("Twelve Data quota exhausted")
+    if r.status_code != 429:
+        return r
 
-        if attempt >= TWELVE_429_RETRIES:
-            return r
-        retry_after = r.headers.get("Retry-After")
-        try:
-            delay = float(retry_after) if retry_after else min(8.0, 1.0 * (2 ** attempt))
-        except Exception:
-            delay = min(8.0, 1.0 * (2 ** attempt))
-        log.warning("Twelve Data 429: انتظار %.1fs ثم إعادة المحاولة (%d/%d)", delay, attempt + 1, TWELVE_429_RETRIES)
-        _time.sleep(delay)
-    if last_exc:
-        raise last_exc
-    raise RuntimeError("Twelve Data request failed")
+    body = (r.text or "").lower()
+    # Distinguish minute rate-limit from true daily quota exhaustion. The old
+    # implementation treated any text containing 'quota' as permanent and
+    # disabled Twelve Data for the rest of the process.
+    minute_limit = any(x in body for x in ("current minute", "per minute", "minute limit", "minute"))
+    daily_limit = any(x in body for x in ("for the day", "for the current day", "daily", "800 api credits")) and not minute_limit
+    if daily_limit:
+        with _TWELVE_QUOTA_LOCK:
+            _TWELVE_QUOTA_EXHAUSTED = True
+            _TWELVE_QUOTA_REASON = (r.text or "daily API credits exhausted")[:180]
+        log.error("Twelve Data DAILY quota exhausted; disabling further fallback requests for this process")
+        raise RuntimeError("Twelve Data daily quota exhausted")
 
+    if minute_limit:
+        with _TWELVE_CREDIT_LOCK:
+            _TWELVE_MINUTE_BLOCKED_UNTIL = max(_TWELVE_MINUTE_BLOCKED_UNTIL, _time.monotonic() + 60.0)
+        log.warning("Twelve Data minute rate limit reached; fallback disabled until next minute")
+        raise RuntimeError("Twelve Data minute rate limit reached; retry next minute")
+
+    # Unknown 429: fail closed rather than retrying several concurrent requests.
+    log.warning("Twelve Data HTTP 429 | no retry | body=%s", (r.text or "")[:180])
+    raise RuntimeError("Twelve Data HTTP 429")
 
 def _twelve_time_series(symbol: str, interval: str, start: datetime, end: datetime, outputsize: int = 5000) -> pd.DataFrame:
     """Fetch Twelve Data OHLCV and normalize it to the bot's DataFrame schema."""
@@ -685,12 +712,18 @@ def fetch_alpaca_bars_multi(
 
 
 def _refresh_recent_5m_from_1m(symbol: str, base: pd.DataFrame, feed: Optional[str] = None) -> pd.DataFrame:
-    """Refresh only completed 5m buckets from fresh Alpaca IEX 1m bars."""
+    """Refresh the most recent 5m bucket from 1m bars when the 5m endpoint lags.
+
+    This is a data-layer repair only: no strategy, score, VWAP or gate is changed.
+    If the 1m source is not fresh, the original frame is returned unchanged.
+    """
     if base is None or base.empty or not alpaca_configured():
         return base
     try:
         now = datetime.now(timezone.utc)
-        one_min = fetch_alpaca_bars(symbol, "1Min", now - timedelta(minutes=25), now, limit=200)
+        one_min = fetch_alpaca_bars(
+            symbol, "1Min", now - timedelta(minutes=20), now, limit=100,
+        )
         if one_min is None or one_min.empty:
             return base
         ok, age = intraday_data_fresh(one_min, "1m", 4.0)
@@ -699,26 +732,24 @@ def _refresh_recent_5m_from_1m(symbol: str, base: pd.DataFrame, feed: Optional[s
             return base
         idx = pd.DatetimeIndex(one_min.index)
         bucket = idx.floor("5min")
-        tmp = one_min.copy(); tmp["_bucket"] = bucket
-        counts = bucket.value_counts()
-        completed = sorted([b for b, c in counts.items() if int(c) >= 5])
-        if not completed:
-            return base
-        latest_bucket = completed[-1]
+        tmp = one_min.copy()
+        tmp["_bucket"] = bucket
         agg = tmp.groupby("_bucket", sort=True).agg(
             Open=("Open", "first"), High=("High", "max"),
             Low=("Low", "min"), Close=("Close", "last"), Volume=("Volume", "sum")
         )
-        if latest_bucket not in agg.index:
+        if agg.empty:
             return base
-        base2 = base.copy(); base2.index = pd.DatetimeIndex(base2.index)
+        base2 = base.copy()
+        base2.index = pd.DatetimeIndex(base2.index)
+        latest_bucket = agg.index[-1]
         base2 = base2[base2.index.floor("5min") < latest_bucket]
-        refreshed = pd.concat([base2, agg.loc[:latest_bucket]])
+        refreshed = pd.concat([base2, agg])
         refreshed = refreshed[~refreshed.index.duplicated(keep="last")].sort_index()
         refreshed.attrs.update(base.attrs)
         refreshed.attrs["data_source"] = str(base.attrs.get("data_source", "alpaca")) + "+1m-refresh"
         refreshed.attrs["recent_1m_age_min"] = float(age)
-        log.info("DATA REFRESH 5m | %s | rebuilt_latest_completed_bucket=%s | 1m_age=%.1fm", symbol, str(latest_bucket), float(age))
+        log.info("DATA REFRESH 5m | %s | rebuilt_latest_bucket=%s | 1m_age=%.1fm", symbol, str(latest_bucket), float(age))
         return refreshed
     except Exception as exc:
         log.warning("DATA REFRESH 5m FAILED | %s | %s", symbol, str(exc))

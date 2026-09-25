@@ -30,7 +30,7 @@ from stocks import MAX_AUTO_PRICE
 log = logging.getLogger(__name__)
 
 # Deployment marker: proves which analyzer_intraday build Render actually loaded.
-INTRADAY_ANALYZER_VERSION = "20260925-5M-CANONICAL-SNAPSHOT-V2"
+INTRADAY_ANALYZER_VERSION = "20260925-FINAL-AUDIT-V3"
 log.info("INTRADAY ANALYZER VERSION | %s", INTRADAY_ANALYZER_VERSION)
 
 SKIP_OPEN_MIN = 20
@@ -100,77 +100,77 @@ def _copy_frame(df):
     return None
 
 def _cached_5m_snapshot(symbols: list[str], fetch_bulk) -> dict[str, pd.DataFrame]:
-    """Return one canonical 5m snapshot; bulk REST is refreshed at most once/4m."""
+    """Return one canonical 5m snapshot for the scan.
+
+    Data integrity only: cache/freshness/repair plumbing. Strategy logic, Score,
+    VWAP and the 12-minute freshness gate remain unchanged. A stale symbol is
+    never accepted as fresh; it is repaired from Alpaca 1m when possible and
+    then may use the controlled Twelve Data fallback.
+    """
     import time as _time
     global _M5_CACHE_UPDATED_AT, _M5_CACHE
     clean = [str(x).upper().strip() for x in symbols or [] if str(x).strip()]
+    unique = list(dict.fromkeys(clean))
     now = _time.monotonic()
     with _M5_CACHE_LOCK:
         fresh_cache = bool(_M5_CACHE) and (now - _M5_CACHE_UPDATED_AT) < M5_BULK_CACHE_TTL_SECONDS
-        cached = {sym: _copy_frame(_M5_CACHE.get(sym)) for sym in clean if sym in _M5_CACHE}
-    # Cache lifetime is not the same thing as market-data freshness. A cached
-    # frame is reusable only when its last candle is still inside the existing
-    # 12-minute M5 freshness gate.
-    if fresh_cache and len(cached) == len(set(clean)):
+        cached = {sym: _copy_frame(_M5_CACHE.get(sym)) for sym in unique if sym in _M5_CACHE}
+
+    # Validate cache freshness, not merely cache age. IEX coverage can leave an
+    # individual symbol stale even while the process cache itself is recent.
+    if fresh_cache and len(cached) == len(unique):
+        from market_data import intraday_data_fresh
         stale = []
-        try:
-            stale = [sym for sym, df in cached.items() if not intraday_data_fresh(df, "5m", 12.0)[0]]
-        except Exception:
-            stale = list(cached)
+        for sym, df in cached.items():
+            ok, age = intraday_data_fresh(df, "5m", 12.0)
+            if not ok:
+                stale.append((sym, float(age)))
         if not stale:
             log.info("INTRADAY 5M CACHE HIT | symbols=%d | age=%.1fs", len(cached), now - _M5_CACHE_UPDATED_AT)
             return cached
-        log.warning("INTRADAY 5M CACHE STALE | symbols=%d | stale=%d | forcing bulk refresh", len(cached), len(stale))
+        log.warning("INTRADAY 5M CACHE STALE | symbols=%d | stale=%d | forcing repair", len(cached), len(stale))
+
     try:
         fresh = fetch_bulk() or {}
     except Exception as exc:
         log.warning("INTRADAY 5M BULK REFRESH FAILED | using cached=%d | %s", len(cached), str(exc))
         fresh = {}
+
     if fresh:
-        # Bulk availability is not the same as 5m freshness. Alpaca can return
-        # a valid frame for a symbol whose latest completed 5m candle is older
-        # than the existing 12-minute gate. Validate every bulk result before
-        # allowing it into the canonical snapshot. Only stale symbols are
-        # repaired individually; this avoids a 196-symbol refetch storm while
-        # preserving the existing freshness gate.
-        validated = {}
-        stale_symbols = []
-        try:
-            from market_data import fetch_intraday, intraday_data_fresh
-            for _sym, _df in fresh.items():
-                _key = str(_sym).upper()
-                if not isinstance(_df, pd.DataFrame) or _df.empty:
+        from market_data import intraday_data_fresh, fetch_intraday
+        validated: dict[str, pd.DataFrame] = {}
+        stale_repair = 0
+        for sym, df in fresh.items():
+            key = str(sym).upper().strip()
+            if not key or not isinstance(df, pd.DataFrame) or df.empty:
+                continue
+            ok, age = intraday_data_fresh(df, "5m", 12.0)
+            if ok:
+                validated[key] = df
+                continue
+            # Bulk IEX may be stale for a symbol that has no recent IEX trades.
+            # Try the normal data-layer repair path once; never relax freshness.
+            try:
+                repaired = fetch_intraday(key, interval="5m", period="5d")
+            except Exception as exc:
+                repaired = None
+                log.warning("INTRADAY 5M STALE REPAIR FAILED | %s | %s", key, str(exc))
+            if isinstance(repaired, pd.DataFrame) and not repaired.empty:
+                rok, rage = intraday_data_fresh(repaired, "5m", 12.0)
+                if rok:
+                    validated[key] = repaired
+                    stale_repair += 1
+                    log.info("INTRADAY 5M STALE REPAIRED | %s | age=%.1fm", key, float(rage))
                     continue
-                _ok, _age = intraday_data_fresh(_df, "5m", 12.0)
-                if _ok:
-                    validated[_key] = _df
-                else:
-                    stale_symbols.append((_key, float(_age)))
-                    _repaired = None
-                    try:
-                        _repaired = fetch_intraday(_key, interval="5m", period="5d")
-                    except Exception as _exc:
-                        log.warning("INTRADAY 5M STALE REPAIR FAILED | %s | %s", _key, str(_exc))
-                    if isinstance(_repaired, pd.DataFrame) and not _repaired.empty:
-                        _rok, _rage = intraday_data_fresh(_repaired, "5m", 12.0)
-                        if _rok:
-                            validated[_key] = _repaired
-                            log.info("INTRADAY 5M STALE REPAIRED | %s | age=%.1fm", _key, float(_rage))
-                        else:
-                            log.warning("INTRADAY 5M STALE UNRESOLVED | %s | bulk_age=%.1fm | repaired_age=%.1fm", _key, float(_age), float(_rage))
-        except Exception as _exc:
-            # If validation itself fails, do not silently promote an unchecked
-            # bulk snapshot into the canonical cache. Keep only frames already
-            # proven usable by the normal path.
-            log.warning("INTRADAY 5M BULK VALIDATION FAILED | %s", str(_exc))
+            log.warning("INTRADAY 5M STALE UNRESOLVED | %s | age=%.1fm", key, float(age))
 
         with _M5_CACHE_LOCK:
             for sym, df in validated.items():
-                _M5_CACHE[str(sym).upper()] = df
+                _M5_CACHE[sym] = df
             _M5_CACHE_UPDATED_AT = now
-            cached = {sym: _copy_frame(_M5_CACHE.get(sym)) for sym in clean if sym in _M5_CACHE}
+            cached = {sym: _copy_frame(_M5_CACHE.get(sym)) for sym in unique if sym in _M5_CACHE}
         log.info("INTRADAY 5M CACHE REFRESH | fetched=%d | validated=%d | stale_repair=%d | available=%d",
-                 len(fresh), len(validated), len(stale_symbols), len(cached))
+                 len(fresh), len(validated), stale_repair, len(cached))
     return cached
 
 def _cached_5m_benchmark(symbol: str, fetch_one):
@@ -2800,6 +2800,10 @@ def analyze_intraday(
     above_open = price >= day_open
 
     hist_5 = m5[m5.index.date < last_day]
+    # IMPORTANT: build the closed-candle snapshot before any gate consumes it.
+    # This fixes the runtime UnboundLocalError that was aborting every Stage-2
+    # candidate on Render. Diagnostic/data-order fix only; no gate threshold changes.
+    _closed_d = today_5.iloc[:_closed_pos + 1].copy()
     vol_session_ratio = _intraday_volume_ratio(_closed_d, hist_5, max_days=20)
     vol_session_ok = vol_session_ratio >= 0.90
 
@@ -2814,7 +2818,6 @@ def analyze_intraday(
     c5 = today_5["Close"]
     e5 = float(_ema(c5, 20).iloc[-1])
     r5 = float(_rsi(c5, 14).iloc[-1])
-    _closed_d = today_5.iloc[:_closed_pos + 1].copy()
     _closed_c5 = _closed_d["Close"].astype(float)
     e5_closed = float(_ema(_closed_c5, 20).iloc[-1]) if len(_closed_c5) else e5
     vwap_closed_s = _vwap(_closed_d)
@@ -5065,15 +5068,9 @@ def _prefilter_intraday(
     try:
         from market_data import fetch_intraday, intraday_data_fresh
         if preloaded is not None:
-            # Partial bulk results are allowed, but ONLY the missing timeframe
-            # is fetched. This prevents a missing H1 or M5 symbol from being
-            # silently rejected and avoids re-requesting the timeframe that is
-            # already present in the canonical snapshot.
+            # The scan supplies the complete Stage-1 candle snapshot. Never
+            # re-fetch H1/M5 here; freshness is evaluated on this same snapshot.
             h1, m5 = preloaded
-            if h1 is None:
-                h1 = fetch_intraday(symbol, interval="60m", period="10d")
-            if m5 is None:
-                m5 = fetch_intraday(symbol, interval="5m", period="5d")
         else:
             h1 = fetch_intraday(symbol, interval="60m", period="10d")
             m5 = fetch_intraday(symbol, interval="5m", period="5d")
