@@ -685,18 +685,12 @@ def fetch_alpaca_bars_multi(
 
 
 def _refresh_recent_5m_from_1m(symbol: str, base: pd.DataFrame, feed: Optional[str] = None) -> pd.DataFrame:
-    """Refresh the most recent 5m bucket from 1m bars when the 5m endpoint lags.
-
-    This is a data-layer repair only: no strategy, score, VWAP or gate is changed.
-    If the 1m source is not fresh, the original frame is returned unchanged.
-    """
+    """Refresh only completed 5m buckets from fresh Alpaca IEX 1m bars."""
     if base is None or base.empty or not alpaca_configured():
         return base
     try:
         now = datetime.now(timezone.utc)
-        one_min = fetch_alpaca_bars(
-            symbol, "1Min", now - timedelta(minutes=20), now, limit=100,
-        )
+        one_min = fetch_alpaca_bars(symbol, "1Min", now - timedelta(minutes=25), now, limit=200)
         if one_min is None or one_min.empty:
             return base
         ok, age = intraday_data_fresh(one_min, "1m", 4.0)
@@ -705,24 +699,26 @@ def _refresh_recent_5m_from_1m(symbol: str, base: pd.DataFrame, feed: Optional[s
             return base
         idx = pd.DatetimeIndex(one_min.index)
         bucket = idx.floor("5min")
-        tmp = one_min.copy()
-        tmp["_bucket"] = bucket
+        tmp = one_min.copy(); tmp["_bucket"] = bucket
+        counts = bucket.value_counts()
+        completed = sorted([b for b, c in counts.items() if int(c) >= 5])
+        if not completed:
+            return base
+        latest_bucket = completed[-1]
         agg = tmp.groupby("_bucket", sort=True).agg(
             Open=("Open", "first"), High=("High", "max"),
             Low=("Low", "min"), Close=("Close", "last"), Volume=("Volume", "sum")
         )
-        if agg.empty:
+        if latest_bucket not in agg.index:
             return base
-        base2 = base.copy()
-        base2.index = pd.DatetimeIndex(base2.index)
-        latest_bucket = agg.index[-1]
+        base2 = base.copy(); base2.index = pd.DatetimeIndex(base2.index)
         base2 = base2[base2.index.floor("5min") < latest_bucket]
-        refreshed = pd.concat([base2, agg])
+        refreshed = pd.concat([base2, agg.loc[:latest_bucket]])
         refreshed = refreshed[~refreshed.index.duplicated(keep="last")].sort_index()
         refreshed.attrs.update(base.attrs)
         refreshed.attrs["data_source"] = str(base.attrs.get("data_source", "alpaca")) + "+1m-refresh"
         refreshed.attrs["recent_1m_age_min"] = float(age)
-        log.info("DATA REFRESH 5m | %s | rebuilt_latest_bucket=%s | 1m_age=%.1fm", symbol, str(latest_bucket), float(age))
+        log.info("DATA REFRESH 5m | %s | rebuilt_latest_completed_bucket=%s | 1m_age=%.1fm", symbol, str(latest_bucket), float(age))
         return refreshed
     except Exception as exc:
         log.warning("DATA REFRESH 5m FAILED | %s | %s", symbol, str(exc))

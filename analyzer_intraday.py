@@ -108,9 +108,19 @@ def _cached_5m_snapshot(symbols: list[str], fetch_bulk) -> dict[str, pd.DataFram
     with _M5_CACHE_LOCK:
         fresh_cache = bool(_M5_CACHE) and (now - _M5_CACHE_UPDATED_AT) < M5_BULK_CACHE_TTL_SECONDS
         cached = {sym: _copy_frame(_M5_CACHE.get(sym)) for sym in clean if sym in _M5_CACHE}
+    # Cache lifetime is not the same thing as market-data freshness. A cached
+    # frame is reusable only when its last candle is still inside the existing
+    # 12-minute M5 freshness gate.
     if fresh_cache and len(cached) == len(set(clean)):
-        log.info("INTRADAY 5M CACHE HIT | symbols=%d | age=%.1fs", len(cached), now - _M5_CACHE_UPDATED_AT)
-        return cached
+        stale = []
+        try:
+            stale = [sym for sym, df in cached.items() if not intraday_data_fresh(df, "5m", 12.0)[0]]
+        except Exception:
+            stale = list(cached)
+        if not stale:
+            log.info("INTRADAY 5M CACHE HIT | symbols=%d | age=%.1fs", len(cached), now - _M5_CACHE_UPDATED_AT)
+            return cached
+        log.warning("INTRADAY 5M CACHE STALE | symbols=%d | stale=%d | forcing bulk refresh", len(cached), len(stale))
     try:
         fresh = fetch_bulk() or {}
     except Exception as exc:
@@ -5018,9 +5028,15 @@ def _prefilter_intraday(
     try:
         from market_data import fetch_intraday, intraday_data_fresh
         if preloaded is not None:
-            # The scan supplies the complete Stage-1 candle snapshot. Never
-            # re-fetch H1/M5 here; freshness is evaluated on this same snapshot.
+            # Partial bulk results are allowed, but ONLY the missing timeframe
+            # is fetched. This prevents a missing H1 or M5 symbol from being
+            # silently rejected and avoids re-requesting the timeframe that is
+            # already present in the canonical snapshot.
             h1, m5 = preloaded
+            if h1 is None:
+                h1 = fetch_intraday(symbol, interval="60m", period="10d")
+            if m5 is None:
+                m5 = fetch_intraday(symbol, interval="5m", period="5d")
         else:
             h1 = fetch_intraday(symbol, interval="60m", period="10d")
             m5 = fetch_intraday(symbol, interval="5m", period="5d")
