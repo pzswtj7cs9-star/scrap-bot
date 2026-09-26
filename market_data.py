@@ -15,7 +15,7 @@ import pandas as pd
 import requests
 
 log = logging.getLogger("halal-bot.data")
-DATA_LAYER_VERSION = "20260925-FINAL-DATA-AUDIT-V3"
+DATA_LAYER_VERSION = "20260926-M5-COMPLETE-BUCKET-FIX-V1"
 log.info("DATA LAYER VERSION | %s", DATA_LAYER_VERSION)
 
 APCA_KEY = os.getenv("APCA_API_KEY_ID", "").strip()
@@ -237,35 +237,89 @@ def get_intraday_ws_bars(symbol: str) -> pd.DataFrame:
     data.attrs["feed"] = "iex"
     return data
 
+def _completed_bucket_mask(index: pd.DatetimeIndex, freq: str, now: Optional[datetime] = None) -> pd.Series:
+    """Return a boolean mask for fully completed time buckets.
+
+    Alpaca/Twelve Data OHLC bars are timestamped at the bucket start. A bar
+    whose bucket end is still in the future is a partial candle and must not
+    be used as a canonical 5m snapshot.
+    """
+    idx = pd.DatetimeIndex(index)
+    if idx.empty:
+        return pd.Series([], dtype=bool, index=idx)
+    now_ts = pd.Timestamp(now or datetime.now(timezone.utc))
+    if now_ts.tzinfo is None:
+        now_ts = now_ts.tz_localize("UTC")
+    now_ts = now_ts.tz_convert(idx.tz) if idx.tz is not None else now_ts.tz_localize(None)
+    buckets = idx.floor(freq)
+    ends = buckets + pd.Timedelta(freq)
+    return pd.Series(ends <= now_ts, index=idx)
+
+
+def _latest_completed_5m_bucket(index: pd.DatetimeIndex, now: Optional[datetime] = None):
+    """Return the latest fully completed 5m bucket, or None."""
+    idx = pd.DatetimeIndex(index)
+    if idx.empty:
+        return None
+    mask = _completed_bucket_mask(idx, "5min", now=now)
+    if not bool(mask.any()):
+        return None
+    return idx[mask.to_numpy()].floor("5min").max()
+
+
+def _latest_completed_1m_rows(df: pd.DataFrame, now: Optional[datetime] = None) -> pd.DataFrame:
+    """Return only fully completed 1m rows, preserving the source frame."""
+    if df is None or df.empty:
+        return df
+    mask = _completed_bucket_mask(pd.DatetimeIndex(df.index), "1min", now=now)
+    return df.loc[mask.to_numpy()].copy()
+
+
 def websocket_5m_patch(symbol: str, base: pd.DataFrame) -> pd.DataFrame:
-    """Patch only the latest completed 5m bucket from cached IEX 1m bars."""
+    """Patch the latest *completed* 5m bucket from cached IEX 1m bars.
+
+    The current 5m bucket is never accepted, even when five 1m bars happen to
+    be present in the cache. Completion is determined from wall-clock time.
+    """
     if base is None or base.empty:
         return base
     one = get_intraday_ws_bars(symbol)
     if one is None or one.empty:
         return base
-    idx = pd.DatetimeIndex(one.index)
+
+    completed_one = _latest_completed_1m_rows(one)
+    if completed_one is None or completed_one.empty:
+        return base
+
+    idx = pd.DatetimeIndex(completed_one.index)
     bucket = idx.floor("5min")
-    tmp = one.copy(); tmp["_bucket"] = bucket
+    tmp = completed_one.copy()
+    tmp["_bucket"] = bucket
     agg = tmp.groupby("_bucket", sort=True).agg(
         Open=("Open", "first"), High=("High", "max"), Low=("Low", "min"),
         Close=("Close", "last"), Volume=("Volume", "sum")
     )
     if agg.empty:
         return base
-    latest = agg.index[-1]
-    # Only replace a bucket when all five minute bars are present; otherwise
-    # leave the historical REST candle untouched until the bucket completes.
-    count = int((bucket == latest).sum())
-    if count < 5:
+
+    # A canonical 5m candle requires exactly five completed 1m bars.
+    counts = tmp.groupby("_bucket", sort=True).size()
+    complete_buckets = [b for b in agg.index if int(counts.get(b, 0)) == 5]
+    if not complete_buckets:
+        log.debug("M5 WS PATCH WAITING | %s | no complete 5m bucket with 5x1m", symbol)
         return base
-    out = base.copy(); out.index = pd.DatetimeIndex(out.index)
+    latest = max(complete_buckets)
+
+    out = base.copy()
+    out.index = pd.DatetimeIndex(out.index)
     out = out[out.index.floor("5min") != latest]
     out = pd.concat([out, agg.loc[[latest]]])
     out = out[~out.index.duplicated(keep="last")].sort_index()
     out.attrs.update(base.attrs)
     out.attrs["data_source"] = "alpaca-iex+websocket"
-    out.attrs["websocket_1m_count"] = count
+    out.attrs["websocket_1m_count"] = 5
+    out.attrs["m5_bucket_complete"] = True
+    log.info("M5 WS PATCH | %s | completed_bucket=%s | 1m_count=5", symbol, str(latest))
     return out
 
 
@@ -566,8 +620,14 @@ def data_age_minutes(df: pd.DataFrame, now: Optional[datetime] = None) -> float:
 
 def intraday_data_fresh(df: pd.DataFrame, interval: str, max_age_minutes: Optional[float] = None) -> tuple[bool, float]:
     defaults = {"1m": 4.0, "5m": 12.0, "15m": 25.0, "60m": 90.0, "1h": 90.0}
+    norm = {"1Min": "1m", "5Min": "5m", "15Min": "15m", "1Hour": "60m"}.get(str(interval), str(interval))
     age = data_age_minutes(df)
-    limit = float(max_age_minutes if max_age_minutes is not None else defaults.get(interval, 12.0))
+    limit = float(max_age_minutes if max_age_minutes is not None else defaults.get(norm, 12.0))
+    if norm == "5m" and df is not None and not df.empty:
+        latest_completed = _latest_completed_5m_bucket(pd.DatetimeIndex(df.index))
+        if latest_completed is None or pd.Timestamp(df.index[-1]).floor("5min") != latest_completed:
+            log.warning("M5 INCOMPLETE CANDLE REJECT | latest=%s | age=%.1fm", str(df.index[-1]), float(age))
+            return False, age
     return age <= limit, age
 
 
@@ -700,11 +760,17 @@ def fetch_alpaca_bars_multi(
                 bars_by_symbol.setdefault(sym, []).extend(bars or [])
             next_token = page.get("next_page_token")
         for sym, bars in bars_by_symbol.items():
+            _sym = str(sym).upper()
             df = _bars_to_df(bars or [])
             if df is not None and not df.empty:
                 df.attrs["data_source"] = "alpaca-iex"
                 df.attrs["feed"] = "iex"
-                out[str(sym).upper()] = df
+                if timeframe == "5Min":
+                    try:
+                        df = websocket_5m_patch(_sym, df)
+                    except Exception as _ws_exc:
+                        log.debug("M5 WS PATCH MULTI SKIPPED | %s | %s", _sym, _ws_exc)
+                out[_sym] = df
         _LAST_ALPACA_FEED = "iex"
 
     _set_status("alpaca-iex")
@@ -712,17 +778,17 @@ def fetch_alpaca_bars_multi(
 
 
 def _refresh_recent_5m_from_1m(symbol: str, base: pd.DataFrame, feed: Optional[str] = None) -> pd.DataFrame:
-    """Refresh the most recent 5m bucket from 1m bars when the 5m endpoint lags.
+    """Refresh the latest completed 5m bucket from fresh IEX 1m bars.
 
-    This is a data-layer repair only: no strategy, score, VWAP or gate is changed.
-    If the 1m source is not fresh, the original frame is returned unchanged.
+    Exactly five completed 1m bars are required. Partial 5m buckets are never
+    inserted into the canonical frame.
     """
     if base is None or base.empty or not alpaca_configured():
         return base
     try:
         now = datetime.now(timezone.utc)
         one_min = fetch_alpaca_bars(
-            symbol, "1Min", now - timedelta(minutes=20), now, limit=100,
+            symbol, "1Min", now - timedelta(minutes=25), now, limit=120,
         )
         if one_min is None or one_min.empty:
             return base
@@ -730,26 +796,37 @@ def _refresh_recent_5m_from_1m(symbol: str, base: pd.DataFrame, feed: Optional[s
         if not ok:
             log.warning("DATA REFRESH 1m STALE | %s | age=%.1fm", symbol, float(age))
             return base
-        idx = pd.DatetimeIndex(one_min.index)
-        bucket = idx.floor("5min")
-        tmp = one_min.copy()
-        tmp["_bucket"] = bucket
+
+        completed = _latest_completed_1m_rows(one_min, now=now)
+        if completed is None or completed.empty:
+            log.warning("DATA REFRESH 5m INCOMPLETE | %s | no completed 1m bars", symbol)
+            return base
+
+        idx = pd.DatetimeIndex(completed.index)
+        buckets = idx.floor("5min")
+        tmp = completed.copy()
+        tmp["_bucket"] = buckets
+        counts = tmp.groupby("_bucket", sort=True).size()
+        complete_buckets = [b for b, n in counts.items() if int(n) == 5]
+        if not complete_buckets:
+            log.warning("DATA REFRESH 5m INCOMPLETE | %s | no bucket with 5x1m", symbol)
+            return base
+        latest_bucket = max(complete_buckets)
         agg = tmp.groupby("_bucket", sort=True).agg(
             Open=("Open", "first"), High=("High", "max"),
             Low=("Low", "min"), Close=("Close", "last"), Volume=("Volume", "sum")
         )
-        if agg.empty:
-            return base
+
         base2 = base.copy()
         base2.index = pd.DatetimeIndex(base2.index)
-        latest_bucket = agg.index[-1]
         base2 = base2[base2.index.floor("5min") < latest_bucket]
-        refreshed = pd.concat([base2, agg])
+        refreshed = pd.concat([base2, agg.loc[[latest_bucket]]])
         refreshed = refreshed[~refreshed.index.duplicated(keep="last")].sort_index()
         refreshed.attrs.update(base.attrs)
         refreshed.attrs["data_source"] = str(base.attrs.get("data_source", "alpaca")) + "+1m-refresh"
         refreshed.attrs["recent_1m_age_min"] = float(age)
-        log.info("DATA REFRESH 5m | %s | rebuilt_latest_bucket=%s | 1m_age=%.1fm", symbol, str(latest_bucket), float(age))
+        refreshed.attrs["m5_bucket_complete"] = True
+        log.info("DATA REFRESH 5m | %s | rebuilt_completed_bucket=%s | 1m_age=%.1fm | 1m_count=5", symbol, str(latest_bucket), float(age))
         return refreshed
     except Exception as exc:
         log.warning("DATA REFRESH 5m FAILED | %s | %s", symbol, str(exc))
@@ -779,6 +856,11 @@ def fetch_intraday(symbol: str, period: str = "5d", interval: str = "5m") -> pd.
         try:
             df = fetch_alpaca_bars(symbol, alpaca_tf, start)
             if df is not None and len(df) >= 10:
+                if alpaca_tf == "5Min":
+                    try:
+                        df = websocket_5m_patch(symbol, df)
+                    except Exception as _ws_exc:
+                        log.debug("M5 WS PATCH FETCH SKIPPED | %s | %s", symbol, _ws_exc)
                 fresh_ok, age = _twelve_fresh(df, interval)
                 if alpaca_tf == "5Min" and not fresh_ok:
                     repaired = _refresh_recent_5m_from_1m(symbol, df)

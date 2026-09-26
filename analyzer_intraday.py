@@ -30,7 +30,7 @@ from stocks import MAX_AUTO_PRICE
 log = logging.getLogger(__name__)
 
 # Deployment marker: proves which analyzer_intraday build Render actually loaded.
-INTRADAY_ANALYZER_VERSION = "20260925-FINAL-AUDIT-V3"
+INTRADAY_ANALYZER_VERSION = "20260926-MARKET-M5-SNAPSHOT-FIX-V1"
 log.info("INTRADAY ANALYZER VERSION | %s", INTRADAY_ANALYZER_VERSION)
 
 SKIP_OPEN_MIN = 20
@@ -93,11 +93,51 @@ _M5_CACHE_UPDATED_AT = 0.0
 _M5_CACHE: dict[str, pd.DataFrame] = {}
 _M5_BENCHMARK_CACHE: dict[str, pd.DataFrame] = {}
 _M5_BENCHMARK_UPDATED_AT = 0.0
+# Per-symbol benchmark timestamps prevent SPY refreshes from masking an older
+# QQQ frame. Diagnostic/data-plumbing only.
+_M5_BENCHMARK_UPDATED_AT_BY_SYMBOL: dict[str, float] = {}
+
+# Controlled stale-repair guard. With Alpaca IEX, some symbols can legitimately
+# have no recent IEX trades. Do not fan out into dozens of individual fallback
+# requests in one scan; unresolved symbols remain stale and are rejected by the
+# existing 12-minute gate.
+M5_STALE_REPAIR_MAX_PER_SCAN = 8
+M5_STALE_REPAIR_COOLDOWN_SECONDS = 600.0
+_M5_STALE_REPAIR_LOCK = Lock()
+_M5_STALE_REPAIR_USED = 0
+_M5_STALE_REPAIR_LAST: dict[str, float] = {}
 
 def _copy_frame(df):
     if isinstance(df, pd.DataFrame):
         return df.copy(deep=False)
     return None
+
+def _allow_m5_stale_repair(symbol: str) -> tuple[bool, str]:
+    """Reserve one controlled stale-repair attempt for this scan/runtime.
+
+    This never relaxes freshness. It only prevents an IEX stale burst from
+    turning into a Twelve Data request storm.
+    """
+    import time as _time
+    global _M5_STALE_REPAIR_USED
+    key = str(symbol).upper().strip()
+    now = _time.monotonic()
+    with _M5_STALE_REPAIR_LOCK:
+        last = _M5_STALE_REPAIR_LAST.get(key, 0.0)
+        if now - last < M5_STALE_REPAIR_COOLDOWN_SECONDS:
+            return False, "cooldown"
+        if _M5_STALE_REPAIR_USED >= M5_STALE_REPAIR_MAX_PER_SCAN:
+            return False, "scan_limit"
+        _M5_STALE_REPAIR_LAST[key] = now
+        _M5_STALE_REPAIR_USED += 1
+        return True, "reserved"
+
+
+def _reset_m5_stale_repair_budget() -> None:
+    global _M5_STALE_REPAIR_USED
+    with _M5_STALE_REPAIR_LOCK:
+        _M5_STALE_REPAIR_USED = 0
+
 
 def _cached_5m_snapshot(symbols: list[str], fetch_bulk) -> dict[str, pd.DataFrame]:
     """Return one canonical 5m snapshot for the scan.
@@ -109,6 +149,7 @@ def _cached_5m_snapshot(symbols: list[str], fetch_bulk) -> dict[str, pd.DataFram
     """
     import time as _time
     global _M5_CACHE_UPDATED_AT, _M5_CACHE
+    _reset_m5_stale_repair_budget()
     clean = [str(x).upper().strip() for x in symbols or [] if str(x).strip()]
     unique = list(dict.fromkeys(clean))
     now = _time.monotonic()
@@ -149,7 +190,16 @@ def _cached_5m_snapshot(symbols: list[str], fetch_bulk) -> dict[str, pd.DataFram
                 validated[key] = df
                 continue
             # Bulk IEX may be stale for a symbol that has no recent IEX trades.
-            # Try the normal data-layer repair path once; never relax freshness.
+            # Repair only a controlled number of symbols; never relax freshness and
+            # never fan out into a Twelve Data request storm.
+            allowed, why = _allow_m5_stale_repair(key)
+            if not allowed:
+                log.warning(
+                    "INTRADAY 5M STALE REPAIR SKIPPED | %s | age=%.1fm | reason=%s",
+                    key, float(age), why,
+                )
+                log.warning("INTRADAY 5M STALE UNRESOLVED | %s | age=%.1fm", key, float(age))
+                continue
             try:
                 repaired = fetch_intraday(key, interval="5m", period="5d")
             except Exception as exc:
@@ -174,26 +224,109 @@ def _cached_5m_snapshot(symbols: list[str], fetch_bulk) -> dict[str, pd.DataFram
     return cached
 
 def _cached_5m_benchmark(symbol: str, fetch_one):
-    """Cache SPY/QQQ 5m for the same snapshot window; never refetch in gates."""
+    """Return one canonical SPY/QQQ 5m frame with per-symbol freshness validation.
+
+    The cache timestamp is tracked per benchmark so a fresh SPY cannot make an
+    older QQQ frame look fresh. No strategy logic or freshness threshold changes.
+    """
     import time as _time
-    global _M5_BENCHMARK_UPDATED_AT
+    global _M5_BENCHMARK_UPDATED_AT, _M5_BENCHMARK_UPDATED_AT_BY_SYMBOL
     sym = str(symbol).upper().strip()
     now = _time.monotonic()
+
     with _M5_CACHE_LOCK:
-        if sym in _M5_BENCHMARK_CACHE and (now - _M5_BENCHMARK_UPDATED_AT) < M5_BULK_CACHE_TTL_SECONDS:
-            return _copy_frame(_M5_BENCHMARK_CACHE[sym])
-    try:
-        df = fetch_one()
-    except Exception as exc:
-        log.warning("INTRADAY 5M BENCHMARK FETCH FAILED | %s | %s", sym, str(exc))
-        df = None
+        cached = _copy_frame(_M5_BENCHMARK_CACHE.get(sym))
+        updated_at = _M5_BENCHMARK_UPDATED_AT_BY_SYMBOL.get(sym, _M5_BENCHMARK_UPDATED_AT)
+
+    if cached is not None and (now - updated_at) < M5_BULK_CACHE_TTL_SECONDS:
+        try:
+            from market_data import intraday_data_fresh
+            fresh_ok, age = intraday_data_fresh(cached, "5m", 12.0)
+        except Exception:
+            fresh_ok, age = False, float("inf")
+        if fresh_ok:
+            log.info(
+                "INTRADAY 5M BENCHMARK CACHE HIT | %s | age=%.1fm | cache_age=%.1fs",
+                sym, float(age), now - updated_at,
+            )
+            return cached
+        log.warning(
+            "INTRADAY 5M BENCHMARK CACHE STALE | %s | age=%.1fm | forcing refresh",
+            sym, float(age),
+        )
+
+    # Benchmark fetch is completed before Market Regime starts.  The loader
+    # used by _market_alignment() must therefore receive a real frame or None;
+    # its retries must never re-fetch inside the gates.  Retry here, once at the
+    # snapshot boundary, so a transient IEX/API miss does not become a fake
+    # three-retry loop over the same None value.
+    df = None
+    last_exc = None
+    for _attempt in range(1, 4):
+        try:
+            df = fetch_one()
+        except Exception as exc:
+            last_exc = exc
+            df = None
+            log.warning(
+                "INTRADAY 5M BENCHMARK FETCH FAILED | %s | attempt=%d/3 | %s",
+                sym, _attempt, str(exc),
+            )
+        if isinstance(df, pd.DataFrame) and not df.empty:
+            try:
+                from market_data import intraday_data_fresh
+                _fresh_now, _age_now = intraday_data_fresh(df, "5m", 12.0)
+            except Exception:
+                _fresh_now, _age_now = False, float("inf")
+            if _fresh_now:
+                break
+            log.warning(
+                "INTRADAY 5M BENCHMARK FETCH STALE | %s | attempt=%d/3 | age=%.1fm",
+                sym, _attempt, float(_age_now),
+            )
+            df = None
+        if _attempt < 3:
+            _time.sleep(0.75)
+
+    if df is None and last_exc is not None:
+        log.warning("INTRADAY 5M BENCHMARK UNRESOLVED | %s | %s", sym, str(last_exc))
+
     if isinstance(df, pd.DataFrame) and not df.empty:
-        with _M5_CACHE_LOCK:
-            _M5_BENCHMARK_CACHE[sym] = df
-            _M5_BENCHMARK_UPDATED_AT = now
-        return _copy_frame(df)
+        try:
+            from market_data import intraday_data_fresh
+            fresh_ok, age = intraday_data_fresh(df, "5m", 12.0)
+        except Exception:
+            fresh_ok, age = False, float("inf")
+
+        if fresh_ok:
+            with _M5_CACHE_LOCK:
+                _M5_BENCHMARK_CACHE[sym] = df
+                _M5_BENCHMARK_UPDATED_AT_BY_SYMBOL[sym] = now
+                _M5_BENCHMARK_UPDATED_AT = now
+            log.info(
+                "INTRADAY 5M BENCHMARK FRESH | %s | age=%.1fm",
+                sym, float(age),
+            )
+            return _copy_frame(df)
+
+        log.warning(
+            "INTRADAY 5M BENCHMARK REJECTED STALE | %s | age=%.1fm>12m",
+            sym, float(age),
+        )
+
+    # Never return a known-stale benchmark as if it were fresh.
     with _M5_CACHE_LOCK:
-        return _copy_frame(_M5_BENCHMARK_CACHE.get(sym))
+        cached = _copy_frame(_M5_BENCHMARK_CACHE.get(sym))
+    if cached is not None:
+        try:
+            from market_data import intraday_data_fresh
+            fresh_ok, age = intraday_data_fresh(cached, "5m", 12.0)
+        except Exception:
+            fresh_ok, age = False, float("inf")
+        if fresh_ok:
+            return cached
+
+    return None
 
 
 def _intraday_data_audit_record(symbol: str, *reasons: str) -> None:
@@ -5273,6 +5406,7 @@ def scan_intraday(
     scan_intraday.last_window = "ok"
 
     try:
+        _reset_m5_stale_repair_budget()
         # Load SPY/QQQ 5m exactly once for this scan. The same frames are reused
         # by market alignment, relative-strength checks, and every Stage-2 symbol.
         from market_data import fetch_intraday
