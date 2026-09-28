@@ -2051,8 +2051,8 @@ def _period_days(period: str, default: int = 5) -> int:
     return int(default)
 
 
-DAILY_MARKET_RETRY_ATTEMPTS = 1
-DAILY_MARKET_RETRY_DELAYS = (0.0,)
+DAILY_MARKET_RETRY_ATTEMPTS = 2
+DAILY_MARKET_RETRY_DELAYS = (0.0, 0.5)
 DAILY_MARKET_SNAPSHOT_ONCE = True
 DAILY_POSITIVE_EMA50_BUFFER_PCT = 0.50
 
@@ -2130,8 +2130,14 @@ def _market_alignment(fetch_intraday) -> tuple[bool, str]:
                     "DAILY MARKET FETCH FAILED | %s | attempt %d/%d | %s",
                     sym, attempt_no, DAILY_MARKET_RETRY_ATTEMPTS, exc,
                 )
-                # Daily market regime is a scan snapshot. Do not add serial retry
-                # sleeps here: a failed snapshot must fail closed for this scan.
+                if attempt_no < DAILY_MARKET_RETRY_ATTEMPTS:
+                    delay = DAILY_MARKET_RETRY_DELAYS[min(
+                        attempt_no, len(DAILY_MARKET_RETRY_DELAYS) - 1
+                    )]
+                    if delay > 0:
+                        time.sleep(delay)
+                    continue
+                # Both attempts failed: fail closed for this scan.
                 break
 
         states.append(state)
