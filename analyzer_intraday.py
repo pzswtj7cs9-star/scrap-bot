@@ -2163,34 +2163,56 @@ def _market_relative_returns(fetch_intraday) -> tuple[float | None, float | None
 
     vals: dict[str, float | None] = {"SPY": None, "QQQ": None}
     for sym in ("SPY", "QQQ"):
-        try:
-            d = fetch_intraday(sym, interval="5m", period="3d")
-            if d is None or len(d) < 6:
-                log.warning("INTRADAY RELATIVE MARKET INCOMPLETE | %s | insufficient bars", sym)
-                continue
+        # A transient empty/stale benchmark must not invalidate the whole
+        # weak-market scan on the first request. Allow exactly one immediate
+        # re-fetch for the affected benchmark before declaring it unavailable.
+        for attempt in range(1, 3):
             try:
-                from market_data import intraday_data_fresh
-                _fresh_ok, _age_min = intraday_data_fresh(d, "5m", 12.0)
-                if not _fresh_ok:
-                    log.warning("INTRADAY RELATIVE MARKET STALE | %s | age=%.1fm>12m", sym, float(_age_min))
-                    continue
-            except Exception as _fresh_exc:
-                log.warning("INTRADAY RELATIVE MARKET FRESHNESS CHECK FAILED | %s | %s", sym, _fresh_exc)
-                continue
-            day = d.index[-1].date()
-            cur = d[d.index.date == day]
-            prev = d[d.index.date < day]
-            if cur.empty or prev.empty:
-                log.warning("INTRADAY RELATIVE MARKET INCOMPLETE | %s | missing current/previous session", sym)
-                continue
-            prev_close = float(prev["Close"].iloc[-1])
-            last = float(cur["Close"].iloc[-1])
-            if prev_close <= 0 or not np.isfinite(prev_close) or not np.isfinite(last):
-                log.warning("INTRADAY RELATIVE MARKET INVALID | %s | non-positive/non-finite benchmark price", sym)
-                continue
-            vals[sym] = (last - prev_close) / prev_close * 100.0
-        except Exception as exc:
-            log.warning("INTRADAY RELATIVE MARKET FETCH FAILED | %s | %s", sym, exc)
+                d = fetch_intraday(sym, interval="5m", period="3d")
+                if d is None or len(d) < 6:
+                    log.warning("INTRADAY RELATIVE MARKET INCOMPLETE | %s | attempt=%d/2 | insufficient bars", sym, attempt)
+                    if attempt < 2:
+                        time.sleep(MARKET_RETRY_SLEEP_SECONDS)
+                        continue
+                    break
+                try:
+                    from market_data import intraday_data_fresh
+                    _fresh_ok, _age_min = intraday_data_fresh(d, "5m", 12.0)
+                    if not _fresh_ok:
+                        log.warning("INTRADAY RELATIVE MARKET STALE | %s | attempt=%d/2 | age=%.1fm>12m", sym, attempt, float(_age_min))
+                        if attempt < 2:
+                            time.sleep(MARKET_RETRY_SLEEP_SECONDS)
+                            continue
+                        break
+                except Exception as _fresh_exc:
+                    log.warning("INTRADAY RELATIVE MARKET FRESHNESS CHECK FAILED | %s | attempt=%d/2 | %s", sym, attempt, _fresh_exc)
+                    if attempt < 2:
+                        time.sleep(MARKET_RETRY_SLEEP_SECONDS)
+                        continue
+                    break
+                day = d.index[-1].date()
+                cur = d[d.index.date == day]
+                prev = d[d.index.date < day]
+                if cur.empty or prev.empty:
+                    log.warning("INTRADAY RELATIVE MARKET INCOMPLETE | %s | attempt=%d/2 | missing current/previous session", sym, attempt)
+                    if attempt < 2:
+                        time.sleep(MARKET_RETRY_SLEEP_SECONDS)
+                        continue
+                    break
+                prev_close = float(prev["Close"].iloc[-1])
+                last = float(cur["Close"].iloc[-1])
+                if prev_close <= 0 or not np.isfinite(prev_close) or not np.isfinite(last):
+                    log.warning("INTRADAY RELATIVE MARKET INVALID | %s | attempt=%d/2 | non-positive/non-finite benchmark price", sym, attempt)
+                    if attempt < 2:
+                        time.sleep(MARKET_RETRY_SLEEP_SECONDS)
+                        continue
+                    break
+                vals[sym] = (last - prev_close) / prev_close * 100.0
+                break
+            except Exception as exc:
+                log.warning("INTRADAY RELATIVE MARKET FETCH FAILED | %s | attempt=%d/2 | %s", sym, attempt, exc)
+                if attempt < 2:
+                    time.sleep(MARKET_RETRY_SLEEP_SECONDS)
 
     spy, qqq = vals["SPY"], vals["QQQ"]
     if spy is None or qqq is None:
@@ -2217,45 +2239,49 @@ def _market_alignment(fetch_intraday) -> tuple[bool, str]:
 
     for sym in ("SPY", "QQQ"):
         state = None
-        try:
-            log.info("MARKET DATA | %s | snapshot", sym)
-            d = fetch_intraday(sym, interval="5m", period="2d")
-            if d is None or len(d) < 4:
-                raise ValueError("market data unavailable/incomplete")
-            if intraday_data_fresh is not None:
-                fresh_ok, age = intraday_data_fresh(d, "5m", 12.0)
-                if not fresh_ok:
-                    raise ValueError(f"market data stale: age={float(age):.1f}m > 12m")
+        for attempt in range(1, 3):
+            try:
+                log.info("MARKET DATA | %s | snapshot attempt=%d/2", sym, attempt)
+                d = fetch_intraday(sym, interval="5m", period="2d")
+                if d is None or len(d) < 4:
+                    raise ValueError("market data unavailable/incomplete")
+                if intraday_data_fresh is not None:
+                    fresh_ok, age = intraday_data_fresh(d, "5m", 12.0)
+                    if not fresh_ok:
+                        raise ValueError(f"market data stale: age={float(age):.1f}m > 12m")
 
-            idx = pd.DatetimeIndex(d.index)
-            if idx.tz is None:
-                idx = idx.tz_localize("UTC")
-            idx_ny = idx.tz_convert("America/New_York")
-            frame = d.copy()
-            frame.index = idx_ny
-            day = now.date()
-            cur = frame[frame.index.date == day]
-            cutoff = pd.Timestamp(now).floor("5min") - pd.Timedelta(minutes=5)
-            cur = cur[cur.index <= cutoff]
-            cur = cur[(cur.index.time >= REGULAR_OPEN) & (cur.index.time <= REGULAR_CLOSE)]
-            if len(cur) < 4:
-                raise ValueError(f"completed market bars incomplete: {len(cur)}")
+                idx = pd.DatetimeIndex(d.index)
+                if idx.tz is None:
+                    idx = idx.tz_localize("UTC")
+                idx_ny = idx.tz_convert("America/New_York")
+                frame = d.copy()
+                frame.index = idx_ny
+                day = now.date()
+                cur = frame[frame.index.date == day]
+                cutoff = pd.Timestamp(now).floor("5min") - pd.Timedelta(minutes=5)
+                cur = cur[cur.index <= cutoff]
+                cur = cur[(cur.index.time >= REGULAR_OPEN) & (cur.index.time <= REGULAR_CLOSE)]
+                if len(cur) < 4:
+                    raise ValueError(f"completed market bars incomplete: {len(cur)}")
 
-            p = float(cur["Close"].iloc[-1])
-            op = float(cur["Open"].iloc[0])
-            vw = float(_vwap(cur).iloc[-1])
-            if p >= op and p >= vw:
-                state = "داعم"
-            elif p >= op and p < vw and p >= op * (1.0 - POSITIVE_BELOW_VWAP_MAX_OPEN_GAP_PCT / 100.0):
-                state = "إيجابي_تحت_VWAP"
-            else:
-                state = "ضعيف"
-            log.info(
-                "MARKET DATA | %s | success | completed_bars=%d | close=%.4f | open=%.4f | vwap=%.4f | age=%.1fm | state=%s",
-                sym, len(cur), p, op, vw, float(age) if intraday_data_fresh is not None else -1.0, state,
-            )
-        except Exception as exc:
-            log.warning("MARKET DATA | %s | failed snapshot | %s", sym, str(exc), exc_info=True)
+                p = float(cur["Close"].iloc[-1])
+                op = float(cur["Open"].iloc[0])
+                vw = float(_vwap(cur).iloc[-1])
+                if p >= op and p >= vw:
+                    state = "داعم"
+                elif p >= op and p < vw and p >= op * (1.0 - POSITIVE_BELOW_VWAP_MAX_OPEN_GAP_PCT / 100.0):
+                    state = "إيجابي_تحت_VWAP"
+                else:
+                    state = "ضعيف"
+                log.info(
+                    "MARKET DATA | %s | success | attempt=%d/2 | completed_bars=%d | close=%.4f | open=%.4f | vwap=%.4f | age=%.1fm | state=%s",
+                    sym, attempt, len(cur), p, op, vw, float(age) if intraday_data_fresh is not None else -1.0, state,
+                )
+                break
+            except Exception as exc:
+                log.warning("MARKET DATA | %s | failed snapshot | attempt=%d/2 | %s", sym, attempt, str(exc), exc_info=True)
+                if attempt < 2:
+                    time.sleep(MARKET_RETRY_SLEEP_SECONDS)
         states.append(state)
 
     if states == ["داعم", "داعم"]:
@@ -2962,6 +2988,14 @@ def analyze_intraday(
             )
         else:
             # Incomplete SPY/QQQ benchmarks can never unlock the weak-market override.
+            # Keep the permission decision strictly blocked, but normalize the
+            # diagnostic return values so an unavailable benchmark cannot leak
+            # None into IntradaySignal/round(). This fixes the Stage-2
+            # NoneType/__round__ exception without manufacturing relative strength:
+            # relative_strength_ok remains False and stock_relative_strength stays 0.
+            market_rel_spy = 0.0
+            market_rel_qqq = 0.0
+            market_rel_avg = 0.0
             stock_relative_strength = 0.0
             relative_strength_ok = False
 
