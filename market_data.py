@@ -15,7 +15,7 @@ import pandas as pd
 import requests
 
 log = logging.getLogger("halal-bot.data")
-DATA_LAYER_VERSION = "20260926-M5-COMPLETE-BUCKET-FIX-V1"
+DATA_LAYER_VERSION = "20260928-M5-TWELVE-SMART-CACHE-V1"
 log.info("DATA LAYER VERSION | %s", DATA_LAYER_VERSION)
 
 APCA_KEY = os.getenv("APCA_API_KEY_ID", "").strip()
@@ -41,10 +41,27 @@ _TWELVE_QUOTA_REASON = ""
 # Keep a local rolling budget so concurrent Stage-1 fallbacks never issue the
 # 9th request and trigger a 429 storm. This is a safety/data-plumbing limit;
 # it never substitutes stale data for a fresh frame.
-TWELVE_MINUTE_CREDIT_LIMIT = max(1, int(os.getenv("TWELVE_DATA_CREDITS_PER_MINUTE", "8")))
+# Keep one credit in reserve by default. This avoids edge/race cases where
+# another process or a provider-side accounting delay consumes the 8th credit.
+TWELVE_MINUTE_CREDIT_LIMIT = max(1, int(os.getenv("TWELVE_DATA_CREDITS_PER_MINUTE", "7")))
 _TWELVE_CREDIT_TIMES = deque(maxlen=64)
 _TWELVE_CREDIT_LOCK = threading.Lock()
 _TWELVE_MINUTE_BLOCKED_UNTIL = 0.0
+
+# Short-lived fallback cache. It is ONLY for Twelve Data responses and is
+# freshness-checked again before the caller accepts the data. Therefore it can
+# reduce duplicate API calls without ever turning stale data into valid data.
+_TWELVE_CACHE = {}
+_TWELVE_CACHE_LOCK = threading.Lock()
+_TWELVE_CACHE_TTL = {
+    "1min": float(os.getenv("TWELVE_CACHE_TTL_1M", "45")),
+    "5min": float(os.getenv("TWELVE_CACHE_TTL_5M", "180")),
+    "15min": float(os.getenv("TWELVE_CACHE_TTL_15M", "300")),
+    "1h": float(os.getenv("TWELVE_CACHE_TTL_1H", "600")),
+    "1day": float(os.getenv("TWELVE_CACHE_TTL_1D", "1800")),
+    "1week": float(os.getenv("TWELVE_CACHE_TTL_1W", "3600")),
+}
+_TWELVE_FETCH_LOCK = threading.Lock()
 
 
 _LAST_SOURCE = "none"
@@ -430,15 +447,50 @@ def _twelve_get(endpoint: str, params: dict, timeout: float | None = None) -> re
     raise RuntimeError("Twelve Data HTTP 429")
 
 def _twelve_time_series(symbol: str, interval: str, start: datetime, end: datetime, outputsize: int = 5000) -> pd.DataFrame:
-    """Fetch Twelve Data OHLCV and normalize it to the bot's DataFrame schema."""
+    """Fetch Twelve Data OHLCV with a short-lived, freshness-safe cache.
+
+    The cache is deliberately below the freshness gate: callers still run
+    _twelve_fresh() on the returned frame. A cached frame can therefore reduce
+    repeated API consumption without allowing stale data into analysis.
+    """
     if not twelve_configured():
         raise RuntimeError("Twelve Data API key missing")
+
     td_interval = {
         "1m": "1min", "1Min": "1min", "5m": "5min", "5Min": "5min",
         "15m": "15min", "15Min": "15min", "60m": "1h", "1h": "1h", "1Hour": "1h",
         "1d": "1day", "1D": "1day", "1Day": "1day",
         "1wk": "1week", "1w": "1week", "1Week": "1week",
     }.get(interval, str(interval).lower())
+
+    # Cache key intentionally ignores the moving start/end timestamps. The
+    # stored frame is validated against the requested history range below.
+    cache_key = (symbol.upper().strip(), td_interval)
+    now_m = _time.monotonic()
+    ttl = float(_TWELVE_CACHE_TTL.get(td_interval, 120.0))
+
+    with _TWELVE_CACHE_LOCK:
+        cached = _TWELVE_CACHE.get(cache_key)
+        if cached:
+            cached_at, cached_df = cached
+            if now_m - cached_at <= ttl and cached_df is not None and not cached_df.empty:
+                try:
+                    start_n = pd.Timestamp(start)
+                    end_n = pd.Timestamp(end)
+                    idx = pd.DatetimeIndex(cached_df.index)
+                    if idx.tz is None:
+                        idx = idx.tz_localize("America/New_York")
+                    else:
+                        idx = idx.tz_convert("America/New_York")
+                    if idx.min() <= start_n.tz_convert("America/New_York") and idx.max() <= end_n.tz_convert("America/New_York") + pd.Timedelta(minutes=2):
+                        hit = cached_df.copy()
+                        hit.attrs.update(cached_df.attrs)
+                        hit.attrs["data_source"] = "twelve-data-cache"
+                        hit.attrs["twelve_cache_age_sec"] = float(now_m - cached_at)
+                        return hit
+                except Exception:
+                    pass
+
     params = {
         "symbol": symbol.upper().strip(),
         "interval": td_interval,
@@ -448,36 +500,68 @@ def _twelve_time_series(symbol: str, interval: str, start: datetime, end: dateti
         "order": "asc",
         "timezone": "America/New_York",
     }
-    r = _twelve_get("time_series", params)
-    if r.status_code >= 400:
-        raise RuntimeError(f"Twelve Data {r.status_code}: {r.text[:180]}")
-    data = r.json() or {}
-    if data.get("status") == "error" or "values" not in data:
-        raise RuntimeError(f"Twelve Data error: {data.get('message') or data.get('code') or 'no values'}")
-    values = data.get("values") or []
-    rows = []
-    idx = []
-    for v in values:
-        try:
-            ts = pd.Timestamp(v.get("datetime"))
-            if ts.tzinfo is None:
-                ts = ts.tz_localize("America/New_York")
-            else:
-                ts = ts.tz_convert("America/New_York")
-            rows.append({
-                "Open": float(v["open"]), "High": float(v["high"]),
-                "Low": float(v["low"]), "Close": float(v["close"]),
-                "Volume": float(v.get("volume") or 0),
-            })
-            idx.append(ts)
-        except Exception:
-            continue
-    if not rows:
-        raise RuntimeError("Twelve Data returned no valid bars")
-    df = pd.DataFrame(rows, index=pd.DatetimeIndex(idx))
-    df = df[~df.index.duplicated(keep="last")].sort_index()
-    df.attrs["data_source"] = "twelve-data"
-    return df
+
+    # Single-flight the actual provider request. This prevents two concurrent
+    # Stage-1 workers from fetching the same symbol/frame simultaneously.
+    with _TWELVE_FETCH_LOCK:
+        # Another worker may have filled the cache while we waited.
+        now_m = _time.monotonic()
+        with _TWELVE_CACHE_LOCK:
+            cached = _TWELVE_CACHE.get(cache_key)
+            if cached:
+                cached_at, cached_df = cached
+                if now_m - cached_at <= ttl and cached_df is not None and not cached_df.empty:
+                    try:
+                        idx = pd.DatetimeIndex(cached_df.index)
+                        if idx.tz is None:
+                            idx = idx.tz_localize("America/New_York")
+                        else:
+                            idx = idx.tz_convert("America/New_York")
+                        start_n = pd.Timestamp(start).tz_convert("America/New_York")
+                        end_n = pd.Timestamp(end).tz_convert("America/New_York")
+                        if idx.min() <= start_n and idx.max() <= end_n + pd.Timedelta(minutes=2):
+                            hit = cached_df.copy()
+                            hit.attrs.update(cached_df.attrs)
+                            hit.attrs["data_source"] = "twelve-data-cache"
+                            hit.attrs["twelve_cache_age_sec"] = float(now_m - cached_at)
+                            return hit
+                    except Exception:
+                        pass
+
+        r = _twelve_get("time_series", params)
+        if r.status_code >= 400:
+            raise RuntimeError(f"Twelve Data {r.status_code}: {r.text[:180]}")
+        data = r.json() or {}
+        if data.get("status") == "error" or "values" not in data:
+            raise RuntimeError(f"Twelve Data error: {data.get('message') or data.get('code') or 'no values'}")
+        values = data.get("values") or []
+        rows = []
+        idx = []
+        for v in values:
+            try:
+                ts = pd.Timestamp(v.get("datetime"))
+                if ts.tzinfo is None:
+                    ts = ts.tz_localize("America/New_York")
+                else:
+                    ts = ts.tz_convert("America/New_York")
+                rows.append({
+                    "Open": float(v["open"]), "High": float(v["high"]),
+                    "Low": float(v["low"]), "Close": float(v["close"]),
+                    "Volume": float(v.get("volume") or 0),
+                })
+                idx.append(ts)
+            except Exception:
+                continue
+        if not rows:
+            raise RuntimeError("Twelve Data returned no valid bars")
+        df = pd.DataFrame(rows, index=pd.DatetimeIndex(idx))
+        df = df[~df.index.duplicated(keep="last")].sort_index()
+        df.attrs["data_source"] = "twelve-data"
+
+        with _TWELVE_CACHE_LOCK:
+            _TWELVE_CACHE[cache_key] = (_time.monotonic(), df.copy())
+
+        return df
 
 
 def _twelve_fresh(df: pd.DataFrame, interval: str) -> tuple[bool, float]:
