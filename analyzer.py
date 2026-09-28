@@ -30,7 +30,7 @@ from stocks import MAX_AUTO_PRICE
 
 log = logging.getLogger("halal-bot.daily")
 
-DAILY_ANALYZER_VERSION = "20260925-FINAL-END-TO-END-AUDIT-V4"
+DAILY_ANALYZER_VERSION = "20260923-FINAL-END-TO-END-AUDIT-V3"
 log.info("DAILY ANALYZER VERSION | %s", DAILY_ANALYZER_VERSION)
 
 SKIP_OPEN_MIN = 0
@@ -2051,8 +2051,12 @@ def _period_days(period: str, default: int = 5) -> int:
     return int(default)
 
 
-DAILY_MARKET_RETRY_ATTEMPTS = 4
-DAILY_MARKET_RETRY_DELAYS = (0.0, 0.5, 1.0, 1.5)
+DAILY_MARKET_RETRY_ATTEMPTS = 1
+DAILY_MARKET_RETRY_DELAYS = (0.0,)
+# Daily market context is a scan-level snapshot. Do not spend multiple seconds
+# retrying the same SPY/QQQ 1D request; a failed snapshot safely yields an
+# unsupported/unknown market state instead of delaying the whole scan.
+DAILY_STAGE1_PARALLEL = True
 DAILY_POSITIVE_EMA50_BUFFER_PCT = 0.50
 
 
@@ -4776,16 +4780,18 @@ def analyze_daily(
 
     score_i = int(max(0, min(100, round(score))))
 
-    # Weak-market exception candidate. It is deliberately narrow: actual
-    # relative strength + strong alignment + high score. Final approval is
+    # Weak-market exception candidate. Daily weak-market floor is 92; 97 is
+    # NOT a universal minimum. The exception remains narrow: actual relative
+    # strength + strong alignment + clean execution, and never Early Entry. Final approval is
     # still recomputed after TP/stop checks below, so market_block is allowed
     # only when it is the sole remaining quality problem.
     strong_stock_market_candidate = bool(
         market_condition == "ضعيف"
         and not market_ok
-        and raw_score >= 97.0
+        and raw_score >= DAILY_MARKET_SCORE_BY_STATE["ضعيف"]
         and strong_alignment
         and relative_strength_ok
+        and entry_type != "دخول مبكر"
         and vol_ratio >= 1.25
         and ext <= 5.0
         and not chop
@@ -4991,7 +4997,8 @@ def analyze_daily(
     # blocker is market_block may pass.
     strong_stock_market_override = bool(
         strong_stock_market_candidate
-        and raw_score >= 97.0
+        and raw_score >= DAILY_MARKET_SCORE_BY_STATE["ضعيف"]
+        and entry_type != "دخول مبكر"
         and not dump
         and not failed
         and quality_ext_pct <= 5.0
@@ -5428,6 +5435,7 @@ def scan_daily(
         log.warning("Daily market context unavailable after retries: %s", exc)
         market_context = (False, "بيانات SPY/QQQ غير متاحة")
 
+    _scan_started_monotonic = time_module.monotonic()
     workers = min(8, max(2, len(symbols)))
     stage1=[]
     stage1_audit_counts: dict[str, int] = {}
@@ -5449,7 +5457,12 @@ def scan_daily(
                 if weekly is None and daily is None:
                     return None
                 return _prefilter_daily_from_frames(sym, weekly, daily, stage1_audit_counts, stage1_audit_lock, stage1_data_audit_counts)
-            for sym in symbols:
+            def _stage1_one(sym):
+                # The bulk weekly/daily frames are already fetched. Running the
+                # per-symbol routing concurrently is important because the daily
+                # time-of-day volume gate legitimately needs one 30d/5m request
+                # per symbol. This preserves the exact volume formula and gates
+                # while removing the old sequential network bottleneck.
                 item = _route_from_frames(sym)
                 if item is None:
                     # Partial-batch hardening: a missing symbol must get its own
@@ -5461,11 +5474,28 @@ def scan_daily(
                     except Exception as exc:
                         log.warning("DAILY INDIVIDUAL FALLBACK FAILED | %s | %s", sym, exc)
                         item = None
-                if item:
-                    route, routes, weekly, daily, vol_ratio = item; stage1.append((route, routes, sym, weekly, daily, vol_ratio))
-                    with stage1_audit_lock: stage1_audit_passed += 1
-                else:
-                    with stage1_audit_lock: stage1_audit_rejected += 1
+                return sym, item
+
+            if DAILY_STAGE1_PARALLEL and symbols:
+                with ThreadPoolExecutor(max_workers=workers) as pool:
+                    futures = {pool.submit(_stage1_one, sym): sym for sym in symbols}
+                    for fut in as_completed(futures):
+                        sym, item = fut.result()
+                        if item:
+                            route, routes, weekly, daily, vol_ratio = item
+                            stage1.append((route, routes, sym, weekly, daily, vol_ratio))
+                            with stage1_audit_lock: stage1_audit_passed += 1
+                        else:
+                            with stage1_audit_lock: stage1_audit_rejected += 1
+            else:
+                for sym in symbols:
+                    sym, item = _stage1_one(sym)
+                    if item:
+                        route, routes, weekly, daily, vol_ratio = item
+                        stage1.append((route, routes, sym, weekly, daily, vol_ratio))
+                        with stage1_audit_lock: stage1_audit_passed += 1
+                    else:
+                        with stage1_audit_lock: stage1_audit_rejected += 1
         else:
             raise RuntimeError("Alpaca not configured")
     except Exception as exc:
@@ -5484,7 +5514,7 @@ def scan_daily(
                 else:
                     with stage1_audit_lock: stage1_audit_rejected += 1
     stage1.sort(key=lambda x:(x[0], max(x[1].values()) if x[1] else 0.0), reverse=True)
-    log.info("STAGE 1 DAILY: %d/%d passed | rejected=%d | audit_reasons=%s", len(stage1), len(symbols), len(symbols)-len(stage1), stage1_audit_counts)
+    log.info("STAGE 1 DAILY: %d/%d passed | rejected=%d | audit_reasons=%s | elapsed=%.2fs", len(stage1), len(symbols), len(symbols)-len(stage1), stage1_audit_counts, time_module.monotonic() - _scan_started_monotonic)
     base_n=max(PREFILTER_MAX_CANDIDATES, limit*5)
     selected={item[2]:item for item in stage1[:base_n]}
     for et in ENTRY_TYPES:
@@ -5498,7 +5528,7 @@ def scan_daily(
     # would silently evict protected strategy lanes. The absolute cap is only
     # a safety ceiling above the mathematical maximum of 50 + (len(ENTRY_TYPES)*4).
     finalists=sorted(selected.values(), key=lambda item:(float(item[0]), max(item[1].values()) if item[1] else 0.0), reverse=True)[:min(PREFILTER_STRATEGY_CAP,base_n+len(ENTRY_TYPES)*PREFILTER_STRATEGY_TOP_K)]
-    log.info("STAGE 2 DAILY: top %d", len(finalists))
+    log.info("STAGE 2 DAILY: top %d | stage1_elapsed=%.2fs", len(finalists), time_module.monotonic() - _scan_started_monotonic)
     results=[]
     stage2_scores = []
     # Diagnostics only: these counters do NOT change any selection rule.

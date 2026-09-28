@@ -93,57 +93,41 @@ _M5_CACHE_UPDATED_AT = 0.0
 _M5_CACHE: dict[str, pd.DataFrame] = {}
 _M5_BENCHMARK_CACHE: dict[str, pd.DataFrame] = {}
 _M5_BENCHMARK_UPDATED_AT = 0.0
+# Controlled stale repair: never let an IEX-wide stale burst turn one scan into
+# dozens of sequential Alpaca/Twelve Data requests. The existing 12m freshness
+# gate remains hard; symbols not repaired in this bounded pass are simply rejected
+# from Stage 1 and can be retried on the next scan.
+M5_STALE_REPAIR_MAX_PER_SCAN = 4
+M5_STALE_REPAIR_WORKERS = 2
 
 def _copy_frame(df):
     if isinstance(df, pd.DataFrame):
         return df.copy(deep=False)
     return None
 
-def _last_completed_pos(df: pd.DataFrame, now=None) -> int:
-    """Return the position of the latest fully completed 5m candle.
-
-    The data layer normally rejects an incomplete latest 5m candle, but this
-    helper keeps Stage-1/Stage-2 correct if a provider returns a completed-only
-    frame or if that policy changes later.
-    """
-    if df is None or df.empty:
-        return -1
-    try:
-        ts = pd.Timestamp(df.index[-1])
-        if ts.tzinfo is None:
-            ts = ts.tz_localize("America/New_York")
-        now_ts = pd.Timestamp(now or datetime.now(timezone.utc))
-        if now_ts.tzinfo is None:
-            now_ts = now_ts.tz_localize("UTC")
-        now_ts = now_ts.tz_convert(ts.tz)
-        bucket_end = ts.floor("5min") + pd.Timedelta(minutes=5)
-        if bucket_end <= now_ts:
-            return len(df) - 1
-        return max(-1, len(df) - 2)
-    except Exception:
-        return max(-1, len(df) - 1)
-
 def _cached_5m_snapshot(symbols: list[str], fetch_bulk) -> dict[str, pd.DataFrame]:
-    """Return one canonical 5m snapshot for the scan.
+    """Return one canonical fresh 5m snapshot without request storms.
 
-    Data integrity only: cache/freshness/repair plumbing. Strategy logic, Score,
-    VWAP and the 12-minute freshness gate remain unchanged. A stale symbol is
-    never accepted as fresh; it is repaired from Alpaca 1m when possible and
-    then may use the controlled Twelve Data fallback.
+    Bulk Alpaca IEX is preferred. Only a small bounded set of stale symbols gets
+    the normal Alpaca -> 1m repair -> Twelve Data fallback path, in parallel with
+    at most two workers. Unrepaired symbols are not re-fetched by Stage 1 because
+    the caller passes an explicit snapshot tuple; they fail the existing freshness
+    gate instead. This keeps /scani responsive without accepting stale data.
     """
     import time as _time
+    from concurrent.futures import ThreadPoolExecutor, as_completed
     global _M5_CACHE_UPDATED_AT, _M5_CACHE
     clean = [str(x).upper().strip() for x in symbols or [] if str(x).strip()]
     unique = list(dict.fromkeys(clean))
     now = _time.monotonic()
+
     with _M5_CACHE_LOCK:
         fresh_cache = bool(_M5_CACHE) and (now - _M5_CACHE_UPDATED_AT) < M5_BULK_CACHE_TTL_SECONDS
         cached = {sym: _copy_frame(_M5_CACHE.get(sym)) for sym in unique if sym in _M5_CACHE}
 
-    # Validate cache freshness, not merely cache age. IEX coverage can leave an
-    # individual symbol stale even while the process cache itself is recent.
+    # Validate the actual candle age, not just process-cache age.
+    from market_data import intraday_data_fresh, fetch_intraday
     if fresh_cache and len(cached) == len(unique):
-        from market_data import intraday_data_fresh
         stale = []
         for sym, df in cached.items():
             ok, age = intraday_data_fresh(df, "5m", 12.0)
@@ -152,7 +136,7 @@ def _cached_5m_snapshot(symbols: list[str], fetch_bulk) -> dict[str, pd.DataFram
         if not stale:
             log.info("INTRADAY 5M CACHE HIT | symbols=%d | age=%.1fs", len(cached), now - _M5_CACHE_UPDATED_AT)
             return cached
-        log.warning("INTRADAY 5M CACHE STALE | symbols=%d | stale=%d | forcing repair", len(cached), len(stale))
+        log.warning("INTRADAY 5M CACHE STALE | symbols=%d | stale=%d | forcing bounded refresh", len(cached), len(stale))
 
     try:
         fresh = fetch_bulk() or {}
@@ -160,107 +144,127 @@ def _cached_5m_snapshot(symbols: list[str], fetch_bulk) -> dict[str, pd.DataFram
         log.warning("INTRADAY 5M BULK REFRESH FAILED | using cached=%d | %s", len(cached), str(exc))
         fresh = {}
 
-    if fresh:
-        from market_data import intraday_data_fresh, fetch_intraday
-        validated: dict[str, pd.DataFrame] = {}
-        stale_repair = 0
-        fresh_keys: set[str] = set()
-        repair_attempted: set[str] = set()
+    validated: dict[str, pd.DataFrame] = {}
+    stale_items: list[tuple[str, float, pd.DataFrame]] = []
+    for sym, df in fresh.items():
+        key = str(sym).upper().strip()
+        if not key or not isinstance(df, pd.DataFrame) or df.empty:
+            continue
+        ok, age = intraday_data_fresh(df, "5m", 12.0)
+        if ok:
+            validated[key] = df
+        else:
+            stale_items.append((key, float(age), df))
 
-        for sym, df in fresh.items():
-            key = str(sym).upper().strip()
-            if not key or not isinstance(df, pd.DataFrame) or df.empty:
-                continue
-            fresh_keys.add(key)
-            ok, age = intraday_data_fresh(df, "5m", 12.0)
-            if ok:
-                validated[key] = df
-                continue
-            # Bulk IEX may be stale for a symbol that has no recent IEX trades.
-            # Try the normal data-layer repair path once; never relax freshness.
-            repair_attempted.add(key)
-            try:
-                repaired = fetch_intraday(key, interval="5m", period="5d")
-            except Exception as exc:
-                repaired = None
-                log.warning("INTRADAY 5M STALE REPAIR FAILED | %s | %s", key, str(exc))
+    # Repair only a bounded number. This is the key fix for the multi-minute scan.
+    stale_items.sort(key=lambda x: x[1])
+    repair_items = stale_items[:M5_STALE_REPAIR_MAX_PER_SCAN]
+    skipped = stale_items[M5_STALE_REPAIR_MAX_PER_SCAN:]
+    for key, age, _ in skipped:
+        log.warning("INTRADAY 5M STALE REPAIR SKIPPED | %s | age=%.1fm | reason=scan_budget", key, age)
+
+    def _repair_one(item):
+        key, age, _ = item
+        try:
+            repaired = fetch_intraday(key, interval="5m", period="5d")
             if isinstance(repaired, pd.DataFrame) and not repaired.empty:
                 rok, rage = intraday_data_fresh(repaired, "5m", 12.0)
                 if rok:
+                    return key, repaired, float(rage), None
+            return key, None, age, "stale_after_repair"
+        except Exception as exc:
+            return key, None, age, str(exc)[:180]
+
+    repaired_count = 0
+    if repair_items:
+        with ThreadPoolExecutor(max_workers=M5_STALE_REPAIR_WORKERS) as pool:
+            futures = [pool.submit(_repair_one, item) for item in repair_items]
+            for fut in as_completed(futures):
+                key, repaired, age, error = fut.result()
+                if repaired is not None:
                     validated[key] = repaired
-                    stale_repair += 1
-                    log.info("INTRADAY 5M STALE REPAIRED | %s | age=%.1fm", key, float(rage))
-                    continue
-            log.warning("INTRADAY 5M STALE UNRESOLVED | %s | age=%.1fm", key, float(age))
+                    repaired_count += 1
+                    log.info("INTRADAY 5M STALE REPAIRED | %s | age=%.1fm", key, age)
+                else:
+                    log.warning("INTRADAY 5M STALE UNRESOLVED | %s | age=%.1fm | %s", key, age, error or "unknown")
 
-        # A bulk response can legitimately omit symbols (for example, no recent
-        # IEX trade). Do not silently fall back to an old cached frame for such a
-        # symbol. Validate the cached copy and give missing/stale symbols one
-        # controlled normal data-layer repair attempt. This preserves valid
-        # candidates without relaxing the 12-minute freshness gate.
-        for key in unique:
-            if key in validated:
-                continue
-            cached_df = cached.get(key)
-            cached_ok = False
-            cached_age = float("inf")
-            if isinstance(cached_df, pd.DataFrame) and not cached_df.empty:
-                cached_ok, cached_age = intraday_data_fresh(cached_df, "5m", 12.0)
-                if cached_ok:
-                    validated[key] = cached_df
-                    continue
-            if key not in repair_attempted and (key not in fresh_keys or not cached_ok):
-                repair_attempted.add(key)
-                try:
-                    repaired = fetch_intraday(key, interval="5m", period="5d")
-                except Exception as exc:
-                    repaired = None
-                    log.warning(
-                        "INTRADAY 5M MISSING/STALE REPAIR FAILED | %s | cached_age=%.1fm | %s",
-                        key, float(cached_age), str(exc),
-                    )
-                if isinstance(repaired, pd.DataFrame) and not repaired.empty:
-                    rok, rage = intraday_data_fresh(repaired, "5m", 12.0)
-                    if rok:
-                        validated[key] = repaired
-                        stale_repair += 1
-                        log.info("INTRADAY 5M MISSING/STALE REPAIRED | %s | age=%.1fm", key, float(rage))
-                    else:
-                        log.warning(
-                            "INTRADAY 5M MISSING/STALE UNRESOLVED | %s | age=%.1fm",
-                            key, float(rage),
-                        )
+    with _M5_CACHE_LOCK:
+        for sym, df in validated.items():
+            _M5_CACHE[sym] = df
+        _M5_CACHE_UPDATED_AT = now
+        cached = {sym: _copy_frame(_M5_CACHE.get(sym)) for sym in unique if sym in _M5_CACHE}
 
-        with _M5_CACHE_LOCK:
-            for sym, df in validated.items():
-                _M5_CACHE[sym] = df
-            _M5_CACHE_UPDATED_AT = now
-            cached = {sym: _copy_frame(_M5_CACHE.get(sym)) for sym in unique if sym in _M5_CACHE}
-        log.info("INTRADAY 5M CACHE REFRESH | fetched=%d | validated=%d | stale_repair=%d | available=%d",
-                 len(fresh), len(validated), stale_repair, len(cached))
+    log.info(
+        "INTRADAY 5M CACHE REFRESH | fetched=%d | validated=%d | stale=%d | repaired=%d | skipped=%d | available=%d",
+        len(fresh), len(validated), len(stale_items), repaired_count, len(skipped), len(cached),
+    )
     return cached
 
+
 def _cached_5m_benchmark(symbol: str, fetch_one):
-    """Cache SPY/QQQ 5m for the same snapshot window; never refetch in gates."""
+    """Return a fresh SPY/QQQ 5m frame without retrying a known-stale cache.
+
+    The previous implementation returned a cached frame solely from cache age.
+    If that frame was already >12m old, _market_alignment() then retried the same
+    stale frame three times, which both delayed /scani and could end in
+    ``السوق غير مؤكد``. Validate the actual candle freshness here at the snapshot
+    boundary; fetch_intraday() remains responsible for Alpaca -> Twelve Data
+    fallback. This is data plumbing only: the 12m freshness gate is unchanged.
+    """
     import time as _time
     global _M5_BENCHMARK_UPDATED_AT
     sym = str(symbol).upper().strip()
     now = _time.monotonic()
+
     with _M5_CACHE_LOCK:
-        if sym in _M5_BENCHMARK_CACHE and (now - _M5_BENCHMARK_UPDATED_AT) < M5_BULK_CACHE_TTL_SECONDS:
-            return _copy_frame(_M5_BENCHMARK_CACHE[sym])
+        cached = _copy_frame(_M5_BENCHMARK_CACHE.get(sym))
+        cache_age = now - _M5_BENCHMARK_UPDATED_AT
+
+    # A cache hit is valid only when the actual last bar is fresh.
+    if cached is not None and cache_age < M5_BULK_CACHE_TTL_SECONDS:
+        try:
+            from market_data import intraday_data_fresh
+            fresh_ok, age = intraday_data_fresh(cached, "5m", 12.0)
+        except Exception:
+            fresh_ok, age = False, float("inf")
+        if fresh_ok:
+            log.info(
+                "INTRADAY 5M BENCHMARK CACHE HIT | %s | age=%.1fm | cache_age=%.1fs",
+                sym, float(age), cache_age,
+            )
+            return cached
+        log.warning(
+            "INTRADAY 5M BENCHMARK CACHE STALE | %s | age=%.1fm | forcing one refresh",
+            sym, float(age),
+        )
+
+    # One refresh attempt at the scan snapshot boundary. fetch_intraday() itself
+    # performs the normal Alpaca IEX -> Twelve Data fallback chain.
     try:
         df = fetch_one()
     except Exception as exc:
         log.warning("INTRADAY 5M BENCHMARK FETCH FAILED | %s | %s", sym, str(exc))
         df = None
+
     if isinstance(df, pd.DataFrame) and not df.empty:
-        with _M5_CACHE_LOCK:
-            _M5_BENCHMARK_CACHE[sym] = df
-            _M5_BENCHMARK_UPDATED_AT = now
-        return _copy_frame(df)
-    with _M5_CACHE_LOCK:
-        return _copy_frame(_M5_BENCHMARK_CACHE.get(sym))
+        try:
+            from market_data import intraday_data_fresh
+            fresh_ok, age = intraday_data_fresh(df, "5m", 12.0)
+        except Exception:
+            fresh_ok, age = False, float("inf")
+        if fresh_ok:
+            with _M5_CACHE_LOCK:
+                _M5_BENCHMARK_CACHE[sym] = df
+                _M5_BENCHMARK_UPDATED_AT = now
+            log.info("INTRADAY 5M BENCHMARK FRESH | %s | age=%.1fm", sym, float(age))
+            return _copy_frame(df)
+        log.warning(
+            "INTRADAY 5M BENCHMARK REJECTED STALE | %s | age=%.1fm>12m",
+            sym, float(age),
+        )
+
+    # Never return a known-stale benchmark as valid.
+    return None
 
 
 def _intraday_data_audit_record(symbol: str, *reasons: str) -> None:
@@ -2223,50 +2227,76 @@ def _market_relative_returns(fetch_intraday) -> tuple[float | None, float | None
 
 
 def _market_alignment(fetch_intraday) -> tuple[bool, str]:
-    """SPY + QQQ: جلب مستقل مع Retry وتسجيل واضح؛ الاختلاط لا يرفض السهم."""
-    import time
+    """Classify SPY + QQQ from one fresh 5m snapshot; never retry stale data.
 
+    Market alignment is a snapshot-level data check. Re-requesting the same
+    stale frame inside this function was the source of unnecessary multi-minute
+    /scani delays. The loader now supplies either a fresh frame or None.
+    """
     states = []
+    now_ny_ts = pd.Timestamp(now_ny())
+    if now_ny_ts.tzinfo is None:
+        now_ny_ts = now_ny_ts.tz_localize("America/New_York")
+    else:
+        now_ny_ts = now_ny_ts.tz_convert("America/New_York")
+
+    session_date = now_ny_ts.date()
+    session_open = time(9, 30)
+    # A 5m candle stamped 10:00 covers 10:00-10:05. During the scan we only
+    # use the latest completed candle, matching the rest of the intraday engine.
+    completed_cutoff = now_ny_ts.floor("5min") - pd.Timedelta(minutes=5)
+
     for sym in ("SPY", "QQQ"):
         state = None
-        for attempt in range(1, MARKET_RETRY_ATTEMPTS + 1):
-            try:
-                log.info("MARKET DATA | %s | attempt %d/%d", sym, attempt, MARKET_RETRY_ATTEMPTS)
-                d = fetch_intraday(sym, interval="5m", period="2d")
-                if d is None or len(d) < 20:
-                    raise ValueError("market data unavailable/incomplete")
-                try:
-                    from market_data import intraday_data_fresh
-                    _fresh_ok, _age_min = intraday_data_fresh(d, "5m", 12.0)
-                    if not _fresh_ok:
-                        raise ValueError(f"market data stale: age={float(_age_min):.1f}m > 12m")
-                except ImportError:
-                    raise
-                day = d.index[-1].date()
-                cur = d[d.index.date == day]
-                if len(cur) < 6:
-                    raise ValueError("market session data incomplete")
-                p = float(cur["Close"].iloc[-1])
-                op = float(cur["Open"].iloc[0])
-                vw = float(_vwap(cur).iloc[-1])
-                if p >= op and p >= vw:
-                    state = "داعم"
-                elif p >= op and p < vw and p >= op * (1.0 - POSITIVE_BELOW_VWAP_MAX_OPEN_GAP_PCT / 100.0):
-                    state = "إيجابي_تحت_VWAP"
-                else:
-                    state = "ضعيف"
-                log.info(
-                    "MARKET DATA | %s | success | bars=%d | close=%.4f | open=%.4f | vwap=%.4f | state=%s",
-                    sym, len(cur), p, op, vw, state,
-                )
-                break
-            except Exception as exc:
-                log.warning(
-                    "MARKET DATA | %s | failed attempt %d/%d | %s",
-                    sym, attempt, MARKET_RETRY_ATTEMPTS, str(exc),
-                )
-                if attempt < MARKET_RETRY_ATTEMPTS:
-                    time.sleep(MARKET_RETRY_SLEEP_SECONDS)
+        try:
+            log.info("MARKET DATA | %s | snapshot validation", sym)
+            d = fetch_intraday(sym, interval="5m", period="2d")
+            if d is None or len(d) < 4:
+                raise ValueError("market data unavailable/incomplete")
+
+            from market_data import intraday_data_fresh
+            fresh_ok, age_min = intraday_data_fresh(d, "5m", 12.0)
+            if not fresh_ok:
+                raise ValueError(f"market data stale: age={float(age_min):.1f}m > 12m")
+
+            # Normalize/filter to today's regular session and completed bars only.
+            idx = pd.DatetimeIndex(d.index)
+            if idx.tz is None:
+                idx = idx.tz_localize("UTC")
+            idx_ny = idx.tz_convert("America/New_York")
+            cur = d.copy()
+            cur.index = idx_ny
+            cur = cur[
+                (cur.index.date == session_date)
+                & (cur.index.time >= session_open)
+                & (cur.index <= completed_cutoff)
+            ]
+
+            # At the first permitted scan point (09:50), four completed 5m bars
+            # exist: 09:30, 09:35, 09:40, 09:45. Requiring six made the market
+            # state falsely "غير مؤكد" during part of the allowed window.
+            if len(cur) < 4:
+                raise ValueError(f"market session data incomplete: completed_bars={len(cur)}<4")
+
+            p = float(cur["Close"].iloc[-1])
+            op = float(cur["Open"].iloc[0])
+            vw = float(_vwap(cur).iloc[-1])
+            if not all(np.isfinite(x) and x > 0 for x in (p, op, vw)):
+                raise ValueError("market benchmark values invalid")
+
+            if p >= op and p >= vw:
+                state = "داعم"
+            elif p >= op and p < vw and p >= op * (1.0 - POSITIVE_BELOW_VWAP_MAX_OPEN_GAP_PCT / 100.0):
+                state = "إيجابي_تحت_VWAP"
+            else:
+                state = "ضعيف"
+
+            log.info(
+                "MARKET DATA | %s | success | completed_bars=%d | close=%.4f | open=%.4f | vwap=%.4f | age=%.1fm | state=%s",
+                sym, len(cur), p, op, vw, float(age_min), state,
+            )
+        except Exception as exc:
+            log.warning("MARKET DATA | %s | unresolved | %s", sym, str(exc))
         states.append(state)
 
     if states == ["داعم", "داعم"]:
@@ -2280,7 +2310,6 @@ def _market_alignment(fetch_intraday) -> tuple[bool, str]:
     elif any(x is None for x in states):
         result = (False, "بيانات السوق غير مكتملة")
     else:
-        # أي مزيج بين داعم/إيجابي تحت VWAP/ضعيف يبقى سوقًا مختلطًا.
         result = (True, "SPY/QQQ مختلطان")
 
     log.info(
@@ -2847,11 +2876,9 @@ def analyze_intraday(
     if len(today_5) < 6:
         return None
 
-    _closed_pos = _last_completed_pos(today_5, now=now_ny())
-    if _closed_pos < 0:
-        return None
-    closed_idx = _closed_pos - len(today_5)
-    closed_prev_idx = closed_idx - 1 if _closed_pos >= 1 else -2
+    closed_idx = -2 if is_us_regular_session(now_ny()) and len(today_5) >= 2 else -1
+    _closed_pos = len(today_5) + closed_idx if closed_idx < 0 else closed_idx
+    closed_prev_idx = closed_idx - 1 if abs(closed_idx) <= len(today_5) - 1 else -2
 
     price = float(today_5["Close"].iloc[-1])
     if price <= 0 or price > float(MAX_AUTO_PRICE):
@@ -5234,12 +5261,8 @@ def _prefilter_intraday(
         hist = m5[m5.index.date < last_day].copy()
         # Time-of-day RVOL: compare cumulative volume through the current
         # session position with the same number of 5m bars in prior sessions.
-        _stage1_closed_pos = _last_completed_pos(today, now=now_ny())
-        if _stage1_closed_pos < 0:
-            _audit_stage1("no_completed_5m_candle")
-            _audit_data("5m:no_completed_5m_candle")
-            return None
-        _stage1_closed_idx = _stage1_closed_pos - len(today)
+        _stage1_closed_idx = -2 if is_us_regular_session(now_ny()) and len(today) >= 2 else -1
+        _stage1_closed_pos = len(today) + _stage1_closed_idx if _stage1_closed_idx < 0 else _stage1_closed_idx
         _stage1_today = today.iloc[:_stage1_closed_pos + 1].copy()
         if len(_stage1_today) < 1:
             _stage1_today = today.copy()
@@ -5476,46 +5499,21 @@ def scan_intraday(
         )
         for item in ranked_for_strategy[:PREFILTER_STRATEGY_TOP_K]:
             selected[item[2]] = item
-    # Build the strategy-aware union first. A symbol is de-duplicated so overlap
-    # between strategies never creates duplicate Stage-2 work.
-    # Preserve the promised strategy lanes: reserve the best available unique
-    # symbol for each strategy first, then fill the remaining Stage-2 slots by
-    # overall route strength. The previous implementation built the union but
-    # immediately sorted/capped it at 30, which could evict every candidate for
-    # a lower-frequency strategy before its real Core/Confirmation logic ran.
-    protected: dict[str, tuple] = {}
-    for et in ENTRY_TYPES:
-        ranked_for_strategy = sorted(
-            stage1,
-            key=lambda item: (
-                float(item[1].get(et, 0.0)),
-                float(item[0]),
-            ),
-            reverse=True,
-        )
-        for item in ranked_for_strategy[:PREFILTER_STRATEGY_TOP_K]:
-            _sym = str(item[2]).upper()
-            if _sym not in protected:
-                protected[_sym] = item
-                break
-
-    generic_ranked = sorted(
+    # Protected strategy lanes: once a symbol enters the Top-K lane of any
+    # strategy, it remains in the Stage-2 candidate pool. The union is
+    # de-duplicated by symbol, so overlap never creates duplicate work.
+    # Do not re-rank this union back through the generic cap: doing so would
+    # silently evict some protected strategy lanes and defeat the purpose of
+    # strategy-aware routing. The absolute cap is therefore only a safety
+    # ceiling above the mathematically possible 50 + (len(ENTRY_TYPES)*4) unique names.
+    finalists = sorted(
         selected.values(),
         key=lambda item: (float(item[0]), max(item[1].values()) if item[1] else 0.0),
         reverse=True,
-    )
-    finalists = list(protected.values())
-    protected_symbols = {str(item[2]).upper() for item in finalists}
-    for item in generic_ranked:
-        if len(finalists) >= INTRADAY_LIVE_TOP_N:
-            break
-        if str(item[2]).upper() in protected_symbols:
-            continue
-        finalists.append(item)
-    finalists = finalists[:INTRADAY_LIVE_TOP_N]
+    )[:INTRADAY_LIVE_TOP_N]
     log.info(
-        "STAGE 2: top %d candidates selected; protected_strategy_lanes=%d/%d",
-        len(finalists), len(protected_symbols), len(ENTRY_TYPES),
+        "STAGE 2: top %d candidates selected; strategy-aware routing reserved lanes for %d strategies",
+        len(finalists), len(ENTRY_TYPES),
     )
 
     # Dynamic Top-30: the current Stage-1 ranking decides which symbols receive
