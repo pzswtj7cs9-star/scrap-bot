@@ -30,7 +30,7 @@ from stocks import MAX_AUTO_PRICE
 log = logging.getLogger(__name__)
 
 # Deployment marker: proves which analyzer_intraday build Render actually loaded.
-INTRADAY_ANALYZER_VERSION = "20260926-MARKET-M5-SNAPSHOT-FIX-V1"
+INTRADAY_ANALYZER_VERSION = "20260925-FINAL-AUDIT-V3"
 log.info("INTRADAY ANALYZER VERSION | %s", INTRADAY_ANALYZER_VERSION)
 
 SKIP_OPEN_MIN = 20
@@ -93,51 +93,11 @@ _M5_CACHE_UPDATED_AT = 0.0
 _M5_CACHE: dict[str, pd.DataFrame] = {}
 _M5_BENCHMARK_CACHE: dict[str, pd.DataFrame] = {}
 _M5_BENCHMARK_UPDATED_AT = 0.0
-# Per-symbol benchmark timestamps prevent SPY refreshes from masking an older
-# QQQ frame. Diagnostic/data-plumbing only.
-_M5_BENCHMARK_UPDATED_AT_BY_SYMBOL: dict[str, float] = {}
-
-# Controlled stale-repair guard. With Alpaca IEX, some symbols can legitimately
-# have no recent IEX trades. Do not fan out into dozens of individual fallback
-# requests in one scan; unresolved symbols remain stale and are rejected by the
-# existing 12-minute gate.
-M5_STALE_REPAIR_MAX_PER_SCAN = 8
-M5_STALE_REPAIR_COOLDOWN_SECONDS = 600.0
-_M5_STALE_REPAIR_LOCK = Lock()
-_M5_STALE_REPAIR_USED = 0
-_M5_STALE_REPAIR_LAST: dict[str, float] = {}
 
 def _copy_frame(df):
     if isinstance(df, pd.DataFrame):
         return df.copy(deep=False)
     return None
-
-def _allow_m5_stale_repair(symbol: str) -> tuple[bool, str]:
-    """Reserve one controlled stale-repair attempt for this scan/runtime.
-
-    This never relaxes freshness. It only prevents an IEX stale burst from
-    turning into a Twelve Data request storm.
-    """
-    import time as _time
-    global _M5_STALE_REPAIR_USED
-    key = str(symbol).upper().strip()
-    now = _time.monotonic()
-    with _M5_STALE_REPAIR_LOCK:
-        last = _M5_STALE_REPAIR_LAST.get(key, 0.0)
-        if now - last < M5_STALE_REPAIR_COOLDOWN_SECONDS:
-            return False, "cooldown"
-        if _M5_STALE_REPAIR_USED >= M5_STALE_REPAIR_MAX_PER_SCAN:
-            return False, "scan_limit"
-        _M5_STALE_REPAIR_LAST[key] = now
-        _M5_STALE_REPAIR_USED += 1
-        return True, "reserved"
-
-
-def _reset_m5_stale_repair_budget() -> None:
-    global _M5_STALE_REPAIR_USED
-    with _M5_STALE_REPAIR_LOCK:
-        _M5_STALE_REPAIR_USED = 0
-
 
 def _cached_5m_snapshot(symbols: list[str], fetch_bulk) -> dict[str, pd.DataFrame]:
     """Return one canonical 5m snapshot for the scan.
@@ -149,7 +109,6 @@ def _cached_5m_snapshot(symbols: list[str], fetch_bulk) -> dict[str, pd.DataFram
     """
     import time as _time
     global _M5_CACHE_UPDATED_AT, _M5_CACHE
-    _reset_m5_stale_repair_budget()
     clean = [str(x).upper().strip() for x in symbols or [] if str(x).strip()]
     unique = list(dict.fromkeys(clean))
     now = _time.monotonic()
@@ -190,16 +149,7 @@ def _cached_5m_snapshot(symbols: list[str], fetch_bulk) -> dict[str, pd.DataFram
                 validated[key] = df
                 continue
             # Bulk IEX may be stale for a symbol that has no recent IEX trades.
-            # Repair only a controlled number of symbols; never relax freshness and
-            # never fan out into a Twelve Data request storm.
-            allowed, why = _allow_m5_stale_repair(key)
-            if not allowed:
-                log.warning(
-                    "INTRADAY 5M STALE REPAIR SKIPPED | %s | age=%.1fm | reason=%s",
-                    key, float(age), why,
-                )
-                log.warning("INTRADAY 5M STALE UNRESOLVED | %s | age=%.1fm", key, float(age))
-                continue
+            # Try the normal data-layer repair path once; never relax freshness.
             try:
                 repaired = fetch_intraday(key, interval="5m", period="5d")
             except Exception as exc:
@@ -224,109 +174,26 @@ def _cached_5m_snapshot(symbols: list[str], fetch_bulk) -> dict[str, pd.DataFram
     return cached
 
 def _cached_5m_benchmark(symbol: str, fetch_one):
-    """Return one canonical SPY/QQQ 5m frame with per-symbol freshness validation.
-
-    The cache timestamp is tracked per benchmark so a fresh SPY cannot make an
-    older QQQ frame look fresh. No strategy logic or freshness threshold changes.
-    """
+    """Cache SPY/QQQ 5m for the same snapshot window; never refetch in gates."""
     import time as _time
-    global _M5_BENCHMARK_UPDATED_AT, _M5_BENCHMARK_UPDATED_AT_BY_SYMBOL
+    global _M5_BENCHMARK_UPDATED_AT
     sym = str(symbol).upper().strip()
     now = _time.monotonic()
-
     with _M5_CACHE_LOCK:
-        cached = _copy_frame(_M5_BENCHMARK_CACHE.get(sym))
-        updated_at = _M5_BENCHMARK_UPDATED_AT_BY_SYMBOL.get(sym, _M5_BENCHMARK_UPDATED_AT)
-
-    if cached is not None and (now - updated_at) < M5_BULK_CACHE_TTL_SECONDS:
-        try:
-            from market_data import intraday_data_fresh
-            fresh_ok, age = intraday_data_fresh(cached, "5m", 12.0)
-        except Exception:
-            fresh_ok, age = False, float("inf")
-        if fresh_ok:
-            log.info(
-                "INTRADAY 5M BENCHMARK CACHE HIT | %s | age=%.1fm | cache_age=%.1fs",
-                sym, float(age), now - updated_at,
-            )
-            return cached
-        log.warning(
-            "INTRADAY 5M BENCHMARK CACHE STALE | %s | age=%.1fm | forcing refresh",
-            sym, float(age),
-        )
-
-    # Benchmark fetch is completed before Market Regime starts.  The loader
-    # used by _market_alignment() must therefore receive a real frame or None;
-    # its retries must never re-fetch inside the gates.  Retry here, once at the
-    # snapshot boundary, so a transient IEX/API miss does not become a fake
-    # three-retry loop over the same None value.
-    df = None
-    last_exc = None
-    for _attempt in range(1, 4):
-        try:
-            df = fetch_one()
-        except Exception as exc:
-            last_exc = exc
-            df = None
-            log.warning(
-                "INTRADAY 5M BENCHMARK FETCH FAILED | %s | attempt=%d/3 | %s",
-                sym, _attempt, str(exc),
-            )
-        if isinstance(df, pd.DataFrame) and not df.empty:
-            try:
-                from market_data import intraday_data_fresh
-                _fresh_now, _age_now = intraday_data_fresh(df, "5m", 12.0)
-            except Exception:
-                _fresh_now, _age_now = False, float("inf")
-            if _fresh_now:
-                break
-            log.warning(
-                "INTRADAY 5M BENCHMARK FETCH STALE | %s | attempt=%d/3 | age=%.1fm",
-                sym, _attempt, float(_age_now),
-            )
-            df = None
-        if _attempt < 3:
-            _time.sleep(0.75)
-
-    if df is None and last_exc is not None:
-        log.warning("INTRADAY 5M BENCHMARK UNRESOLVED | %s | %s", sym, str(last_exc))
-
+        if sym in _M5_BENCHMARK_CACHE and (now - _M5_BENCHMARK_UPDATED_AT) < M5_BULK_CACHE_TTL_SECONDS:
+            return _copy_frame(_M5_BENCHMARK_CACHE[sym])
+    try:
+        df = fetch_one()
+    except Exception as exc:
+        log.warning("INTRADAY 5M BENCHMARK FETCH FAILED | %s | %s", sym, str(exc))
+        df = None
     if isinstance(df, pd.DataFrame) and not df.empty:
-        try:
-            from market_data import intraday_data_fresh
-            fresh_ok, age = intraday_data_fresh(df, "5m", 12.0)
-        except Exception:
-            fresh_ok, age = False, float("inf")
-
-        if fresh_ok:
-            with _M5_CACHE_LOCK:
-                _M5_BENCHMARK_CACHE[sym] = df
-                _M5_BENCHMARK_UPDATED_AT_BY_SYMBOL[sym] = now
-                _M5_BENCHMARK_UPDATED_AT = now
-            log.info(
-                "INTRADAY 5M BENCHMARK FRESH | %s | age=%.1fm",
-                sym, float(age),
-            )
-            return _copy_frame(df)
-
-        log.warning(
-            "INTRADAY 5M BENCHMARK REJECTED STALE | %s | age=%.1fm>12m",
-            sym, float(age),
-        )
-
-    # Never return a known-stale benchmark as if it were fresh.
+        with _M5_CACHE_LOCK:
+            _M5_BENCHMARK_CACHE[sym] = df
+            _M5_BENCHMARK_UPDATED_AT = now
+        return _copy_frame(df)
     with _M5_CACHE_LOCK:
-        cached = _copy_frame(_M5_BENCHMARK_CACHE.get(sym))
-    if cached is not None:
-        try:
-            from market_data import intraday_data_fresh
-            fresh_ok, age = intraday_data_fresh(cached, "5m", 12.0)
-        except Exception:
-            fresh_ok, age = False, float("inf")
-        if fresh_ok:
-            return cached
-
-    return None
+        return _copy_frame(_M5_BENCHMARK_CACHE.get(sym))
 
 
 def _intraday_data_audit_record(symbol: str, *reasons: str) -> None:
@@ -2995,7 +2862,7 @@ def analyze_intraday(
         len(break_window) > 0
         and (break_window["Close"].astype(float) >= level_high * 1.001).any()
     )
-    retest_window = today_5.iloc[max(0, _closed_pos - 3):_closed_pos]
+    retest_window = today_5.iloc[max(0, _closed_pos - 3):_closed_pos + 1]
     retest_touch = bool(
         len(retest_window) > 0
         and (retest_window["Low"].astype(float) <= level_high * 1.007).any()
@@ -3075,7 +2942,7 @@ def analyze_intraday(
 
     retest = prior_break and near_level and closed_close >= level_high * 0.997
 
-    recent4 = today_5.iloc[max(0, _closed_pos - 4):_closed_pos]
+    recent4 = today_5.iloc[max(0, _closed_pos - 3):_closed_pos + 1]
     closed_close = float(today_5["Close"].iloc[closed_idx])
     vwap_touch = False
     try:
@@ -3486,10 +3353,12 @@ def analyze_intraday(
     strategy_stats = policy_for_strategy.get("strategy_stats", {})
 
     def _competition_fail_reasons(name: str) -> list[str]:
-        """Diagnostic-only blockers for the Competition Audit.
+        """Return ONLY the exact structural Core blockers for a strategy.
 
-        Reads only values already calculated by the analyzer. It never changes
-        matching, scoring, ranking, alerts, exits, filters, or learning.
+        Diagnostic-only.  This function intentionally does not report generic
+        VWAP/volume/momentum/market confirmations as Core blockers. Those are
+        evaluated after a structural match by Score/Confirmation/Final Gates.
+        This keeps the audit aligned with ``matched_entry_types``.
         """
         c = strategy_ctx
         out: list[str] = []
@@ -3501,174 +3370,106 @@ def analyze_intraday(
             if not bool(ok):
                 out.append(label)
 
-        def common(*, mom_min=None, vol_min=None, ext_max=None,
-                   trend=True, vwap=True, opening=False, green=True,
-                   market=True, state=True, no_failed=True):
-            if trend:
-                add("الاتجاه ليس صاعدًا", v("trend_up", False))
-            if vwap:
-                add("السعر ليس فوق VWAP", v("above_vwap", False))
-            if opening:
-                add("السعر ليس فوق الافتتاح", v("above_open", False))
-            if green:
-                add("آخر شمعة ليست خضراء", v("last_green", False))
-            if market:
-                add("صلاحية السوق/الإعداد غير متحققة", v("setup_market_permission", v("market_ok", False)))
-            if state:
-                add("حالة الإطار معاكسة", str(v("m15_state", v("h4_state", "محايد"))) != "معاكس")
-            if no_failed:
-                add("يوجد failed/rejection", not v("failed", False))
-            if mom_min is not None:
-                try: add(f"الزخم <= {mom_min:.2f}", float(v("mom", 0.0) or 0.0) > mom_min)
-                except Exception: add(f"الزخم <= {mom_min:.2f}", False)
-            if vol_min is not None:
-                try: add(f"الحجم أقل من {vol_min:.2f}x", float(v("vol_session_ratio", v("vol_ratio", 0.0)) or 0.0) >= vol_min)
-                except Exception: add(f"الحجم أقل من {vol_min:.2f}x", False)
-            if ext_max is not None:
-                try: add(f"الامتداد أكبر من {ext_max:.1f}%", float(v("ext_tmp", 999.0) or 999.0) <= ext_max)
-                except Exception: add(f"الامتداد أكبر من {ext_max:.1f}%", False)
-
-        # Exact/near-exact gates for the simpler setups.
+        # The Core trigger for every canonical strategy is the same boolean
+        # used by matched_entry_types, with explicit sub-components where the
+        # Core is composed from several structural conditions.
         if name == "إعادة اختبار":
             add("لا يوجد اختراق سابق للمستوى", v("prior_break", False))
-            add("السعر ليس قريبًا من المستوى", v("near_level", False))
-            try:
-                # Audit must mirror the Retest Core trigger: latest completed candle close.
-                p, lvl = float(v("closed_close", 0.0) or 0.0), float(v("level_high", 0.0) or 0.0)
-                add("لم تتم استعادة 99.7% من المستوى", lvl > 0 and p >= lvl * 0.997)
-            except Exception: add("تعذر فحص استعادة المستوى", False)
-            common(vwap=True, opening=False, green=False, market=False, state=False, no_failed=True)
+            add("لا يوجد لمس/اقتراب من المستوى", v("near_level", False))
+            lvl = float(v("level_high", 0.0) or 0.0)
+            close = float(v("closed_close", 0.0) or 0.0)
+            add("لم تتم استعادة 99.7% من المستوى", lvl > 0 and close >= lvl * 0.997)
 
         elif name == "اختراق نطاق الافتتاح":
-            try:
-                # Audit mirrors the ORB Core trigger: latest completed candle close.
-                p, lvl = float(v("closed_close", 0.0) or 0.0), float(v("orb_high", 0.0) or 0.0)
-                add("ORB غير صالح", lvl > 0)
-                add("لم يحدث اختراق ORB >= 0.1%", lvl > 0 and p >= lvl * 1.001)
-            except Exception: add("تعذر فحص ORB", False)
+            add("ORB غير صالح", float(v("orb_high", 0.0) or 0.0) > 0)
             add("الإغلاق السابق ليس تحت ORB", v("prior_orb", False))
-            common(mom_min=None, vol_min=1.0, vwap=True, opening=False, green=True, market=False, state=True, no_failed=True)
+            add("لم يحدث اختراق ORB >= 0.1%", v("orb_breakout", False))
 
         elif name == "اختراق مؤكد":
             add("لا يوجد breakout_now", v("breakout_now", False))
-            add("جودة الاختراق غير كافية", v("breakout_ok", False))
-            try: add("الحجم أقل من 1.00x", float(v("vol_session_ratio", v("vol_ratio", 0.0)) or 0.0) >= 1.0)
-            except Exception: add("تعذر فحص الحجم", False)
+            add("جودة الاختراق غير متحققة", v("breakout_ok", False))
 
         elif name == "ارتداد VWAP":
-            add("السعر ليس فوق VWAP", v("above_vwap", False))
             add("لم يحدث لمس VWAP", v("vwap_touch", False))
-            add("آخر شمعة ليست خضراء", v("last_green", False))
-            common(mom_min=0.05, vol_min=1.0, trend=True, vwap=False, opening=False, green=False, market=False, state=True, no_failed=True)
+            vwap = float(v("vwap_last_closed", 0.0) or 0.0)
+            close = float(v("closed_close", 0.0) or 0.0)
+            add("لم تتم استعادة 100.1% من VWAP", vwap > 0 and close >= vwap * 1.001)
 
         elif name == "ارتداد EMA20":
-            add("الاتجاه ليس صاعدًا", v("trend_up", False))
             add("لم يحدث لمس EMA20", v("ema_touch", False))
-            try:
-                # Audit mirrors the EMA20 Core trigger: latest completed candle close.
-                p, ema = float(v("closed_close", 0.0) or 0.0), float(v("e5_closed", v("e5", v("e20", 0.0))) or 0.0)
-                add("لم تتم استعادة EMA20", ema > 0 and p >= ema * 1.001)
-            except Exception: add("تعذر فحص استعادة EMA20", False)
-            common(mom_min=0.05, vol_min=1.0, trend=False, vwap=False, opening=False, green=True, market=False, state=True, no_failed=True)
+            ema = float(v("e5_closed", v("e5", 0.0)) or 0.0)
+            close = float(v("closed_close", 0.0) or 0.0)
+            add("لم تتم استعادة 100.1% من EMA20", ema > 0 and close >= ema * 1.001)
+
+        elif name == "سحب سيولة":
+            add("لم يكتمل Liquidity Sweep", v("liquidity_sweep", False))
+
+        elif name == "سحب سيولة مع Displacement":
+            add("لم يكتمل Sweep + Displacement", v("liquidity_displacement", False))
+
+        elif name == "ضغط ثم انفجار":
+            add("لم يكتمل Compression + Expansion", v("compression_expansion", False))
+
+        elif name == "استمرار الزخم":
+            add("لم يكتمل Impulse + Pause + Resume", v("momentum_continuation", False))
+
+        elif name == "علم صاعد":
+            add("لم يكتمل Bull Flag", v("bull_flag", False))
+
+        elif name == "استعادة مستوى":
+            add("لم يكتمل Resistance Reclaim", v("resistance_reclaim", False))
+
+        elif name == "دخول بعد Opening Drive":
+            add("لم يكتمل Opening Drive + Pullback", v("opening_drive_pullback", False))
+
+        elif name == "استعادة قمة اليوم":
+            add("لم يكتمل HOD Reclaim", v("hod_reclaim", False))
+
+        elif name == "استعادة بعد فشل ORB":
+            add("لم يكتمل Failed ORB + Reclaim", v("orb_failed_reclaim", False))
+
+        elif name == "استمرار ABC":
+            add("لم يكتمل ABC Continuation", v("abc_continuation", False))
+
+        elif name == "استمرار/استعادة الفجوة":
+            add("لم يكتمل Gap Continuation/Reclaim", v("gap_setup", False))
+
+        elif name == "استعادة بعد فشل كسر دعم":
+            add("لم يكتمل Failed Breakdown + Reclaim", v("failed_breakdown_reclaim", False))
+
+        elif name == "ارتداد بعد تفوق نسبي":
+            add("لم يكتمل Relative Strength Pullback", v("rs_pullback", False))
 
         elif name == "دخول مبكر":
-            add("الاتجاه ليس صاعدًا", v("trend_up", False))
-            add("السعر ليس فوق VWAP", v("above_vwap", False))
-            add("السعر ليس فوق الافتتاح", v("above_open", False))
-            add("يوجد breakout_now", not v("breakout_now", False))
-            add("ليس قريبًا من المقاومة", v("early_near_resistance", False))
-            # Intraday Early Entry has one authoritative structural limit: 1.5%.
-            # Do not infer the limit from the presence of m15_state; this context
-            # exists for all intraday candidates and previously made the audit
-            # conditional for no valid reason.
-            limit = 1.5
-            try: add(f"نطاق الدخول المبكر أكبر من {limit:.1f}%", float(v("early_range", 999.0) or 999.0) <= limit)
-            except Exception: add("تعذر فحص early_range", False)
-            add("Holding غير إيجابي", v("early_holding", False))
-            common(mom_min=0.03, vol_min=0.95, trend=False, vwap=False, opening=False, green=True, market=True, state=True, no_failed=True, ext_max=2.2)
-            others = {
-                "retest":"إعادة الاختبار", "orb_breakout":"ORB", "breakout_now":"الاختراق المؤكد",
-                "liquidity_displacement":"سحب السيولة + Displacement", "liquidity_sweep":"سحب السيولة",
-                "compression_expansion":"ضغط ثم انفجار", "momentum_continuation":"استمرار الزخم",
-                "bull_flag":"العلم الصاعد", "resistance_reclaim":"استعادة مستوى",
-                "orb_failed_reclaim":"استعادة بعد فشل ORB", "abc_continuation":"ABC",
-                "opening_drive_pullback":"Opening Drive", "hod_reclaim":"استعادة القمة",
-                "vwap_bounce":"ارتداد VWAP", "ema_pullback":"ارتداد EMA20",
-                "gap_setup":"استمرار/استعادة الفجوة", "failed_breakdown_reclaim":"استعادة بعد فشل كسر دعم",
-                "rs_pullback":"ارتداد بعد تفوق نسبي"
-            }
-            for key, label in others.items():
-                add(f"يوجد trigger لـ {label}", not v(key, False))
-
-        else:
-            # Composite setups: report the structural trigger plus the common
-            # confirmation gates. This is deliberately conservative: we do not
-            # invent a sub-blocker when the original analyzer did not expose it.
-            trigger = {
-                "سحب سيولة":"liquidity_sweep",
-                "سحب سيولة مع Displacement":"liquidity_displacement",
-                "ضغط ثم انفجار":"compression_expansion",
-                "استمرار الزخم":"momentum_continuation",
-                "علم صاعد":"bull_flag",
-                "استعادة مستوى":"resistance_reclaim",
-                "دخول بعد Opening Drive":"opening_drive_pullback",
-                "استعادة قمة اليوم":"hod_reclaim",
-                                "استعادة بعد فشل ORB":"orb_failed_reclaim",
-                "استمرار ABC":"abc_continuation",
-                "استمرار/استعادة الفجوة":"gap_setup",
-                "استعادة بعد فشل كسر دعم":"failed_breakdown_reclaim",
-                "ارتداد بعد تفوق نسبي":"rs_pullback",
-            }.get(name)
-            if trigger:
-                add("البنية/الـtrigger الرئيسي غير مكتمل", v(trigger, False))
-
-            if name == "سحب سيولة":
-                common(mom_min=0.05, vol_min=1.0, opening=False, ext_max=None)
-            elif name == "سحب سيولة مع Displacement":
-                common(mom_min=0.08, vol_min=1.25, opening=True, ext_max=6.0 if "h4_state" in c else 3.5)
-            elif name == "ضغط ثم انفجار":
-                common(mom_min=0.05, vol_min=1.20, opening=True, ext_max=4.0 if "m15_state" in c else 6.0)
-            elif name == "استمرار الزخم":
-                common(mom_min=0.08, vol_min=1.05, opening=True, ext_max=3.5 if "m15_state" in c else 6.0)
-                add("يوجد breakout_now", not v("breakout_now", False))
-            elif name == "علم صاعد":
-                common(mom_min=0.05, vol_min=1.05, opening=True, ext_max=3.5 if "m15_state" in c else 6.0)
-                add("يوجد ORB breakout", not v("orb_breakout", False))
-            elif name == "استعادة مستوى":
-                common(mom_min=0.05, vol_min=1.05, opening=True, ext_max=3.5 if "m15_state" in c else 6.0)
-            elif name == "دخول بعد Opening Drive":
-                common(mom_min=0.05 if "m15_state" in c else 0.20, vol_min=1.05, opening=True, ext_max=3.5 if "m15_state" in c else 6.0)
-                add("يوجد breakout_now", not v("breakout_now", False))
-                add("يوجد ORB breakout", not v("orb_breakout", False))
-            elif name in {"استعادة قمة اليوم"}:
-                common(mom_min=0.05, vol_min=1.05, opening=True, ext_max=3.5 if "m15_state" in c else 6.0)
-            elif name == "استعادة بعد فشل ORB":
-                common(mom_min=0.05, vol_min=1.05, opening=True, ext_max=3.5 if "m15_state" in c else 6.0)
-                add("يوجد ORB breakout حالي", not v("orb_breakout", False))
-            elif name == "استمرار ABC":
-                common(mom_min=0.05, vol_min=1.05, opening=True, ext_max=3.5 if "m15_state" in c else 6.0)
-            elif name == "استمرار/استعادة الفجوة":
-                add("الفجوة أقل من 2.00%", float(v("gap_pct",0.0) or 0.0) >= 2.0)
-                add("لم يكتمل Hold/Failure للفجوة", bool(v("gap_setup",False)))
-                common(mom_min=0.03, vol_min=0.90, opening=False, ext_max=6.0 if "m15_state" not in c else 4.5)
-            elif name == "استعادة بعد فشل كسر دعم":
-                add("الدعم لا يملك لمسَين على الأقل", int(v("failed_breakdown_touches",0) or 0) >= 2)
-                add("نافذة الفشل تجاوزت 5 شموع", 1 <= int(v("failed_breakdown_bars",0) or 0) <= 5)
-                add("الهبوط تجاوز 2 ATR", float(v("failed_breakdown_depth_atr",99.0) or 99.0) <= 2.0)
-                add("لم تتم استعادة الدعم", bool(v("failed_breakdown_reclaim",False)))
-                common(mom_min=0.03, vol_min=0.90, opening=False, ext_max=6.0 if "m15_state" not in c else 4.5)
-            elif name == "ارتداد بعد تفوق نسبي":
-                add("التفوق مقابل SPY أقل من 1.00%", float(v("rs_vs_spy",0.0) or 0.0) >= 1.0)
-                add("التفوق مقابل QQQ أقل من 1.00%", float(v("rs_vs_qqq",0.0) or 0.0) >= 1.0)
-                add("استمرارية التفوق أقل من 60%", float(v("rs_persistence",0.0) or 0.0) >= 60.0)
-                add("Pullback أكبر من 50%", 0.0 < float(v("rs_pullback_pct",99.0) or 99.0) <= 50.0)
-                add("لم يحافظ Pullback على Higher Low", bool(v("rs_higher_low",False)))
-                add("لم يحدث Trigger", bool(v("rs_pullback",False)))
-                common(mom_min=0.03, vol_min=0.90, opening=False, ext_max=6.0 if "m15_state" not in c else 4.5)
+            add("لم يكتمل Early Entry Core", v("early", False))
 
         if not out:
-            out.append("لم يكتمل trigger الاستراتيجية رغم عدم توفر blocker أدق")
-        # Keep the audit readable; the caller already limits the displayed list.
+            out.append("لم يوجد Core blocker إضافي")
+        return out
+
+    def _competition_confirmation_reasons(name: str) -> list[str]:
+        """Diagnostic-only confirmation/final-quality context.
+
+        Confirmation is NOT a reason for Core non-match.  It is shown separately
+        so an operator can distinguish a missing setup from a matched setup whose
+        quality/final gates are weak.
+        """
+        c = strategy_ctx
+        out: list[str] = []
+        def v(key, default=None): return c.get(key, default)
+        def add(label: str, ok: bool):
+            if not bool(ok): out.append(label)
+        try:
+            add("الحجم أقل من 0.90x", float(v("vol_session_ratio", 0.0) or 0.0) >= 0.90)
+            add("الزخم <= 0.05%", float(v("mom", 0.0) or 0.0) > 0.05)
+            add("الاتجاه غير صاعد", v("trend_up", False))
+            add("تحت VWAP", v("above_vwap", False))
+            add("آخر شمعة غير خضراء", v("last_green", False))
+            add("صلاحية السوق غير متحققة", v("setup_market_permission", False))
+            add("حالة M15 معاكسة", str(v("m15_state", "محايد")) != "معاكس")
+            add("امتداد > 4%", float(v("ext_tmp", 999.0) or 999.0) <= 4.0)
+        except Exception:
+            pass
         return out
 
     # Storage is initialized before the diagnostic-only zero-match audit so
@@ -4290,7 +4091,7 @@ def analyze_intraday(
         for _rank, _et in enumerate(_zero_ranked, 1):
             _why = ";".join(_competition_fail_reasons(_et)[:4])
             _zero_details.append(
-                f"{_rank}. {_et}:FAIL(score={_zero_scores.get(_et, 0.0):.1f}; blockers={_why})"
+                f"{_rank}. {_et}:CORE_FAIL(score={_zero_scores.get(_et, 0.0):.1f}; core_blockers={_why})"
             )
         log.info(
             "INTRADAY STRATEGY COMPETITION AUDIT V2 | %s | primary=NONE | matched=0/%s | "
@@ -4453,13 +4254,14 @@ def analyze_intraday(
         _is_match = _et in matched_entry_types
         _score = _competition_scores_all.get(_et, 0.0)
         if _is_match:
+            _confirm = ";".join(_competition_confirmation_reasons(_et)[:4]) or "لا توجد ملاحظات Confirmation عامة"
             _competition_details.append(
-                f"{_rank}. {_et}:MATCH(score={_score:.1f})"
+                f"{_rank}. {_et}:MATCH(score={_score:.1f}; confirmation={_confirm})"
             )
         else:
             _why = ";".join(_competition_fail_reasons(_et)[:4])
             _competition_details.append(
-                f"{_rank}. {_et}:FAIL(score={_score:.1f}; blockers={_why})"
+                f"{_rank}. {_et}:CORE_FAIL(score={_score:.1f}; core_blockers={_why})"
             )
 
     log.info(
@@ -5406,7 +5208,6 @@ def scan_intraday(
     scan_intraday.last_window = "ok"
 
     try:
-        _reset_m5_stale_repair_budget()
         # Load SPY/QQQ 5m exactly once for this scan. The same frames are reused
         # by market alignment, relative-strength checks, and every Stage-2 symbol.
         from market_data import fetch_intraday
