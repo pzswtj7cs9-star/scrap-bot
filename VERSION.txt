@@ -1,0 +1,22 @@
+SCRAP BOT — INTRADAY FINAL HARDENED FIX
+Date: 2026-09-28
+Base: analyzer_intraday(20260928-171732) + market_data(20260928-171732)
+
+Changes:
+1) 5m freshness is measured from the latest COMPLETED 5m candle; a forming candle cannot make a valid snapshot look stale.
+2) 5m stale repair is bounded to 4 symbols/scan with 2 workers; known-stale data is never accepted.
+3) SPY/QQQ benchmark cache validates actual candle freshness; no known-stale benchmark is returned.
+4) SPY/QQQ market alignment uses one fresh snapshot per symbol and only completed regular-session 5m bars; earliest window supports 4 completed bars.
+5) Hardened Stage-2 numeric rounding so a None value cannot abort the worker with "NoneType doesn't define __round__ method"; valid numeric behavior is unchanged.
+6) Stage-2 exception logging now includes traceback for any unexpected future defect.
+
+Preserved:
+- 19 strategies
+- Score / Score ledger
+- VWAP logic
+- 88 weak-market floor and 97 stronger override tier
+- Quote freshness <= 2 minutes
+- Spread hard reject > 1.20%
+- All quality/safety gates
+- Alpaca IEX execution quotes
+- No Yahoo

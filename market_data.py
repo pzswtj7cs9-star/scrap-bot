@@ -703,15 +703,39 @@ def data_age_minutes(df: pd.DataFrame, now: Optional[datetime] = None) -> float:
 
 
 def intraday_data_fresh(df: pd.DataFrame, interval: str, max_age_minutes: Optional[float] = None) -> tuple[bool, float]:
+    """Freshness is measured from the latest *completed* candle for 5m data.
+
+    A provider may include the currently forming 5m bar as the last row. That
+    bar must not make a valid completed 5m snapshot appear stale (or fresh).
+    We therefore locate the latest completed bucket first and calculate age
+    from that bucket timestamp. The existing 12-minute hard freshness limit is
+    unchanged.
+    """
     defaults = {"1m": 4.0, "5m": 12.0, "15m": 25.0, "60m": 90.0, "1h": 90.0}
     norm = {"1Min": "1m", "5Min": "5m", "15Min": "15m", "1Hour": "60m"}.get(str(interval), str(interval))
-    age = data_age_minutes(df)
     limit = float(max_age_minutes if max_age_minutes is not None else defaults.get(norm, 12.0))
-    if norm == "5m" and df is not None and not df.empty:
-        latest_completed = _latest_completed_5m_bucket(pd.DatetimeIndex(df.index))
-        if latest_completed is None or pd.Timestamp(df.index[-1]).floor("5min") != latest_completed:
-            log.warning("M5 INCOMPLETE CANDLE REJECT | latest=%s | age=%.1fm", str(df.index[-1]), float(age))
-            return False, age
+
+    if df is None or df.empty:
+        return False, float("inf")
+
+    if norm == "5m":
+        idx = pd.DatetimeIndex(df.index)
+        latest_completed = _latest_completed_5m_bucket(idx)
+        if latest_completed is None:
+            log.warning("M5 INCOMPLETE CANDLE REJECT | no completed 5m bucket")
+            return False, float("inf")
+        # IMPORTANT: ignore a newer forming 5m row when computing age. The
+        # canonical freshness clock is the latest fully completed 5m bucket.
+        age_df = pd.DataFrame({"Close": [0.0]}, index=[pd.Timestamp(latest_completed)])
+        age = data_age_minutes(age_df)
+        if age > limit:
+            log.warning(
+                "M5 COMPLETED CANDLE STALE | completed=%s | age=%.1fm | limit=%.1fm",
+                str(latest_completed), float(age), float(limit),
+            )
+        return age <= limit, age
+
+    age = data_age_minutes(df)
     return age <= limit, age
 
 
