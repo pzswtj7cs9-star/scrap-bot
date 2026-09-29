@@ -31,7 +31,7 @@ from stocks import MAX_AUTO_PRICE
 log = logging.getLogger(__name__)
 
 # Deployment marker: proves which analyzer_intraday build Render actually loaded.
-INTRADAY_ANALYZER_VERSION = "20260928-FINAL-HARDENED-V7"
+INTRADAY_ANALYZER_VERSION = "20260929-M5-ROUTING-FIX-V1"
 log.info("INTRADAY ANALYZER VERSION | %s", INTRADAY_ANALYZER_VERSION)
 
 SKIP_OPEN_MIN = 20
@@ -5200,7 +5200,11 @@ def _prefilter_intraday(
         # genuine data-source delay.
         ok_h1, h1_age_min = intraday_data_fresh(h1, "60m", 90)
         ok_m5, m5_age_min = intraday_data_fresh(m5, "5m", 12)
-        if h1 is None or m5 is None or len(h1) < 40 or len(m5) < 30 or not ok_h1 or not ok_m5:
+        # Stage 1 is routing-only. A stale M5 frame may remain eligible for
+        # Top-30 routing so the live WebSocket can refresh it before Stage 2.
+        # The hard 12-minute M5 gate itself is unchanged in analyze_intraday();
+        # therefore stale M5 can NEVER become a signal.
+        if h1 is None or m5 is None or len(h1) < 40 or len(m5) < 30 or not ok_h1:
             reasons = []
             if h1 is None:
                 reasons.append("h1_missing")
@@ -5212,8 +5216,6 @@ def _prefilter_intraday(
                 reasons.append(f"m5_bars<{30}")
             if not ok_h1:
                 reasons.append(f"h1_stale(age={h1_age_min:.1f}m>90m)")
-            if not ok_m5:
-                reasons.append(f"m5_stale(age={m5_age_min:.1f}m>12m)")
             for _reason in reasons or ["data_invalid"]:
                 _audit_stage1(_reason)
                 if _reason.startswith(("h1_", "m5_", "data_")):
@@ -5223,6 +5225,13 @@ def _prefilter_intraday(
                 symbol, ";".join(reasons) or "data_invalid", float(h1_age_min), float(m5_age_min),
             )
             return None
+
+        if not ok_m5:
+            _audit_data(f"m5_stale(age={m5_age_min:.1f}m>12m)")
+            log.info(
+                "INTRADAY STAGE 1 ROUTING-ONLY M5 STALE | %s | age=%.1fm | final_12m_gate=UNCHANGED",
+                symbol, float(m5_age_min),
+            )
 
         last_day = m5.index[-1].date()
         today = m5[m5.index.date == last_day]
