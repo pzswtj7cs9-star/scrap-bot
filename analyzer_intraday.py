@@ -31,7 +31,7 @@ from stocks import MAX_AUTO_PRICE
 log = logging.getLogger(__name__)
 
 # Deployment marker: proves which analyzer_intraday build Render actually loaded.
-INTRADAY_ANALYZER_VERSION = "20260929-M5-ROUTING-FIX-V1"
+INTRADAY_ANALYZER_VERSION = "20260930-INTRADAY-DATA-ROUTING-HARDENED-V2"
 log.info("INTRADAY ANALYZER VERSION | %s", INTRADAY_ANALYZER_VERSION)
 
 SKIP_OPEN_MIN = 20
@@ -97,6 +97,16 @@ _M5_CACHE_UPDATED_AT = 0.0
 _M5_CACHE: dict[str, pd.DataFrame] = {}
 _M5_BENCHMARK_CACHE: dict[str, pd.DataFrame] = {}
 _M5_BENCHMARK_UPDATED_AT = 0.0
+
+# 15m is a slower confirmation timeframe. Re-fetching it for every Top-30
+# symbol on every one-minute scan creates avoidable provider pressure. Keep a
+# bounded cache; Stage 2 still applies the hard 25-minute freshness gate.
+M15_CACHE_TTL_SECONDS = 600.0
+M15_STALE_REPAIR_MAX_PER_SCAN = 6
+M15_STALE_REPAIR_WORKERS = 3
+_M15_CACHE_LOCK = Lock()
+_M15_CACHE_UPDATED_AT = 0.0
+_M15_CACHE: dict[str, pd.DataFrame] = {}
 
 def _copy_frame(df):
     if isinstance(df, pd.DataFrame):
@@ -193,19 +203,107 @@ def _cached_5m_snapshot(symbols: list[str], fetch_bulk) -> dict[str, pd.DataFram
         _M5_CACHE_UPDATED_AT = now
         cached = {sym: _copy_frame(_M5_CACHE.get(sym)) for sym in unique if sym in validated or sym in _M5_CACHE}
 
-    # A stale cached symbol not present in this validated batch must not leak
-    # back into the scan. Validate the final returned map one last time.
-    final: dict[str, pd.DataFrame] = {}
+    # Routing snapshot: return fresh frames plus unresolved stale frames so
+    # Stage 1 can rank them for the Top-30 WebSocket lane. Stale frames are
+    # deliberately NOT written into the fresh M5 cache and can NEVER pass the
+    # hard 12-minute Stage-2 gate in analyze_intraday().
+    routing: dict[str, pd.DataFrame] = {}
     for sym, df in cached.items():
-        ok, _age = intraday_data_fresh(df, "5m", 12.0)
-        if ok:
-            final[sym] = df
+        if isinstance(df, pd.DataFrame) and not df.empty:
+            routing[sym] = df
+    for sym, df in (fresh or {}).items():
+        key = str(sym).upper().strip()
+        if key and isinstance(df, pd.DataFrame) and not df.empty and key not in routing:
+            routing[key] = df
 
     log.info(
-        "INTRADAY 5M CACHE REFRESH | fetched=%d | validated=%d | stale=%d | repaired=%d | skipped=%d | available=%d",
-        len(fresh or {}), len(validated), len(stale_items), repaired_count, len(skipped_items), len(final),
+        "INTRADAY 5M CACHE REFRESH | fetched=%d | validated=%d | stale=%d | repaired=%d | skipped=%d | routing_available=%d",
+        len(fresh or {}), len(validated), len(stale_items), repaired_count, len(skipped_items), len(routing),
     )
-    return final
+    return routing
+
+def _cached_15m_snapshot(symbols: list[str], fetch_one) -> dict[str, pd.DataFrame]:
+    """Return one bounded 15m snapshot for Stage 2.
+
+    Fresh frames are reused for up to 10 minutes. Stale/missing symbols are
+    repaired in a small parallel budget. A stale frame may be returned for
+    diagnostics/routing, but analyze_intraday() remains the hard 25-minute
+    signal gate. This removes the previous 30 REST requests every minute.
+    """
+    import time as _time
+    global _M15_CACHE_UPDATED_AT, _M15_CACHE
+    clean = list(dict.fromkeys(str(x).upper().strip() for x in (symbols or []) if str(x).strip()))
+    now = _time.monotonic()
+    with _M15_CACHE_LOCK:
+        cached = {sym: _copy_frame(_M15_CACHE.get(sym)) for sym in clean if sym in _M15_CACHE}
+        cache_age = now - _M15_CACHE_UPDATED_AT if _M15_CACHE_UPDATED_AT else float("inf")
+
+    from market_data import intraday_data_fresh
+    missing_or_stale = []
+    for sym in clean:
+        df = cached.get(sym)
+        if df is None:
+            missing_or_stale.append(sym)
+            continue
+        ok, age = intraday_data_fresh(df, "15m", 25.0)
+        if not ok:
+            missing_or_stale.append(sym)
+
+    if cached and len(cached) == len(clean) and not missing_or_stale and cache_age < M15_CACHE_TTL_SECONDS:
+        log.info("INTRADAY 15M CACHE HIT | symbols=%d | age=%.1fs", len(cached), cache_age)
+        return cached
+
+    # Initial population must not leave most of Top-30 without M15. On a cold
+    # process cache, fetch the full requested set once; on later scans only a
+    # bounded stale/missing repair is allowed.
+    if not cached:
+        repair = list(missing_or_stale)
+        skipped = []
+        repair_workers = min(8, max(2, len(repair)))
+    else:
+        repair = missing_or_stale[:M15_STALE_REPAIR_MAX_PER_SCAN]
+        skipped = missing_or_stale[M15_STALE_REPAIR_MAX_PER_SCAN:]
+        repair_workers = M15_STALE_REPAIR_WORKERS
+
+    def _one(sym):
+        try:
+            df = fetch_one(sym)
+            if isinstance(df, pd.DataFrame) and not df.empty:
+                return sym, df, None
+            return sym, None, "empty"
+        except Exception as exc:
+            return sym, None, f"exception:{type(exc).__name__}:{str(exc)[:160]}"
+
+    if repair:
+        with ThreadPoolExecutor(max_workers=repair_workers) as pool:
+            futures = [pool.submit(_one, sym) for sym in repair]
+            for fut in as_completed(futures):
+                sym, df, err = fut.result()
+                if df is not None:
+                    cached[sym] = df
+                    log.info("INTRADAY 15M REFRESHED | %s", sym)
+                else:
+                    log.warning("INTRADAY 15M REFRESH FAILED | %s | %s", sym, err or "unknown")
+
+    for sym in skipped:
+        log.warning("INTRADAY 15M REFRESH SKIPPED | %s | reason=scan_budget", sym)
+
+    # Cache every returned frame, including a stale frame, as a transport cache.
+    # Freshness remains enforced by analyze_intraday(); stale data is never a
+    # valid signal input.
+    with _M15_CACHE_LOCK:
+        for sym, df in cached.items():
+            if isinstance(df, pd.DataFrame) and not df.empty:
+                _M15_CACHE[sym] = df
+        _M15_CACHE_UPDATED_AT = now
+        out = {sym: _copy_frame(_M15_CACHE.get(sym)) for sym in clean if sym in _M15_CACHE}
+
+    log.info(
+        "INTRADAY 15M CACHE | requested=%d | available=%d | refreshed=%d | skipped=%d | cache_age=%.1fs",
+        len(clean), len(out), len(repair), len(skipped), cache_age,
+    )
+    return out
+
 
 def _cached_5m_benchmark(symbol: str, fetch_one):
     """Return a fresh SPY/QQQ 5m snapshot; never return a known-stale benchmark."""
@@ -5390,6 +5488,64 @@ def _prefilter_intraday(
         return None
 
 
+def _refresh_top30_m5_from_ws(finalists: list[tuple]) -> list[tuple]:
+    """Give the persistent IEX WS a bounded chance to refresh stale Top-30 M5.
+
+    No REST candle request is made here. We wait only for actual WS 1m data
+    that can form a fully completed 5m bucket; otherwise the unchanged 12m
+    Stage-2 freshness gate rejects the symbol safely.
+    """
+    if not finalists:
+        return finalists
+    import time as _time
+    from market_data import set_intraday_ws_symbols, websocket_5m_patch, get_intraday_ws_bars, intraday_data_fresh
+
+    live_top30 = [str(item[2]).upper() for item in finalists[:INTRADAY_LIVE_TOP_N]]
+    set_intraday_ws_symbols(live_top30)
+
+    stale_syms = []
+    for item in finalists[:INTRADAY_LIVE_TOP_N]:
+        sym, m5 = str(item[2]).upper(), item[4]
+        try:
+            ok, _ = intraday_data_fresh(m5, "5m", 12.0)
+            if not ok:
+                stale_syms.append(sym)
+        except Exception:
+            stale_syms.append(sym)
+
+    # If no stale Top-30 frame exists, do not add latency to the scan.
+    if not stale_syms:
+        return finalists
+
+    deadline = _time.monotonic() + 3.0
+    current = list(finalists)
+    patched = set()
+    while _time.monotonic() < deadline and len(patched) < len(stale_syms):
+        for i, item in enumerate(current[:INTRADAY_LIVE_TOP_N]):
+            sym = str(item[2]).upper()
+            if sym not in stale_syms or sym in patched:
+                continue
+            try:
+                ws_one = get_intraday_ws_bars(sym)
+                if ws_one is None or ws_one.empty:
+                    continue
+                new_m5 = websocket_5m_patch(sym, item[4])
+                ok, age = intraday_data_fresh(new_m5, "5m", 12.0)
+                if ok:
+                    current[i] = (item[0], item[1], item[2], item[3], new_m5)
+                    patched.add(sym)
+                    log.info("INTRADAY M5 WS READY | %s | age=%.1fm", sym, float(age))
+            except Exception as exc:
+                log.debug("INTRADAY M5 WS PATCH WAIT | %s | %s", sym, str(exc))
+        if len(patched) < len(stale_syms):
+            _time.sleep(0.25)
+
+    for sym in stale_syms:
+        if sym not in patched:
+            log.info("INTRADAY M5 WS NOT READY | %s | final_12m_gate=UNCHANGED", sym)
+    return current
+
+
 def scan_intraday(
     symbols: list[str],
     names: dict,
@@ -5478,7 +5634,7 @@ def scan_intraday(
                 _prefilter_intraday,
                 sym,
                 (bulk_h1.get(sym), bulk_m5.get(sym))
-                if (sym in bulk_h1 or sym in bulk_m5) else None,
+                if (sym in bulk_h1 and sym in bulk_m5) else None,
                 stage1_audit_counts,
                 stage1_audit_lock,
                 stage1_data_audit_counts,
@@ -5539,61 +5695,53 @@ def scan_intraday(
     # scan; there is no fixed symbol list.
     live_top30 = [str(item[2]).upper() for item in finalists[:INTRADAY_LIVE_TOP_N]]
     try:
-        from market_data import set_intraday_ws_symbols, websocket_5m_patch
-        set_intraday_ws_symbols(live_top30)
-        _patched_stage1 = []
-        for _item in finalists:
-            _score, _routes, _sym, _h1, _m5 = _item
-            if str(_sym).upper() in live_top30:
-                _m5_live = websocket_5m_patch(_sym, _m5)
-                _item = (_score, _routes, _sym, _h1, _m5_live)
-            _patched_stage1.append(_item)
-        finalists = _patched_stage1
+        finalists = _refresh_top30_m5_from_ws(finalists)
         log.info("INTRADAY DYNAMIC TOP30 | symbols=%d | %s", len(live_top30), ",".join(live_top30))
     except Exception as _exc:
+        # WS is an enhancement, never a safety bypass. Stage 2 still enforces
+        # the 12-minute M5 gate on the unchanged base frame.
         log.warning("INTRADAY TOP30 WEBSOCKET LAYER UNAVAILABLE | %s", str(_exc))
 
-    # Complete candle snapshot: one M15 load per Stage-2 symbol and one shared
-    # SPY/QQQ 5m benchmark load for the entire cycle. No strategy/gate may
-    # request candle data after this point.
+    # Complete candle snapshot: M15 comes from a bounded cache/refresh layer;
+    # SPY/QQQ 5m are shared for the entire cycle. No strategy/gate may request
+    # candle data after this point.
     candle_snapshots: dict[str, IntradaySnapshot] = {}
     try:
-        from market_data import fetch_intraday, intraday_data_fresh
+        from market_data import intraday_data_fresh, fetch_intraday
         for _sym, _df in benchmark_frames.items():
             if _df is not None:
                 _ok, _age = intraday_data_fresh(_df, "5m", 12.0)
                 if not _ok:
                     log.warning("INTRADAY SNAPSHOT BENCHMARK STALE | %s | age=%.1fm", _sym, float(_age))
 
-        def _build_snapshot(item):
-            _, _, _sym, _h1, _m5 = item
-            try:
-                _m15 = fetch_intraday(_sym, interval="15m", period="10d")
-                return _sym, {
-                    "h1": _h1, "m5": _m5, "m15": _m15,
-                    "spy5": benchmark_frames.get("SPY"),
-                    "qqq5": benchmark_frames.get("QQQ"),
-                }
-            except Exception as _exc:
-                log.warning("INTRADAY SNAPSHOT M15 FAILED | %s | %s", _sym, str(_exc))
-                return _sym, {
-                    "h1": _h1, "m5": _m5, "m15": None,
-                    "spy5": benchmark_frames.get("SPY"),
-                    "qqq5": benchmark_frames.get("QQQ"),
-                }
-
-        with ThreadPoolExecutor(max_workers=workers) as _snap_pool:
-            _snap_futures = {_snap_pool.submit(_build_snapshot, item): str(item[2]) for item in finalists}
-            for _fut in as_completed(_snap_futures):
-                _sym, _snap = _fut.result()
-                candle_snapshots[_sym] = _snap
+        _m15_map = _cached_15m_snapshot(
+            [str(item[2]).upper() for item in finalists],
+            lambda _sym: fetch_intraday(_sym, interval="15m", period="10d"),
+        )
+        for _item in finalists:
+            _, _, _sym, _h1, _m5 = _item
+            candle_snapshots[str(_sym).upper()] = {
+                "h1": _h1, "m5": _m5, "m15": _m15_map.get(str(_sym).upper()),
+                "spy5": benchmark_frames.get("SPY"),
+                "qqq5": benchmark_frames.get("QQQ"),
+            }
         log.info(
-            "INTRADAY CANDLE SNAPSHOT | symbols=%d | M15_per_symbol=1 | SPY5=1 | QQQ5=1 | nested_candle_fetch=0",
-            len(candle_snapshots),
+            "INTRADAY CANDLE SNAPSHOT | symbols=%d | M15_cache=1 | M15_available=%d | SPY5=1 | QQQ5=1 | nested_candle_fetch=0",
+            len(candle_snapshots), len(_m15_map),
         )
     except Exception as _exc:
-        log.warning("INTRADAY CANDLE SNAPSHOT FAILED | %s", str(_exc))
+        # A failure in the optional M15 transport/cache must never erase the
+        # already-valid H1/M5 Top-30 snapshot. Keep M15=None per symbol;
+        # analyze_intraday() will apply its existing 25-minute M15 logic.
+        log.warning("INTRADAY CANDLE SNAPSHOT M15 LAYER FAILED | %s", str(_exc))
         candle_snapshots = {}
+        for _item in finalists:
+            _, _, _sym, _h1, _m5 = _item
+            candle_snapshots[str(_sym).upper()] = {
+                "h1": _h1, "m5": _m5, "m15": None,
+                "spy5": benchmark_frames.get("SPY"),
+                "qqq5": benchmark_frames.get("QQQ"),
+            }
 
     # Stage 2 — only finalists receive full setup/confluence/news analysis from the same snapshot.
     results: list[IntradaySignal] = []
