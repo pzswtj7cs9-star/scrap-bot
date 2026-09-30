@@ -31,7 +31,7 @@ from stocks import MAX_AUTO_PRICE
 log = logging.getLogger(__name__)
 
 # Deployment marker: proves which analyzer_intraday build Render actually loaded.
-INTRADAY_ANALYZER_VERSION = "20260930-INTRADAY-DATA-ROUTING-HARDENED-V2"
+INTRADAY_ANALYZER_VERSION = "20260930-INTRADAY-DATA-ROUTING-HARDENED-V3-QUOTE-HANDOFF"
 log.info("INTRADAY ANALYZER VERSION | %s", INTRADAY_ANALYZER_VERSION)
 
 SKIP_OPEN_MIN = 20
@@ -2650,7 +2650,13 @@ def _quote_liquidity(symbol: str, price: float) -> dict:
 
 
 def _final_execution_snapshot(symbol: str, reference_price: float, quote_snapshot: dict | None = None) -> dict:
-    """لقطة تنفيذ نهائية مستقلة عن التحليل. لا تعيد حساب Stop/TP."""
+    """لقطة التنفيذ النهائية من نفس Quote Snapshot المستخدم في Liquidity.
+
+    مهم: لا تطلب Quote ثانية إذا مرّر caller لقطة Quote صالحة.
+    Liquidity وFinal Execution يستخدمان نفس bid/ask/timestamp/feed.
+    ندعم schema الخاصة بـ _quote_liquidity (quote_timestamp/quote_feed)
+    وكذلك schema الخام من market_data (timestamp/feed).
+    """
     result = {
         "ok": False,
         "entry_price": 0.0,
@@ -2660,10 +2666,17 @@ def _final_execution_snapshot(symbol: str, reference_price: float, quote_snapsho
         "reason": "not_attempted",
     }
     try:
+        # If a snapshot was supplied, it is authoritative for this final gate.
+        # Never silently replace it with a second REST quote.
         q = quote_snapshot if isinstance(quote_snapshot, dict) else None
-        if not q:
+        if q is None:
             from market_data import fetch_latest_quote
             q = fetch_latest_quote(symbol)
+
+        if not isinstance(q, dict) or not q:
+            result["reason"] = "quote_snapshot_empty"
+            return result
+
         bid = float(q.get("bid") or 0)
         ask = float(q.get("ask") or 0)
         if bid <= 0:
@@ -2678,23 +2691,61 @@ def _final_execution_snapshot(symbol: str, reference_price: float, quote_snapsho
         if float(reference_price or 0) <= 0:
             result["reason"] = "invalid_reference_price"
             return result
+
         mid = (bid + ask) / 2.0
-        ts = q.get("timestamp")
-        if ts:
-            qdf = pd.DataFrame({"Close": [mid]}, index=[pd.Timestamp(ts)])
-            from market_data import data_age_minutes
-            result["quote_age_min"] = float(data_age_minutes(qdf))
+
+        # _quote_liquidity() already calculated an effective age (including
+        # cache age). Reuse it when present so the final gate validates the
+        # exact same Quote snapshot rather than creating a different age.
+        raw_age = q.get("quote_age_min")
+        try:
+            if raw_age is not None:
+                age = float(raw_age)
+                if np.isfinite(age):
+                    result["quote_age_min"] = age
+        except (TypeError, ValueError):
+            pass
+
+        # Fallback for a raw market_data quote or an older snapshot schema.
+        if not np.isfinite(float(result["quote_age_min"])):
+            ts = q.get("quote_timestamp")
+            if ts is None:
+                ts = q.get("timestamp")
+            if ts:
+                qdf = pd.DataFrame({"Close": [mid]}, index=[pd.Timestamp(ts)])
+                from market_data import data_age_minutes
+                result["quote_age_min"] = float(data_age_minutes(qdf))
+
         if result["quote_age_min"] > QUOTE_MAX_AGE_MIN:
             result["reason"] = f"quote_stale>{QUOTE_MAX_AGE_MIN}m"
+            result["quote_source"] = str(
+                q.get("quote_source")
+                or ("alpaca-" + str(q.get("quote_feed") or q.get("feed") or "unknown"))
+            )
             return result
+
         spread = (ask - bid) / mid * 100.0
+
+        # Normalize both Quote schemas. This is the critical handoff fix:
+        # _quote_liquidity uses quote_feed/quote_timestamp, while the raw
+        # market_data response uses feed/timestamp.
+        quote_source = q.get("quote_source")
+        if not quote_source or str(quote_source).lower() == "none":
+            feed = q.get("quote_feed") or q.get("feed") or "unknown"
+            quote_source = "alpaca-" + str(feed)
+
         result.update({
             "spread_pct": spread,
             "entry_price": round(mid, 4),
-            "quote_source": "alpaca-" + str(q.get("feed") or "unknown"),
+            "quote_source": str(quote_source),
             "ok": spread <= HARD_MAX_SPREAD_PCT,
             "reason": "ok" if spread <= HARD_MAX_SPREAD_PCT else f"spread>{HARD_MAX_SPREAD_PCT:.2f}%",
         })
+
+        log.debug(
+            "INTRADAY FINAL EXECUTION QUOTE HANDOFF | %s | source=%s age=%.3fm spread=%.3f%%",
+            symbol, result["quote_source"], float(result["quote_age_min"]), spread,
+        )
     except Exception as exc:
         result["reason"] = f"exception:{type(exc).__name__}:{str(exc)[:220]}"
         log.warning("INTRADAY FINAL EXECUTION SNAPSHOT FAILED | %s | %s", symbol, result["reason"], exc_info=True)
