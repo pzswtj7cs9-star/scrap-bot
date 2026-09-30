@@ -31,7 +31,7 @@ from stocks import MAX_AUTO_PRICE
 log = logging.getLogger(__name__)
 
 # Deployment marker: proves which analyzer_intraday build Render actually loaded.
-INTRADAY_ANALYZER_VERSION = "20260930-INTRADAY-DATA-ROUTING-HARDENED-V3-QUOTE-HANDOFF"
+INTRADAY_ANALYZER_VERSION = "20260930-INTRADAY-DATA-ROUTING-HARDENED-V4-BOUNDED-FALLBACK"
 log.info("INTRADAY ANALYZER VERSION | %s", INTRADAY_ANALYZER_VERSION)
 
 SKIP_OPEN_MIN = 20
@@ -97,6 +97,15 @@ _M5_CACHE_UPDATED_AT = 0.0
 _M5_CACHE: dict[str, pd.DataFrame] = {}
 _M5_BENCHMARK_CACHE: dict[str, pd.DataFrame] = {}
 _M5_BENCHMARK_UPDATED_AT = 0.0
+
+# H1 routing cache: bulk Alpaca is authoritative; a previously fetched H1 frame
+# may be reused for Stage-1 routing only while it remains inside the existing
+# 90-minute freshness gate. This prevents a missing symbol in one bulk response
+# from triggering a per-symbol fallback storm. Stage 2 still re-validates H1.
+H1_ROUTING_CACHE_TTL_SECONDS = 300.0
+_H1_CACHE_LOCK = Lock()
+_H1_CACHE_UPDATED_AT = 0.0
+_H1_CACHE: dict[str, pd.DataFrame] = {}
 
 # 15m is a slower confirmation timeframe. Re-fetching it for every Top-30
 # symbol on every one-minute scan creates avoidable provider pressure. Keep a
@@ -2945,7 +2954,7 @@ def analyze_intraday(
     symbol: str,
     name: str = "",
     market_context: tuple[bool, str] | None = None,
-    preloaded: tuple[pd.DataFrame, pd.DataFrame] | None = None,
+    preloaded: tuple[pd.DataFrame | None, pd.DataFrame | None] | None = None,
     snapshot: IntradaySnapshot | None = None,
 ) -> Optional[IntradaySignal]:
     def _safe_round(value, ndigits=0, default=0.0):
@@ -5310,7 +5319,7 @@ def get_learning_alert() -> dict | None:
 
 def _prefilter_intraday(
     symbol: str,
-    preloaded: tuple[pd.DataFrame, pd.DataFrame] | None = None,
+    preloaded: tuple[pd.DataFrame | None, pd.DataFrame | None] | None = None,
     audit_counts: dict[str, int] | None = None,
     audit_lock: Lock | None = None,
     data_audit_counts: dict[str, int] | None = None,
@@ -5338,10 +5347,13 @@ def _prefilter_intraday(
     try:
         from market_data import fetch_intraday, intraday_data_fresh
         if preloaded is not None:
-            # The scan supplies the complete Stage-1 candle snapshot. Never
-            # re-fetch H1/M5 here; freshness is evaluated on this same snapshot.
+            # The scan supplies the bounded Stage-1 snapshot. Never re-fetch H1/M5
+            # here; a missing frame is a local routing rejection, not a reason to
+            # launch a per-symbol Twelve-Data fallback request.
             h1, m5 = preloaded
         else:
+            # Direct legacy callers may still request a single symbol explicitly.
+            # The scheduled scan path never uses this branch.
             h1 = fetch_intraday(symbol, interval="60m", period="10d")
             m5 = fetch_intraday(symbol, interval="5m", period="5d")
         # Diagnostic only: keep the existing freshness gates unchanged, but expose
@@ -5603,6 +5615,7 @@ def scan_intraday(
     min_score: int = INTRADAY_MIN_SCORE,
     limit: int = 8,
 ) -> list[IntradaySignal]:
+    global _H1_CACHE_UPDATED_AT
     ok, _ = session_window_ok()
     if not ok:
         scan_intraday.last_window = _
@@ -5662,7 +5675,15 @@ def scan_intraday(
             end = datetime.now(timezone.utc)
             bulk_h1 = fetch_alpaca_bars_multi(
                 symbols, "1Hour", end - timedelta(days=13), end=end, chunk_size=50
-            )
+            ) or {}
+            # Keep only the bulk H1 frames in the routing cache. On a later scan,
+            # a temporarily missing symbol can reuse its prior H1 frame if it is
+            # still fresh under the unchanged 90-minute hard gate.
+            with _H1_CACHE_LOCK:
+                for _hsym, _hdf in bulk_h1.items():
+                    if isinstance(_hdf, pd.DataFrame) and not _hdf.empty:
+                        _H1_CACHE[str(_hsym).upper()] = _hdf
+                _H1_CACHE_UPDATED_AT = end.timestamp()
             def _load_m5_bulk():
                 return fetch_alpaca_bars_multi(
                     symbols, "5Min", end - timedelta(days=8), end=end, chunk_size=50
@@ -5673,19 +5694,38 @@ def scan_intraday(
                 len(bulk_h1), len(bulk_m5),
             )
     except Exception as exc:
-        log.warning("STAGE 1 bulk load failed; fallback to per-symbol: %s", exc)
+        log.warning("STAGE 1 bulk load failed; using bounded process caches only: %s", exc)
         bulk_h1 = {}
         with _M5_CACHE_LOCK:
             bulk_m5 = {str(sym).upper(): _copy_frame(df) for sym, df in _M5_CACHE.items() if str(sym).upper() in {str(x).upper() for x in symbols}}
 
-    # Stage 1 — H1 + 5m only for the full universe.
+    # Fill only from the bounded H1 routing cache. We deliberately do NOT call
+    # fetch_intraday() once per missing symbol here: that was the path that could
+    # turn one bad/empty bulk response into a long Twelve-Data fallback storm.
+    from market_data import intraday_data_fresh
+    with _H1_CACHE_LOCK:
+        _h1_cached = {str(sym).upper(): _copy_frame(_H1_CACHE.get(str(sym).upper())) for sym in symbols}
+    _h1_cache_used = 0
+    for _sym in symbols:
+        _key = str(_sym).upper()
+        if _key in bulk_h1:
+            continue
+        _candidate = _h1_cached.get(_key)
+        if isinstance(_candidate, pd.DataFrame) and not _candidate.empty:
+            _ok_h1, _age_h1 = intraday_data_fresh(_candidate, "60m", 90.0)
+            if _ok_h1:
+                bulk_h1[_key] = _candidate
+                _h1_cache_used += 1
+    log.info("STAGE 1 H1 ROUTING CACHE | bulk=%d | cache_used=%d | total=%d", len(bulk_h1), _h1_cache_used, len(symbols))
+
+    # Stage 1 — H1 + 5m only for the full universe. Missing bulk frames are
+    # rejected locally; no per-symbol REST/fallback request is allowed here.
     with ThreadPoolExecutor(max_workers=workers) as pool:
         futures = {
             pool.submit(
                 _prefilter_intraday,
                 sym,
-                (bulk_h1.get(sym), bulk_m5.get(sym))
-                if (sym in bulk_h1 and sym in bulk_m5) else None,
+                (bulk_h1.get(sym), bulk_m5.get(sym)),
                 stage1_audit_counts,
                 stage1_audit_lock,
                 stage1_data_audit_counts,

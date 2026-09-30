@@ -420,15 +420,26 @@ def _twelve_get(endpoint: str, params: dict, timeout: float | None = None) -> re
         # retry in the same minute from multiple workers.
         raise
 
-    if r.status_code != 429:
+    # Some Twelve Data gateways have returned HTTP 404 while the JSON body
+    # explicitly reports code=429 / exhausted credits. Treat the provider
+    # payload as authoritative so the scanner does not keep retrying a dead
+    # fallback path.
+    body = (r.text or "").lower()
+    body_quota = any(x in body for x in (
+        "you have run out of api credits", "api credits", "for the day",
+        "current day", "daily quota", "code\":429", "code: 429",
+    ))
+    body_minute = any(x in body for x in ("current minute", "per minute", "minute limit"))
+    if r.status_code != 429 and not (r.status_code in (400, 404, 429) and (body_quota or body_minute)):
         return r
 
-    body = (r.text or "").lower()
+    if r.status_code != 429 and not (body_quota or body_minute):
+        return r
     # Distinguish minute rate-limit from true daily quota exhaustion. The old
     # implementation treated any text containing 'quota' as permanent and
     # disabled Twelve Data for the rest of the process.
-    minute_limit = any(x in body for x in ("current minute", "per minute", "minute limit", "minute"))
-    daily_limit = any(x in body for x in ("for the day", "for the current day", "daily", "800 api credits")) and not minute_limit
+    minute_limit = body_minute or any(x in body for x in ("minute",))
+    daily_limit = body_quota and not minute_limit
     if daily_limit:
         with _TWELVE_QUOTA_LOCK:
             _TWELVE_QUOTA_EXHAUSTED = True
