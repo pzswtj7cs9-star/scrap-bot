@@ -992,6 +992,33 @@ def fetch_intraday(symbol: str, period: str = "5d", interval: str = "5m") -> pd.
                     _set_status(df.attrs.get("data_source", "alpaca-iex"))
                     return df
                 last_errors.append(f"Alpaca stale age={age:.1f}m")
+
+                # One-time Alpaca retry for stale weekly data.  This is a
+                # data-layer recovery only: no strategy, score, VWAP, or
+                # gate logic is changed.  Do not retry other timeframes here
+                # because they already have their dedicated freshness/repair
+                # paths.
+                if alpaca_tf == "1Week":
+                    try:
+                        log.warning(
+                            "DATA REFRESH 1W RETRY | %s | initial_age=%.1fm | source=alpaca-iex",
+                            symbol, float(age),
+                        )
+                        retry_df = fetch_alpaca_bars(symbol, alpaca_tf, start)
+                        if retry_df is not None and len(retry_df) >= 10:
+                            retry_fresh, retry_age = _twelve_fresh(retry_df, interval)
+                            log.info(
+                                "DATA HEALTH RETRY | %s | %s | interval=%s | age=%.1fm | fresh=%s",
+                                symbol, retry_df.attrs.get("data_source", "alpaca-iex"),
+                                interval, float(retry_age), bool(retry_fresh),
+                            )
+                            if retry_fresh:
+                                _set_status(retry_df.attrs.get("data_source", "alpaca-iex"))
+                                return retry_df
+                            last_errors.append(f"Alpaca retry stale age={retry_age:.1f}m")
+                    except Exception as retry_exc:
+                        last_errors.append(f"Alpaca 1W retry: {str(retry_exc)[:100]}")
+                        log.warning("Alpaca 1W retry %s %s: %s", symbol, interval, retry_exc)
         except Exception as exc:
             last_errors.append(f"Alpaca: {str(exc)[:100]}")
             log.warning("Alpaca intra %s %s: %s", symbol, interval, exc)
