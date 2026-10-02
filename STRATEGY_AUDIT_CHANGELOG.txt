@@ -1,0 +1,49 @@
+SCRAP BOT — STRATEGY AUDIT V1
+Date: 2026-10-02
+
+Purpose
+-------
+Add diagnostic-only per-strategy observability so every Daily (19) and Intraday (20)
+strategy records its own Core blockers and Confirmation diagnostics independently.
+
+What is recorded
+----------------
+1. Each strategy has its own matched / failed count.
+2. Each failed strategy stores each Core/entry blocker as an independent counter.
+3. Each matched strategy stores the weakest Confirmation component name independently.
+4. Primary strategy selection and non-primary matches are counted separately.
+5. If the primary strategy reaches a later Stage-2 rejection gate, that gate/reason is
+   recorded under that strategy's pipeline_rejects.
+6. Confirmation component values are stored in the existing strategy score ledger for
+   diagnostics only; the existing 70/30 score calculation is unchanged.
+
+Important safety guarantees
+---------------------------
+- No strategy condition was loosened or tightened.
+- No strategy was removed.
+- Global score thresholds were not changed.
+- VWAP logic was not changed.
+- Risk / TP / Stop / Final Execution logic was not changed.
+- The audit does not participate in selection, ranking, alerts, exits, learning, or gates.
+- No extra market-data requests are introduced by this audit.
+- The audit uses values already calculated by the analyzer.
+
+Persistent audit locations
+--------------------------
+Daily:   /var/data/daily_audit_counters.json
+Intraday:/var/data/intraday_audit_counters.json
+
+New log markers
+---------------
+DAILY STRATEGY AUDIT CUMULATIVE
+INTRADAY STRATEGY AUDIT CUMULATIVE
+
+The persistent JSON keeps every strategy and every blocker separately, while the log
+prints a compact cumulative summary.
+
+Validation
+----------
+- Python compile check: PASS
+- AST parse: PASS
+- Import smoke test with project dependency stubs: PASS
+- ENTRY_TYPES detected: Daily=19, Intraday=20
