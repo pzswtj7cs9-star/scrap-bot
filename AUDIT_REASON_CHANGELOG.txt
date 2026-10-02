@@ -1,0 +1,11 @@
+ScrapBot — Flat Rejection Reason Audit — 2026-10-02
+
+Purpose:
+- Keep every concrete rejection reason as its own counter.
+- Add a flat Stage-2 rejection_reasons map and top-20 log.
+- Do not change Score, VWAP, strategy gates, risk gates, market gates, or quote thresholds.
+- Final execution now records only the actual execution reason, not duplicate metadata (source/age/spread) as extra reasons.
+- Daily audit schema: 3. Intraday audit schema: 2. Old cumulative audit files are reset on first run of this version.
+
+Validation:
+- py_compile passed for all four Python files.

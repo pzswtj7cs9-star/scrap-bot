@@ -15,7 +15,7 @@ import pandas as pd
 import requests
 
 log = logging.getLogger("halal-bot.data")
-DATA_LAYER_VERSION = "20261002-IEX-PERSISTENT-WS-1W-RETRY-M5-V2"
+DATA_LAYER_VERSION = "20260928-M5-TWELVE-SMART-CACHE-V1"
 log.info("DATA LAYER VERSION | %s", DATA_LAYER_VERSION)
 
 APCA_KEY = os.getenv("APCA_API_KEY_ID", "").strip()
