@@ -31,12 +31,13 @@ from stocks import MAX_AUTO_PRICE
 log = logging.getLogger(__name__)
 
 # Deployment marker: proves which analyzer_intraday build Render actually loaded.
-INTRADAY_ANALYZER_VERSION = "20260930-INTRADAY-DATA-ROUTING-HARDENED-V4-BOUNDED-FALLBACK"
+INTRADAY_ANALYZER_VERSION = "20261002-INTRADAY-STRATEGY20-MOMENTUM-IGNITION-V2-BALANCED"
 log.info("INTRADAY ANALYZER VERSION | %s", INTRADAY_ANALYZER_VERSION)
 
 SKIP_OPEN_MIN = 20
 SKIP_CLOSE_MIN = 20
 INTRADAY_MIN_SCORE = 82
+INTRADAY_STRATEGY_BALANCE_VERSION = "20261002-BALANCED-STRATEGIES-V3"
 
 # Central execution / market-regime configuration. Keep global safety thresholds
 # here so changing one policy value cannot leave a stale duplicate elsewhere.
@@ -449,6 +450,7 @@ ENTRY_TYPES = (
     "علم صاعد", "استعادة مستوى", "دخول بعد Opening Drive", "استعادة قمة اليوم",
     "استعادة بعد فشل ORB", "استمرار ABC", "سحب سيولة مع Displacement",
     "استمرار/استعادة الفجوة", "استعادة بعد فشل كسر دعم", "ارتداد بعد تفوق نسبي",
+    "انطلاقة الزخم",
 )
 PREFILTER_STRATEGY_CAP = PREFILTER_MAX_CANDIDATES + (len(ENTRY_TYPES) * PREFILTER_STRATEGY_TOP_K)
 INTRADAY_LIVE_TOP_N = 30
@@ -519,6 +521,7 @@ STRATEGY_FRESHNESS_BARS = {
     "استمرار/استعادة الفجوة": 3,
     "استعادة بعد فشل كسر دعم": 5,
     "ارتداد بعد تفوق نسبي": 4,
+    "انطلاقة الزخم": 3,
 }
 
 REASON_EDGE = 0.08
@@ -667,10 +670,10 @@ def _default_adaptive_policy() -> dict:
             "h1_trend": 1.0, "m15": 1.0, "m5": 1.0, "vwap": 1.0,
             "vol_session": 1.0, "market": 1.0, "breakout": 1.0,
             "breakout_candle": 1.0, "retest": 1.0, "vwap_bounce": 1.0,
-            "ema_pullback": 1.0, "liquidity_sweep": 1.0, "liquidity_displacement": 1.0, "orb": 1.0, "momentum_continuation": 1.0, "compression_expansion": 1.0, "bull_flag": 1.0, "resistance_reclaim": 1.0, "opening_drive_pullback": 1.0, "hod_reclaim": 1.0, "orb_failed_reclaim": 1.0, "abc_continuation": 1.0, "vwap_h1_confluence": 1.0, "multi_level_confluence": 1.0, "early": 1.0,
+            "ema_pullback": 1.0, "liquidity_sweep": 1.0, "liquidity_displacement": 1.0, "orb": 1.0, "momentum_continuation": 1.0, "compression_expansion": 1.0, "bull_flag": 1.0, "resistance_reclaim": 1.0, "opening_drive_pullback": 1.0, "hod_reclaim": 1.0, "orb_failed_reclaim": 1.0, "abc_continuation": 1.0, "vwap_h1_confluence": 1.0, "multi_level_confluence": 1.0, "early": 1.0, "momentum_ignition": 1.0,
             "news_momentum": 1.0,
         },
-        "entry_limits": {"دخول مبكر": 94, "إعادة اختبار": 95, "ارتداد VWAP": 96, "ارتداد EMA20": 96, "سحب سيولة": 97, "ضغط ثم انفجار": 98, "استمرار الزخم": 97, "اختراق نطاق الافتتاح": 99, "اختراق مؤكد": 100, "علم صاعد": 98, "استعادة مستوى": 98, "دخول بعد Opening Drive": 98, "استعادة قمة اليوم": 98, "استعادة بعد فشل ORB": 99, "استمرار ABC": 98, "سحب سيولة مع Displacement": 99, "استمرار/استعادة الفجوة": 98, "استعادة بعد فشل كسر دعم": 98, "ارتداد بعد تفوق نسبي": 97},
+        "entry_limits": {"دخول مبكر": 94, "إعادة اختبار": 95, "ارتداد VWAP": 96, "ارتداد EMA20": 96, "سحب سيولة": 97, "ضغط ثم انفجار": 98, "استمرار الزخم": 97, "اختراق نطاق الافتتاح": 99, "اختراق مؤكد": 100, "علم صاعد": 98, "استعادة مستوى": 98, "دخول بعد Opening Drive": 98, "استعادة قمة اليوم": 98, "استعادة بعد فشل ORB": 99, "استمرار ABC": 98, "سحب سيولة مع Displacement": 99, "استمرار/استعادة الفجوة": 98, "استعادة بعد فشل كسر دعم": 98, "ارتداد بعد تفوق نسبي": 97, "انطلاقة الزخم": 96},
         "strategy_stats": {et: {"samples": 0, "wins": 0, "win_rate": 0.0} for et in ENTRY_TYPES},
         "strategy_weights": {},
         "strategy_weights_active": False,
@@ -871,6 +874,7 @@ def _strategy_weight_defaults() -> dict:
         "استمرار/استعادة الفجوة": {"gap_quality": .35, "gap_hold": .25, "gap_trigger": .40},
         "استعادة بعد فشل كسر دعم": {"support_quality": .25, "breakdown_quality": .35, "breakdown_reclaim": .40},
         "ارتداد بعد تفوق نسبي": {"rs_strength": .30, "rs_pullback": .25, "rs_higher_low": .20, "rs_trigger": .25},
+        "انطلاقة الزخم": {"base_quality": .30, "expansion_quality": .40, "trigger_quality": .30},
         "دخول مبكر": {"early_range": .40, "near_resistance": .30, "holding": .30},
     }
 
@@ -2212,9 +2216,9 @@ def _breakout_quality(today_5: pd.DataFrame, level: float, price: float) -> tupl
         upper_wick = (h - max(o, c)) / rng
         prior_close = float(today_5["Close"].iloc[bar_idx - 1])
 
-        strong_close = c >= level * 1.001 and close_pos >= 0.70
-        body_ok = body >= 0.45
-        wick_ok = upper_wick <= 0.30
+        strong_close = c >= level * 1.001 and close_pos >= 0.65
+        body_ok = body >= 0.40
+        wick_ok = upper_wick <= 0.35
         follow = prior_close >= level * 0.997 or c >= prior_close * 1.002
         quality = (body * 0.4 + close_pos * 0.4 + (1 - min(upper_wick, 1)) * 0.2) * 100
         return bool(strong_close and body_ok and wick_ok and follow), float(quality)
@@ -2876,7 +2880,7 @@ def _detect_professional_new_setups(
         gap_pct = (session_open - prev_close) / prev_close * 100.0
         out["gap_pct"] = gap_pct
         # 17 — bullish Gap Continuation / Gap Reclaim.
-        if gap_pct >= 2.0:
+        if gap_pct >= 1.25:
             gap_abs = session_open - prev_close
             gap_mid = prev_close + gap_abs * 0.50
             out["gap_mid"] = gap_mid
@@ -2943,7 +2947,7 @@ def _detect_professional_new_setups(
             trigger = float(last["Close"]) >= pb_high * 1.001
             out.update(rs_reference_gain=ref_gain, rs_pullback_pct=pb_pct, rs_pullback_high=pb_high,
                        rs_higher_low=held_hl,
-                       rs_pullback=bool(ref_gain >= 1.0 and 0.0 < pb_pct <= 50.0 and held_hl and trigger))
+                       rs_pullback=bool(ref_gain >= 0.75 and 0.0 < pb_pct <= 60.0 and held_hl and trigger))
     except Exception as exc:
         log.warning("INTRADAY professional setup detection failed: %s", exc)
         return out
@@ -3079,13 +3083,16 @@ def analyze_intraday(
     vwap_last_closed = float(vwap_closed_s.iloc[-1]) if len(vwap_closed_s) and pd.notna(vwap_closed_s.iloc[-1]) else vwap_last
     last_green = float(today_5["Close"].iloc[closed_idx]) >= float(today_5["Open"].iloc[closed_idx])
     mom = (price - float(c5.iloc[-6])) / float(c5.iloc[-6]) * 100 if len(c5) >= 6 else 0.0
-    live_ok = price >= e5 * 0.998 and above_vwap and (last_green or mom > 0.05) and r5 < 78
+    # Strategy-aware live quality: VWAP is no longer a universal structural
+    # requirement. VWAP Bounce still requires its own VWAP core/confirmation;
+    # other setups may form above/below VWAP and are judged by their own structure.
+    # Safety/market gates remain authoritative below.
+    live_ok = price >= e5 * 0.998 and (last_green or mom > 0.05) and r5 < 78
     # AUDIT ONLY: decompose the exact live gate without changing its logic.
     live_gate_reasons: list[str] = []
     if price < e5 * 0.998:
         live_gate_reasons.append("below_ema20_gate")
-    if not above_vwap:
-        live_gate_reasons.append("below_vwap_gate")
+    # below VWAP is intentionally not a live_ok failure for non-VWAP setups.
     if (not last_green) and mom <= 0.05:
         live_gate_reasons.append("last_candle_not_green")
         live_gate_reasons.append("momentum<=0.05")
@@ -3120,7 +3127,7 @@ def analyze_intraday(
     retest_window = today_5.iloc[max(0, _closed_pos - 3):_closed_pos]
     retest_touch = bool(
         len(retest_window) > 0
-        and (retest_window["Low"].astype(float) <= level_high * 1.007).any()
+        and (retest_window["Low"].astype(float) <= level_high * 1.009).any()
         and (retest_window["High"].astype(float) >= level_high * 0.993).any()
     )
     near_level = retest_touch
@@ -3160,7 +3167,8 @@ def analyze_intraday(
     # نظام السوق هو الذي يحدد بوابة الدخول: قوي/مختلط/ضعيف.
     mixed_market_ok = bool(
         market_condition == "مختلط"
-        and trend_up and live_ok and above_vwap and above_open
+        and trend_up and live_ok and above_open
+        and (above_vwap if vwap_bounce else True)
         and m15_state == "داعم" and vol_session_ratio >= 1.0
         and not dump and not chop and ext_tmp <= 4.0
     )
@@ -3177,7 +3185,7 @@ def analyze_intraday(
         market_condition == "إيجابي_تحت_VWAP"
         and trend_up
         and live_ok
-        and above_vwap
+        and (above_vwap if vwap_bounce else (above_vwap or breakout_now or orb_breakout or momentum_continuation or compression_expansion or liquidity_sweep or liquidity_displacement or bull_flag or resistance_reclaim or opening_drive_pullback or hod_reclaim or orb_failed_reclaim or abc_continuation or gap_setup or failed_breakdown_reclaim or rs_pullback or momentum_ignition))
         and above_open
         and m15_state != "معاكس"
         and vol_session_ratio >= 0.90
@@ -3310,9 +3318,9 @@ def analyze_intraday(
             resume_green = resume_close >= resume_open
             resume_above_pause = resume_close >= pause_close * 1.001
             momentum_continuation = bool(
-                impulse_gain >= 0.35
+                impulse_gain >= 0.30
                 and impulse_range_pct > 0
-                and pause_range_pct <= max(0.80, impulse_range_pct * 0.90)
+                and pause_range_pct <= max(0.90, impulse_range_pct * 0.95)
                 and pause_hold
                 and resume_green
                 and resume_above_pause
@@ -3334,8 +3342,8 @@ def analyze_intraday(
             comp_width_pct = comp_range / max(price, 1e-9) * 100
             cur_body = abs(float(cur["Close"]) - float(cur["Open"]))
             cur_close_pos = (float(cur["Close"]) - float(cur["Low"])) / cur_range
-            expansion = cur_range >= max(med_range * 1.35, price * 0.003)
-            compression = comp_width_pct <= 2.2 and med_range > 0
+            expansion = cur_range >= max(med_range * 1.25, price * 0.0025)
+            compression = comp_width_pct <= 2.5 and med_range > 0
             comp_high = float(prev["High"].max()) if len(prev) else 0.0
             breakout_from_compression = bool(
                 comp_high > 0 and float(cur["Close"]) >= comp_high * 1.001
@@ -3343,8 +3351,8 @@ def analyze_intraday(
             compression_expansion = bool(
                 compression and expansion and breakout_from_compression
                 and float(cur["Close"]) > float(cur["Open"])
-                and cur_close_pos >= 0.70
-                and cur_body / cur_range >= 0.45
+                and cur_close_pos >= 0.65
+                and cur_body / cur_range >= 0.40
             )
     except Exception:
         compression_expansion = False
@@ -3392,7 +3400,7 @@ def analyze_intraday(
             flag_range = (flag_high - flag_low) / max(flag_high, 1e-9) * 100
             flag_retrace = (impulse_high - flag_low) / impulse_range * 100
             breakout_flag = closed_close >= flag_high * 1.001
-            bull_flag = bool(impulse_gain >= 1.0 and flag_range <= 2.0 and flag_retrace <= 50.0 and breakout_flag)
+            bull_flag = bool(impulse_gain >= 0.8 and flag_range <= 2.5 and flag_retrace <= 55.0 and breakout_flag)
 
         if len(today_5) >= 8:
             prior = today_5.iloc[-8:-2]
@@ -3420,7 +3428,7 @@ def analyze_intraday(
             reclaim_drive = closed_close >= drive_high * 0.999
             controlled_pullback = 0.50 <= pullback_from_high <= 8.0
             not_chasing = ext_tmp <= 6.0
-            opening_drive_pullback = bool(drive_is_recent and drive_return >= 2.0 and controlled_pullback and reclaim_drive and not_chasing)
+            opening_drive_pullback = bool(drive_is_recent and drive_return >= 1.25 and controlled_pullback and reclaim_drive and not_chasing)
         else:
             drive_level = 0.0
 
@@ -3484,11 +3492,11 @@ def analyze_intraday(
             c_last_green = float(c["Close"].iloc[-1]) >= float(c["Open"].iloc[-1])
             c_close = float(c["Close"].iloc[-1])
             c_break = c_close >= a_high * 1.001
-            abc_continuation = bool(a_gain >= 0.70 and 20.0 <= b_retrace <= 65.0 and c_break and c_last_green)
+            abc_continuation = bool(a_gain >= 0.50 and 15.0 <= b_retrace <= 70.0 and c_break and c_last_green)
     except Exception as exc:
         log.debug("INTRADAY strategy core fallback: %s", exc)
 
-    # 17/18/19 — additional professional setup cores from completed 5m candles.
+    # 17/18/19/20 — additional professional setup cores from completed 5m candles.
     # New intraday strategies use completed 5m structure, so ATR is also 5m.
     # Read ATR(14) from the full 5m history rather than today's short slice;
     # this prevents the first valid setup from being delayed until 14 bars.
@@ -3521,10 +3529,112 @@ def analyze_intraday(
             rs_vs_spy, rs_vs_qqq, rs_persistence, _rs_stock_return, _rs_valid = _aligned_relative_strength_metrics(
                 today_5.iloc[:_closed_pos + 1], spy5, qqq5, lookback=5, persistence_bars=5
             )
-            rs_strategy_ok = bool(_rs_valid and rs_vs_spy >= 1.0 and rs_vs_qqq >= 1.0 and rs_persistence >= 60.0)
+            rs_strategy_ok = bool(_rs_valid and rs_vs_spy >= 0.75 and rs_vs_qqq >= 0.75 and rs_persistence >= 50.0)
         except Exception as exc:
             log.debug("INTRADAY RS strategy benchmark fallback: %s", exc)
     rs_pullback=bool(rs_pullback and rs_strategy_ok)
+
+    # Strategy 20 — Momentum Ignition / First Pullback.
+    # Catches a fresh expansion from a compact 5m base or the first controlled
+    # pullback after that expansion. It is structural only; all existing global
+    # safety, market, quality, liquidity and final-execution gates remain intact.
+    momentum_ignition = False
+    momentum_ignition_mode = ""
+    momentum_base_high = 0.0
+    momentum_base_low = 0.0
+    momentum_impulse_high = 0.0
+    momentum_impulse_low = 0.0
+    momentum_impulse_gain_pct = 0.0
+    momentum_base_range_pct = 0.0
+    momentum_expansion_quality = 0.0
+    momentum_trigger_quality = 0.0
+    momentum_pullback_depth_pct = 0.0
+    momentum_trigger_level = 0.0
+    momentum_stop_low = 0.0
+    try:
+        _mi_df = _closed_d.copy()
+        if len(_mi_df) >= 9:
+            _mi_h = _mi_df["High"].astype(float)
+            _mi_l = _mi_df["Low"].astype(float)
+            _mi_o = _mi_df["Open"].astype(float)
+            _mi_c = _mi_df["Close"].astype(float)
+            _mi_v = _mi_df["Volume"].astype(float).fillna(0.0)
+
+            def _mi_bar_metrics(pos):
+                row = _mi_df.iloc[pos]
+                hi, lo = float(row["High"]), float(row["Low"])
+                op, cl = float(row["Open"]), float(row["Close"])
+                rng = max(hi - lo, price * 0.0001)
+                body = abs(cl - op) / rng
+                close_pos = (cl - lo) / rng
+                return hi, lo, op, cl, rng, body, close_pos
+
+            _base = _mi_df.iloc[-6:-1]
+            _base_high = float(_base["High"].max())
+            _base_low = float(_base["Low"].min())
+            _base_range = _base_high - _base_low
+            _base_range_pct = _base_range / max(float(_mi_c.iloc[-1]), 1e-9) * 100.0
+            _med_range = float((_mi_h.iloc[-9:-1] - _mi_l.iloc[-9:-1]).median())
+            _hi, _lo, _op, _cl, _rng, _body, _cp = _mi_bar_metrics(-1)
+            _vol_ref = float(_mi_v.iloc[-7:-1].median())
+            _vol_ratio = _mi_v.iloc[-1] / max(_vol_ref, 1e-9) if _vol_ref > 0 else 1.0
+            _break = _cl >= _base_high * 1.001
+            _base_tight = bool(_base_range_pct <= 3.00 and (_med_range <= 0 or _base_range <= max(_med_range * 4.0, price * 0.002)))
+            _expansion = bool(_rng >= max(_med_range * 1.10, price * 0.004) and _body >= 0.50 and _cp >= 0.60)
+            _volume_ok = bool(_vol_ratio >= 1.05)
+            _direct_ext = (price - e5_closed) / max(e5_closed, 1e-9) * 100.0
+            _direct_ok = bool(_direct_ext <= 4.00)
+            if _base_tight and _break and _expansion and _volume_ok and _direct_ok:
+                momentum_ignition = True
+                momentum_ignition_mode = "expansion"
+                momentum_base_high = _base_high; momentum_base_low = _base_low
+                momentum_impulse_high = _hi; momentum_impulse_low = _lo
+                momentum_impulse_gain_pct = max(0.0, (_cl - _base_high) / max(_base_high, 1e-9) * 100.0)
+                momentum_base_range_pct = _base_range_pct
+                momentum_expansion_quality = min(100.0, 45.0 * min(1.0, _body / 0.75) + 30.0 * min(1.0, _rng / max(_med_range * 1.5, price * 0.004)) + 25.0 * min(1.0, _vol_ratio / 1.5))
+                momentum_trigger_quality = min(100.0, 60.0 * min(1.0, (_cl / max(_base_high, 1e-9) - 1.0) / 0.004) + 40.0 * _cp)
+                momentum_trigger_level = _base_high; momentum_stop_low = _base_low
+
+            if not momentum_ignition:
+                for _imp_back in (3, 2):
+                    _imp_pos = len(_mi_df) - 1 - _imp_back
+                    _base_start = _imp_pos - 5
+                    if _base_start < 0: continue
+                    _base2 = _mi_df.iloc[_base_start:_imp_pos]
+                    if len(_base2) < 5: continue
+                    _bh = float(_base2["High"].max()); _bl = float(_base2["Low"].min())
+                    _br_pct = (_bh - _bl) / max(float(_mi_c.iloc[-1]), 1e-9) * 100.0
+                    _ih, _il, _io, _ic, _irng, _ibody, _icp = _mi_bar_metrics(_imp_pos)
+                    _iref = float(_mi_v.iloc[max(0, _imp_pos-5):_imp_pos].median())
+                    _ivr = float(_mi_v.iloc[_imp_pos]) / max(_iref, 1e-9) if _iref > 0 else 1.0
+                    _imed = float((_mi_h.iloc[max(0, _imp_pos-5):_imp_pos] - _mi_l.iloc[max(0, _imp_pos-5):_imp_pos]).median())
+                    _ibase_tight = bool(_br_pct <= 3.00 and (_imed <= 0 or (_bh - _bl) <= max(_imed * 4.0, price * 0.002)))
+                    _ibreak = _ic >= _bh * 1.001
+                    _iexp = bool(_irng >= max(_imed * 1.10, price * 0.004) and _ibody >= 0.50 and _icp >= 0.60)
+                    _ivol = bool(_ivr >= 1.05)
+                    if not (_ibase_tight and _ibreak and _iexp and _ivol): continue
+                    _post = _mi_df.iloc[_imp_pos+1:]
+                    if len(_post) < 1 or len(_post) > 2: continue
+                    _post_low = float(_post["Low"].min())
+                    _den = max(_ih - _bh, _ic * 0.002, 1e-9)
+                    _pull_depth = min(100.0, max(0.0, (_ih - _post_low) / max(_ih - _bh, _ic * 0.002, 1e-9) * 100.0))
+                    _latest_close = float(_mi_c.iloc[-1])
+                    _reclaim = _latest_close >= _bh * 0.998 and _latest_close >= float(_mi_c.iloc[-2]) * 0.999
+                    _not_broken = _post_low >= _bh * 0.990
+                    _not_extended = (price - e5_closed) / max(e5_closed, 1e-9) * 100.0 <= 4.00
+                    if _pull_depth <= 60.0 and _reclaim and _not_broken and _not_extended:
+                        momentum_ignition = True; momentum_ignition_mode = "first_pullback"
+                        momentum_base_high = _bh; momentum_base_low = _bl
+                        momentum_impulse_high = _ih; momentum_impulse_low = _il
+                        momentum_impulse_gain_pct = max(0.0, (_ic - _bh) / max(_bh, 1e-9) * 100.0)
+                        momentum_base_range_pct = _br_pct; momentum_pullback_depth_pct = _pull_depth
+                        momentum_expansion_quality = min(100.0, 40.0 * min(1.0, _ibody / 0.75) + 30.0 * min(1.0, _irng / max(_imed * 1.5, price * 0.004)) + 30.0 * min(1.0, _ivr / 1.5))
+                        momentum_trigger_quality = min(100.0, 60.0 * max(0.0, 1.0 - _pull_depth / 60.0) + 40.0 * min(1.0, max(0.0, (_latest_close / max(_bh, 1e-9) - 0.998) / 0.004)))
+                        momentum_trigger_level = _bh; momentum_stop_low = _post_low
+                        break
+    except Exception as _mi_exc:
+        log.debug("INTRADAY MOMENTUM IGNITION DETECTION | %s | %s", symbol, str(_mi_exc))
+        momentum_ignition = False
 
     # Strategy-specific confirmations are defined once inside _strategy_strength.
     # They affect the 30% Confirmation block and never block Core matching.
@@ -3537,7 +3647,7 @@ def analyze_intraday(
                          bull_flag, resistance_reclaim, orb_failed_reclaim,
                          abc_continuation, opening_drive_pullback, hod_reclaim,
                          vwap_bounce, ema_pullback, gap_setup, failed_breakdown_reclaim,
-                         rs_pullback))
+                         rs_pullback, momentum_ignition))
 
     # Capture the complete strategy context only after strategy confirmations exist.
     strategy_ctx = locals().copy()
@@ -3572,6 +3682,8 @@ def analyze_intraday(
         matched_entry_types.append("استعادة بعد فشل كسر دعم")
     if rs_pullback:
         matched_entry_types.append("ارتداد بعد تفوق نسبي")
+    if momentum_ignition:
+        matched_entry_types.append("انطلاقة الزخم")
     if opening_drive_pullback:
         matched_entry_types.append("دخول بعد Opening Drive")
     if hod_reclaim:
@@ -3755,7 +3867,7 @@ def analyze_intraday(
             if name == "سحب سيولة":
                 common(mom_min=0.05, vol_min=1.0, opening=False, ext_max=None)
             elif name == "سحب سيولة مع Displacement":
-                common(mom_min=0.08, vol_min=1.25, opening=True, ext_max=6.0 if "h4_state" in c else 3.5)
+                common(mom_min=0.06, vol_min=1.10, opening=True, ext_max=6.0 if "h4_state" in c else 3.5)
             elif name == "ضغط ثم انفجار":
                 common(mom_min=0.05, vol_min=1.20, opening=True, ext_max=4.0 if "m15_state" in c else 6.0)
             elif name == "استمرار الزخم":
@@ -3778,7 +3890,7 @@ def analyze_intraday(
             elif name == "استمرار ABC":
                 common(mom_min=0.05, vol_min=1.05, opening=True, ext_max=3.5 if "m15_state" in c else 6.0)
             elif name == "استمرار/استعادة الفجوة":
-                add("الفجوة أقل من 2.00%", float(v("gap_pct",0.0) or 0.0) >= 2.0)
+                add("الفجوة أقل من 1.25%", float(v("gap_pct",0.0) or 0.0) >= 1.25)
                 add("لم يكتمل Hold/Failure للفجوة", bool(v("gap_setup",False)))
                 common(mom_min=0.03, vol_min=0.90, opening=False, ext_max=6.0 if "m15_state" not in c else 4.5)
             elif name == "استعادة بعد فشل كسر دعم":
@@ -3787,10 +3899,20 @@ def analyze_intraday(
                 add("الهبوط تجاوز 2 ATR", float(v("failed_breakdown_depth_atr",99.0) or 99.0) <= 2.0)
                 add("لم تتم استعادة الدعم", bool(v("failed_breakdown_reclaim",False)))
                 common(mom_min=0.03, vol_min=0.90, opening=False, ext_max=6.0 if "m15_state" not in c else 4.5)
+            elif name == "انطلاقة الزخم":
+                add("لم تتكون قاعدة 5m ضيقة", float(v("momentum_base_high", 0.0) or 0.0) > 0 and float(v("momentum_base_low", 0.0) or 0.0) > 0)
+                add("لم يكتمل Trigger انطلاقة الزخم", bool(v("momentum_ignition", False)))
+                try:
+                    _mi_ema = float(v("e5_closed", v("e5", 0.0)) or 0.0); _mi_p = float(v("price", 0.0) or 0.0)
+                    add("الامتداد فوق EMA20 أكبر من 4.00%", _mi_ema > 0 and ((_mi_p - _mi_ema) / _mi_ema * 100.0) <= 4.00)
+                except Exception: add("تعذر فحص امتداد EMA20", False)
+                add("الـPullback تجاوز 60%", str(v("momentum_ignition_mode", "")) == "expansion" or float(v("momentum_pullback_depth_pct", 0.0) or 0.0) <= 60.0)
+                common(mom_min=0.05, vol_min=1.00, opening=True, ext_max=4.0)
+
             elif name == "ارتداد بعد تفوق نسبي":
-                add("التفوق مقابل SPY أقل من 1.00%", float(v("rs_vs_spy",0.0) or 0.0) >= 1.0)
-                add("التفوق مقابل QQQ أقل من 1.00%", float(v("rs_vs_qqq",0.0) or 0.0) >= 1.0)
-                add("استمرارية التفوق أقل من 60%", float(v("rs_persistence",0.0) or 0.0) >= 60.0)
+                add("التفوق مقابل SPY أقل من 0.75%", float(v("rs_vs_spy",0.0) or 0.0) >= 0.75)
+                add("التفوق مقابل QQQ أقل من 0.75%", float(v("rs_vs_qqq",0.0) or 0.0) >= 0.75)
+                add("استمرارية التفوق أقل من 50%", float(v("rs_persistence",0.0) or 0.0) >= 50.0)
                 add("Pullback أكبر من 50%", 0.0 < float(v("rs_pullback_pct",99.0) or 99.0) <= 50.0)
                 add("لم يحافظ Pullback على Higher Low", bool(v("rs_higher_low",False)))
                 add("لم يحدث Trigger", bool(v("rs_pullback",False)))
@@ -3844,7 +3966,7 @@ def analyze_intraday(
             q = 0.30*touch + 0.30*reclaim + 0.20*(100 if green else 0) + 0.10*(100 if mstate == "داعم" else 0) + 0.10*clip((vr-0.9)/0.6*100)
         elif name == "سحب سيولة":
             sweep = 100 if c.get("liquidity_sweep", False) else 0
-            q = 0.35*sweep + 0.25*clip((vr-0.9)/0.7*100) + 0.20*(100 if green else 0) + 0.20*clip((mom-0.05)/0.25*100)
+            q = 0.35*sweep + 0.25*clip((vr-0.85)/0.65*100) + 0.20*(100 if green else 0) + 0.20*clip((mom-0.05)/0.25*100)
         elif name == "سحب سيولة مع Displacement":
             # Core uses the sweep trigger plus an ATOMIC displacement-quality
             # measure. Do not score the composite liquidity_displacement flag
@@ -3871,13 +3993,13 @@ def analyze_intraday(
             q = 0.35*sweep + 0.65*disp
         elif name == "ضغط ثم انفجار":
             match = 100 if c.get("compression_expansion", False) else 0
-            q = 0.40*match + 0.25*clip((vr-1.2)/0.8*100) + 0.20*(100 if green else 0) + 0.15*clip((mom-0.05)/0.25*100)
+            q = 0.40*match + 0.25*clip((vr-1.10)/0.70*100) + 0.20*(100 if green else 0) + 0.15*clip((mom-0.05)/0.25*100)
         elif name == "استمرار الزخم":
-            q = 0.45*clip((mom-0.08)/0.50*100) + 0.30*clip((vr-1.0)/0.75*100) + 0.15*(100 if green else 0) + 0.10*(100 if mstate == "داعم" else 0)
+            q = 0.45*clip((mom-0.05)/0.45*100) + 0.30*clip((vr-0.90)/0.70*100) + 0.15*(100 if green else 0) + 0.10*(100 if mstate == "داعم" else 0)
         elif name == "علم صاعد":
-            impulse = clip((float(c.get("impulse_gain",0.0) or 0.0)-1.0)/2.0*100)
-            flag = clip((2.0-float(c.get("flag_range",2.0) or 2.0))/1.5*100)
-            q = 0.30*impulse + 0.30*flag + 0.20*(100 if green else 0) + 0.20*clip((vr-0.9)/0.7*100)
+            impulse = clip((float(c.get("impulse_gain",0.0) or 0.0)-0.8)/1.7*100)
+            flag = clip((2.5-float(c.get("flag_range",2.5) or 2.5))/1.5*100)
+            q = 0.30*impulse + 0.30*flag + 0.20*(100 if green else 0) + 0.20*clip((vr-0.85)/0.65*100)
         elif name == "استعادة مستوى":
             # Core scores the level structure independently: repeated tests and
             # depth of the prior loss. The full resistance_reclaim boolean is
@@ -3902,10 +4024,10 @@ def analyze_intraday(
             reclaim = clip((0.6-dist)/0.6*100)
             q = 0.60*match + 0.40*reclaim
         elif name == "دخول بعد Opening Drive":
-            drive = clip((float(c.get("drive_return",0.0) or 0.0)-1.0)/2.0*100)
+            drive = clip((float(c.get("drive_return",0.0) or 0.0)-0.75)/1.75*100)
             pb = float(c.get("pullback_from_high", 99.0) or 99.0)
             pull = clip((2.5-abs(pb-1.0))/1.5*100)
-            q = 0.35*drive + 0.25*pull + 0.20*(100 if green else 0) + 0.20*clip((vr-0.9)/0.7*100)
+            q = 0.35*drive + 0.25*pull + 0.20*(100 if green else 0) + 0.20*clip((vr-0.85)/0.65*100)
         elif name in {"استعادة قمة اليوم"}:
             # Core uses prior rejection depth + current reclaim distance; the
             # composite hod_reclaim flag itself is not scored.
@@ -3946,20 +4068,25 @@ def analyze_intraday(
             reclaim = clip((price_v/max(orb_high,1e-9)-1.001)/0.004*100) if orb_high > 0 else 0
             q = 0.35*failed + 0.25*orbq + 0.40*reclaim
         elif name == "استمرار ABC":
-            a = clip((float(c.get("a_gain",0.0) or 0.0)-0.70)/1.5*100)
+            a = clip((float(c.get("a_gain",0.0) or 0.0)-0.50)/1.5*100)
             b = clip(100-abs(float(c.get("b_retrace",42.5) or 42.5)-42.5)/22.5*100)
             cb = 100 if c.get("c_break", False) else 0
-            q = 0.25*a + 0.25*b + 0.30*cb + 0.10*clip((mom-0.05)/0.25*100) + 0.10*clip((vr-0.9)/0.7*100)
+            q = 0.25*a + 0.25*b + 0.30*cb + 0.10*clip((mom-0.05)/0.25*100) + 0.10*clip((vr-0.9)/0.6*100)
         elif name == "استمرار/استعادة الفجوة":
-            gap = clip((float(c.get("gap_pct",0.0) or 0.0)-2.0)/3.0*100); hold = 100.0 if str(c.get("gap_mode","") or "") in {"continuation","reclaim"} else 0.0; trigger = 100.0 if c.get("gap_setup",False) else 0.0
+            gap = clip((float(c.get("gap_pct",0.0) or 0.0)-1.25)/3.0*100); hold = 100.0 if str(c.get("gap_mode","") or "") in {"continuation","reclaim"} else 0.0; trigger = 100.0 if c.get("gap_setup",False) else 0.0
             q=0.35*gap+0.25*hold+0.40*trigger; components={"gap_quality":gap,"gap_hold":hold,"gap_trigger":trigger}
         elif name == "استعادة بعد فشل كسر دعم":
             touches_n=int(c.get("failed_breakdown_touches",0) or 0); touches=clip(50.0 + (touches_n-2.0)/3.0*50.0) if touches_n >= 2 else 0.0
             depth=float(c.get("failed_breakdown_depth_atr",0.0) or 0.0); breakdown=clip((2.0-depth)/1.8*100.0) if depth > 0 else 0.0; reclaim=100.0 if c.get("failed_breakdown_reclaim",False) else 0.0
             q=0.25*touches+0.35*breakdown+0.40*reclaim; components={"support_quality":touches,"breakdown_quality":breakdown,"breakdown_reclaim":reclaim}
         elif name == "ارتداد بعد تفوق نسبي":
-            rsq=clip((min(float(c.get("rs_vs_spy",0.0) or 0.0),float(c.get("rs_vs_qqq",0.0) or 0.0))-1.0)/2.0*100); pb=clip((50.0-float(c.get("rs_pullback_pct",50.0) or 50.0))/50.0*100); hl=100.0 if c.get("rs_higher_low",False) else 0.0; trig=100.0 if c.get("rs_pullback",False) else 0.0
+            rsq=clip((min(float(c.get("rs_vs_spy",0.0) or 0.0),float(c.get("rs_vs_qqq",0.0) or 0.0))-0.75)/1.75*100); pb=clip((50.0-float(c.get("rs_pullback_pct",50.0) or 50.0))/50.0*100); hl=100.0 if c.get("rs_higher_low",False) else 0.0; trig=100.0 if c.get("rs_pullback",False) else 0.0
             q=0.30*rsq+0.25*pb+0.20*hl+0.25*trig; components={"rs_strength":rsq,"rs_pullback":pb,"rs_higher_low":hl,"rs_trigger":trig}
+        elif name == "انطلاقة الزخم":
+            base_q = clip(100.0 - float(c.get("momentum_base_range_pct", 3.0) or 3.0) / 3.0 * 100.0)
+            expansion_q = clip(float(c.get("momentum_expansion_quality", 0.0) or 0.0))
+            trigger_q = clip(float(c.get("momentum_trigger_quality", 0.0) or 0.0))
+            q = 0.30*base_q + 0.40*expansion_q + 0.30*trigger_q
 
         else:  # دخول مبكر
             # Keep the scoring scale aligned with the real intraday Core gate:
@@ -3982,31 +4109,33 @@ def analyze_intraday(
         elif name == "ارتداد EMA20":
             components = {"touch": touch, "reclaim": reclaim, "candle": 100 if green else 0, "higher_tf": 100 if mstate == "داعم" else 0, "volume": clip((vr-0.9)/0.6*100)}
         elif name == "سحب سيولة":
-            components = {"sweep": sweep, "volume": clip((vr-0.9)/0.7*100), "candle": 100 if green else 0, "momentum": clip((mom-0.05)/0.25*100)}
+            components = {"sweep": sweep, "volume": clip((vr-0.85)/0.65*100), "candle": 100 if green else 0, "momentum": clip((mom-0.05)/0.25*100)}
         elif name == "سحب سيولة مع Displacement":
-            components = {"sweep": sweep, "displacement": disp, "volume": clip((vr-1.0)/0.75*100), "momentum": clip((mom-0.08)/0.25*100), "candle": 100 if green else 0}
+            components = {"sweep": sweep, "displacement": disp, "volume": clip((vr-0.90)/0.70*100), "momentum": clip((mom-0.08)/0.25*100), "candle": 100 if green else 0}
         elif name == "ضغط ثم انفجار":
-            components = {"match": match, "volume": clip((vr-1.2)/0.8*100), "candle": 100 if green else 0, "momentum": clip((mom-0.05)/0.25*100)}
+            components = {"match": match, "volume": clip((vr-1.10)/0.70*100), "candle": 100 if green else 0, "momentum": clip((mom-0.05)/0.25*100)}
         elif name == "استمرار الزخم":
-            components = {"momentum": clip((mom-0.08)/0.50*100), "volume": clip((vr-1.0)/0.75*100), "candle": 100 if green else 0, "higher_tf": 100 if mstate == "داعم" else 0}
+            components = {"momentum": clip((mom-0.05)/0.45*100), "volume": clip((vr-0.90)/0.70*100), "candle": 100 if green else 0, "higher_tf": 100 if mstate == "داعم" else 0}
         elif name == "علم صاعد":
-            components = {"impulse": impulse, "flag": flag, "candle": 100 if green else 0, "volume": clip((vr-0.9)/0.7*100)}
+            components = {"impulse": impulse, "flag": flag, "candle": 100 if green else 0, "volume": clip((vr-0.85)/0.65*100)}
         elif name == "استعادة مستوى":
-            components = {"match": match, "reclaim": reclaim, "candle": 100 if green else 0, "volume": clip((vr-0.9)/0.7*100)}
+            components = {"match": match, "reclaim": reclaim, "candle": 100 if green else 0, "volume": clip((vr-0.85)/0.65*100)}
         elif name == "دخول بعد Opening Drive":
-            components = {"drive": drive, "pullback": pull, "candle": 100 if green else 0, "volume": clip((vr-0.9)/0.7*100)}
+            components = {"drive": drive, "pullback": pull, "candle": 100 if green else 0, "volume": clip((vr-0.85)/0.65*100)}
         elif name in {"استعادة قمة اليوم"}:
-            components = {"match": match, "reclaim": reclaim, "candle": 100 if green else 0, "volume": clip((vr-0.9)/0.7*100)}
+            components = {"match": match, "reclaim": reclaim, "candle": 100 if green else 0, "volume": clip((vr-0.85)/0.65*100)}
         elif name == "استعادة بعد فشل ORB":
-            components = {"failed_reclaim": failed, "orb_quality": orbq, "reclaim": reclaim, "momentum": clip((mom-0.05)/0.25*100), "volume": clip((vr-0.9)/0.7*100)}
+            components = {"failed_reclaim": failed, "orb_quality": orbq, "reclaim": reclaim, "momentum": clip((mom-0.05)/0.25*100), "volume": clip((vr-0.85)/0.65*100)}
         elif name == "استمرار ABC":
-            components = {"a": a, "b": b, "c_break": cb, "momentum": clip((mom-0.05)/0.25*100), "volume": clip((vr-0.9)/0.7*100)}
+            components = {"a": a, "b": b, "c_break": cb, "momentum": clip((mom-0.05)/0.25*100), "volume": clip((vr-0.85)/0.65*100)}
         elif name == "استمرار/استعادة الفجوة":
-            components = {"gap_quality": gap, "gap_hold": hold, "gap_trigger": trigger, "volume": clip((vr-0.9)/0.7*100), "candle": 100 if green else 0}
+            components = {"gap_quality": gap, "gap_hold": hold, "gap_trigger": trigger, "volume": clip((vr-0.85)/0.65*100), "candle": 100 if green else 0}
         elif name == "استعادة بعد فشل كسر دعم":
-            components = {"support_quality": touches, "breakdown_quality": breakdown, "breakdown_reclaim": reclaim, "volume": clip((vr-0.9)/0.7*100), "candle": 100 if green else 0}
+            components = {"support_quality": touches, "breakdown_quality": breakdown, "breakdown_reclaim": reclaim, "volume": clip((vr-0.85)/0.65*100), "candle": 100 if green else 0}
         elif name == "ارتداد بعد تفوق نسبي":
-            components = {"rs_strength": rsq, "rs_pullback": pb, "rs_higher_low": hl, "rs_trigger": trig, "volume": clip((vr-0.9)/0.7*100), "candle": 100 if green else 0}
+            components = {"rs_strength": rsq, "rs_pullback": pb, "rs_higher_low": hl, "rs_trigger": trig, "volume": clip((vr-0.85)/0.65*100), "candle": 100 if green else 0}
+        elif name == "انطلاقة الزخم":
+            components = {"base_quality": clip(100.0 - float(c.get("momentum_base_range_pct", 3.0) or 3.0) / 3.0 * 100.0), "expansion_quality": clip(float(c.get("momentum_expansion_quality", 0.0) or 0.0)), "trigger_quality": clip(float(c.get("momentum_trigger_quality", 0.0) or 0.0)), "volume": clip((vr-0.9)/0.6*100), "candle": 100 if green else 0}
         else:  # دخول مبكر
             components = {"early_range": early_range, "near_resistance": near, "holding": holding, "momentum": clip((mom-0.05)/0.25*100), "candle": 100 if green else 0}
 
@@ -4032,6 +4161,7 @@ def analyze_intraday(
             "استمرار/استعادة الفجوة": {"gap_quality", "gap_hold", "gap_trigger"},
             "استعادة بعد فشل كسر دعم": {"support_quality", "breakdown_quality", "breakdown_reclaim"},
             "ارتداد بعد تفوق نسبي": {"rs_strength", "rs_pullback", "rs_higher_low", "rs_trigger"},
+            "انطلاقة الزخم": {"base_quality", "expansion_quality", "trigger_quality"},
             "دخول مبكر": {"early_range", "near_resistance", "holding"},
         }.get(name, set())
         all_weights = _strategy_weights_for(policy_for_strategy, name)
@@ -4223,6 +4353,7 @@ def analyze_intraday(
             "استمرار/استعادة الفجوة": {"gap_volume":.20,"gap_close_strength":.20,"gap_open_hold":.20,"gap_follow_through":.20,"gap_trend_alignment":.20},
             "استعادة بعد فشل كسر دعم": {"breakdown_recovery_speed":.20,"breakdown_reclaim_volume":.20,"breakdown_close_strength":.20,"breakdown_support_stability":.20,"breakdown_trend_alignment":.20},
             "ارتداد بعد تفوق نسبي": {"rs_persistence":.25,"rs_relative_volume":.20,"rs_recovery":.20,"rs_trigger_close":.20,"rs_trend_alignment":.15},
+            "انطلاقة الزخم": {"mi_volume_expansion":.25,"mi_close_strength":.20,"mi_follow_through":.20,"mi_base_stability":.20,"mi_extension_control":.15},
             "دخول مبكر": {"range_contraction":.30,"volume_stability":.20,"resistance_pressure":.20,"holding_quality":.20,"pressure_persistence":.10},
         }.get(name,{})
 
@@ -4378,6 +4509,11 @@ def analyze_intraday(
         vals["gap_volume"]=_relative_volume(2,5); vals["gap_close_strength"]=close_pos; vals["gap_open_hold"]=_level_stability(float(c.get("day_open",0.0) or 0.0),4); vals["gap_follow_through"]=_slope(2,5); vals["gap_trend_alignment"]=vals_trend_alignment
         vals["breakdown_recovery_speed"]=_clip(100.0-(max(1.0,float(c.get("failed_breakdown_bars",0) or 0))-1.0)/4.0*100.0) if float(c.get("failed_breakdown_bars",0) or 0) > 0 else 0.0; vals["breakdown_reclaim_volume"]=_relative_volume(2,5); vals["breakdown_close_strength"]=close_pos; vals["breakdown_support_stability"]=_level_stability(float(c.get("failed_breakdown_support",0.0) or 0.0),4); vals["breakdown_trend_alignment"]=vals_trend_alignment
         vals["rs_persistence"]=_clip(float(c.get("rs_persistence",0.0) or 0.0)); vals["rs_relative_volume"]=_relative_volume(2,5); vals["rs_recovery"]=_slope(2,5); vals["rs_trigger_close"]=close_pos; vals["rs_trend_alignment"]=vals_trend_alignment
+        vals["mi_volume_expansion"] = _relative_volume(1, 6)
+        vals["mi_close_strength"] = close_pos
+        vals["mi_follow_through"] = _slope(2, 5)
+        vals["mi_base_stability"] = _range_contraction(3, 5)
+        vals["mi_extension_control"] = _clip(100.0 - max(0.0, ((price_v - ema_level) / max(ema_level, 1e-9) * 100.0)) / 4.0 * 100.0) if ema_level > 0 else 0.0
 
         confirmation_score=sum(_clip(vals.get(k,0.0))*float(w) for k,w in confirmation_weights.items())
         confirmation_score=_clip(confirmation_score)
@@ -4499,6 +4635,7 @@ def analyze_intraday(
         "استمرار/استعادة الفجوة": 18,
         "استعادة بعد فشل كسر دعم": 17,
         "ارتداد بعد تفوق نسبي": 16,
+        "انطلاقة الزخم": 19,
         "علم صاعد": 12,
         "ضغط ثم انفجار": 11,
         "اختراق نطاق الافتتاح": 10,
@@ -4763,6 +4900,9 @@ def analyze_intraday(
     elif entry_type == "ارتداد بعد تفوق نسبي":
         reasons.append("ارتداد بعد تفوق نسبي مع قوة نسبية وبنية Higher Low")
         factors.append("rs_pullback")
+    elif entry_type == "انطلاقة الزخم":
+        reasons.append("انطلاقة زخم من قاعدة 5m ضيقة" if momentum_ignition_mode == "expansion" else "انطلاقة زخم ثم أول تراجع منظم")
+        factors.append("momentum_ignition")
     else:
         reasons.append("دخول مبكر فوق VWAP")
         factors.append("early")
@@ -4877,6 +5017,8 @@ def analyze_intraday(
         score = min(score, float(limits.get("استعادة بعد فشل كسر دعم", 98.0)))
     elif entry_type == "ارتداد بعد تفوق نسبي":
         score = min(score, float(limits.get("ارتداد بعد تفوق نسبي", 97.0)))
+    elif entry_type == "انطلاقة الزخم":
+        score = min(score, float(limits.get("انطلاقة الزخم", 96.0)))
     else:
         score = min(score, 80.0)
 
@@ -4908,7 +5050,9 @@ def analyze_intraday(
     if market_condition == "مختلط":
         mixed_market_ok = bool(
             raw_score >= 85
-            and trend_up and live_ok and above_vwap and above_open
+            and trend_up and live_ok
+            and (above_vwap if vwap_bounce else True)
+            and above_open
             and m15_state == "داعم" and vol_session_ratio >= 1.0
             and not dump and not chop and ext_tmp <= 4.0
         )
@@ -4918,7 +5062,17 @@ def analyze_intraday(
     if market_condition == "إيجابي_تحت_VWAP":
         positive_below_vwap_ok = bool(
             raw_score >= POSITIVE_BELOW_VWAP_MIN_SCORE
-            and trend_up and live_ok and above_vwap and above_open
+            and trend_up and live_ok
+            and (above_vwap if vwap_bounce else (
+                above_vwap or breakout_now or orb_breakout
+                or momentum_continuation or compression_expansion
+                or liquidity_sweep or liquidity_displacement
+                or bull_flag or resistance_reclaim
+                or opening_drive_pullback or hod_reclaim
+                or orb_failed_reclaim or abc_continuation or gap_setup
+                or failed_breakdown_reclaim or rs_pullback or momentum_ignition
+            ))
+            and above_open
             and m15_state != "معاكس"
             and vol_session_ratio >= 0.90
             and not dump and not chop and ext_tmp <= 4.5
@@ -5019,6 +5173,8 @@ def analyze_intraday(
         strategy_stop = drive_level * 0.997 if drive_level > 0 else recent_low * 0.997
     elif entry_type == "استعادة قمة اليوم":
         strategy_stop = float(prior["Low"].min()) * 0.997 if "prior" in locals() and len(prior) else (hod_level * 0.997 if hod_level > 0 else recent_low * 0.997)
+    elif entry_type == "انطلاقة الزخم":
+        strategy_stop = float(momentum_stop_low) * 0.997 if momentum_stop_low > 0 else float(_closed_quality_lows.tail(5).min()) * 0.997
     elif entry_type in {"ضغط ثم انفجار", "استمرار الزخم"}:
         strategy_stop = float(_closed_quality_lows.tail(5).min()) * 0.997
 
@@ -5520,13 +5676,49 @@ def _prefilter_intraday(
         # gates remain in analyze_intraday().
         _prev_close = float(m5["Close"].astype(float).iloc[-2]) if len(m5) >= 2 else price
         _gap_pct = (float(today["Open"].iloc[0]) - _prev_close) / max(_prev_close, 1e-9) * 100.0
-        _gap_proxy = bool(_gap_pct >= 2.0 and price >= float(today["Open"].iloc[0]) * 0.997)
+        _gap_proxy = bool(_gap_pct >= 1.25 and price >= float(today["Open"].iloc[0]) * 0.997)
         _support = float(today["Low"].astype(float).iloc[:-1].tail(10).min()) if len(today) >= 4 else 0.0
         _failed_breakdown_proxy = bool(_support > 0 and float(today["Close"].astype(float).iloc[-2]) <= _support * 0.998 and price >= _support * 1.001)
         _rs_proxy = bool(trend and mom >= 0.75 and price >= e20 * 0.995)
-        route_by_strategy["استمرار/استعادة الفجوة"] = (50 if _gap_proxy else 0) + min(20, max(0, _gap_pct - 2.0) * 10) + min(15, max(0, mom) * 3)
+        route_by_strategy["استمرار/استعادة الفجوة"] = (50 if _gap_proxy else 0) + min(20, max(0, _gap_pct - 1.25) * 10) + min(15, max(0, mom) * 3)
         route_by_strategy["استعادة بعد فشل كسر دعم"] = (50 if _failed_breakdown_proxy else 0) + (15 if trend else 0) + min(15, max(0, vol_ratio - 0.9) * 10)
         route_by_strategy["ارتداد بعد تفوق نسبي"] = (45 if _rs_proxy else 0) + min(25, max(0, mom) * 5) + (15 if above_vwap else 0)
+        _mi_route = 0.0
+        try:
+            _mi_closed = today.iloc[:_stage1_closed_pos + 1].copy()
+            if len(_mi_closed) >= 7:
+                _mb = _mi_closed.iloc[-6:-1]
+                _mh = _mi_closed["High"].astype(float); _ml = _mi_closed["Low"].astype(float)
+                _mc = _mi_closed["Close"].astype(float); _mo = _mi_closed["Open"].astype(float); _mv = _mi_closed["Volume"].astype(float).fillna(0.0)
+                _bh = float(_mb["High"].max()); _br = (_bh - float(_mb["Low"].min())) / max(float(_mc.iloc[-1]), 1e-9) * 100.0
+                _rng = max(float(_mh.iloc[-1] - _ml.iloc[-1]), 0.0); _med = float((_mh.iloc[-6:-1] - _ml.iloc[-6:-1]).median())
+                _body = abs(float(_mc.iloc[-1] - _mo.iloc[-1])) / max(_rng, 1e-9); _cp = (float(_mc.iloc[-1]) - float(_ml.iloc[-1])) / max(_rng, 1e-9)
+                _vbase = float(_mv.iloc[-6:-1].median()); _vr = float(_mv.iloc[-1]) / max(_vbase, 1e-9) if _vbase > 0 else 1.0
+                _mi_route = (35 if _br <= 3.0 else 0) + (30 if float(_mc.iloc[-1]) >= _bh * 1.001 else 0) + (20 if _body >= 0.50 and _cp >= 0.60 and _rng >= max(_med * 1.10, price * 0.004) else 0) + (15 if _vr >= 1.05 else 0)
+                # First-pullback lane: the expansion happened 2–3 completed bars
+                # ago and the current completed bar has reclaimed the base level.
+                for _ib in (3, 2):
+                    _ip = len(_mi_closed) - 1 - _ib
+                    _bs = _ip - 5
+                    if _bs < 0: continue
+                    _b2 = _mi_closed.iloc[_bs:_ip]
+                    _bh2 = float(_b2["High"].max()); _bl2 = float(_b2["Low"].min())
+                    _ih2 = float(_mi_closed["High"].astype(float).iloc[_ip]); _il2 = float(_mi_closed["Low"].astype(float).iloc[_ip])
+                    _io2 = float(_mi_closed["Open"].astype(float).iloc[_ip]); _ic2 = float(_mi_closed["Close"].astype(float).iloc[_ip])
+                    _ir2 = max(_ih2 - _il2, 1e-9); _ibody2 = abs(_ic2 - _io2) / _ir2; _icp2 = (_ic2 - _il2) / _ir2
+                    _med2 = float((_mi_closed["High"].astype(float).iloc[max(0,_ip-5):_ip] - _mi_closed["Low"].astype(float).iloc[max(0,_ip-5):_ip]).median())
+                    _vr2 = float(_mi_closed["Volume"].astype(float).iloc[_ip]) / max(float(_mi_closed["Volume"].astype(float).iloc[max(0,_ip-5):_ip].median()), 1e-9)
+                    _post2 = _mi_closed.iloc[_ip+1:]
+                    if len(_post2) < 1 or len(_post2) > 2: continue
+                    _pl2 = float(_post2["Low"].astype(float).min()); _cc2 = float(_mi_closed["Close"].astype(float).iloc[-1])
+                    _pd2 = min(100.0, max(0.0, (_ih2 - _pl2) / max(_ih2 - _bh2, _ih2 * 0.002, 1e-9) * 100.0))
+                    _valid_pb = (_bh2 - _bl2) / max(_cc2, 1e-9) * 100.0 <= 3.0 and _ic2 >= _bh2 * 1.001 and _ibody2 >= 0.50 and _icp2 >= 0.60 and _ir2 >= max(_med2 * 1.10, price * 0.004) and _vr2 >= 1.05 and _pd2 <= 60.0 and _pl2 >= _bh2 * 0.990 and _cc2 >= _bh2 * 0.998
+                    if _valid_pb:
+                        _mi_route = max(_mi_route, 90.0 + min(10.0, max(0.0, 60.0 - _pd2) / 6.0))
+                        break
+        except Exception:
+            _mi_route = 0.0
+        route_by_strategy["انطلاقة الزخم"] = _mi_route
 
         # General route score remains useful for overall ranking.
         route_score = max(route_by_strategy.values()) + (2.0 if trend else 0.0)
@@ -5764,21 +5956,42 @@ def scan_intraday(
         )
         for item in ranked_for_strategy[:PREFILTER_STRATEGY_TOP_K]:
             selected[item[2]] = item
-    # Protected strategy lanes: once a symbol enters the Top-K lane of any
-    # strategy, it remains in the Stage-2 candidate pool. The union is
-    # de-duplicated by symbol, so overlap never creates duplicate work.
-    # Do not re-rank this union back through the generic cap: doing so would
-    # silently evict some protected strategy lanes and defeat the purpose of
-    # strategy-aware routing. The absolute cap is therefore only a safety
-    # ceiling above the mathematically possible 50 + (len(ENTRY_TYPES)*4) unique names.
-    finalists = sorted(
+    # Protected strategy lanes: keep Stage 2 bounded to the existing Top-30
+    # budget, but guarantee one best Stage-1 candidate for every strategy that
+    # has a non-zero routing score. The old union-then-slice could evict a lane
+    # after it had been reserved. This is a pipeline fix only: no strategy gate
+    # or score is weakened.
+    _sorted_stage1 = sorted(
         selected.values(),
         key=lambda item: (float(item[0]), max(item[1].values()) if item[1] else 0.0),
         reverse=True,
-    )[:INTRADAY_LIVE_TOP_N]
+    )
+    _protected: dict[str, tuple] = {}
+    for et in ENTRY_TYPES:
+        _lane = max(
+            selected.values(),
+            key=lambda item: (float(item[1].get(et, 0.0)), float(item[0])),
+            default=None,
+        )
+        if _lane is not None and float(_lane[1].get(et, 0.0)) > 0.0:
+            _protected[str(_lane[2])] = _lane
+    _final_map: dict[str, tuple] = dict(_protected)
+    for _item in _sorted_stage1:
+        if len(_final_map) >= INTRADAY_LIVE_TOP_N:
+            break
+        _final_map.setdefault(str(_item[2]), _item)
+    finalists = sorted(
+        _final_map.values(),
+        key=lambda item: (float(item[0]), max(item[1].values()) if item[1] else 0.0),
+        reverse=True,
+    )
+    _protected_present = sum(
+        1 for et in ENTRY_TYPES
+        if any(float(x[1].get(et, 0.0)) > 0.0 for x in finalists)
+    )
     log.info(
-        "STAGE 2: top %d candidates selected; strategy-aware routing reserved lanes for %d strategies",
-        len(finalists), len(ENTRY_TYPES),
+        "STAGE 2: %d candidates selected; strategy coverage=%d/%d; Top-30 budget preserved",
+        len(finalists), _protected_present, len(ENTRY_TYPES),
     )
 
     # Dynamic Top-30: the current Stage-1 ranking decides which symbols receive

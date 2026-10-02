@@ -30,7 +30,7 @@ from stocks import MAX_AUTO_PRICE
 
 log = logging.getLogger("halal-bot.daily")
 
-DAILY_ANALYZER_VERSION = "20260923-FINAL-END-TO-END-AUDIT-V3"
+DAILY_ANALYZER_VERSION = "20261002-BALANCED-STRATEGIES-V3"
 log.info("DAILY ANALYZER VERSION | %s", DAILY_ANALYZER_VERSION)
 
 SKIP_OPEN_MIN = 0
@@ -1232,7 +1232,7 @@ SETUP_LIFECYCLE_RULES = {
     "استعادة بعد فشل ORB": ("ORB Break ثم Failure ثم Reclaim", "يُستهلك عند تسجيل الإشارة", "يتاح مجددًا بعد Failure جديد"),
     "استمرار ABC": ("A ثم B ثم C Break", "يُستهلك عند تسجيل الإشارة", "يتاح مجددًا بعد موجة ABC جديدة"),
     "سحب سيولة مع Displacement": ("Sweep ثم Reclaim ثم Displacement", "يُستهلك عند تسجيل الإشارة", "يتاح مجددًا بعد Sweep/Displacement جديد"),
-    "استمرار/استعادة الفجوة": ("Gap >=2% ثم Hold/Failure ثم Continuation أو Reclaim", "يُستهلك عند تسجيل الإشارة", "يتاح مجددًا مع فجوة جلسة جديدة"),
+    "استمرار/استعادة الفجوة": ("Gap >=1.5% ثم Hold/Failure ثم Continuation أو Reclaim", "يُستهلك عند تسجيل الإشارة", "يتاح مجددًا مع فجوة جلسة جديدة"),
     "استعادة بعد فشل كسر دعم": ("Support متعدد اللمس ثم Close دون الدعم ثم Reclaim", "يُستهلك عند تسجيل الإشارة", "يتاح مجددًا بعد تكوّن دعم جديد وفشل جديد"),
     "ارتداد بعد تفوق نسبي": ("تفوق مستمر مقابل SPY وQQQ ثم Pullback مضبوط ثم Trigger", "يُستهلك عند تسجيل الإشارة", "يتاح مجددًا بعد موجة تفوق جديدة"),
 }
@@ -2024,9 +2024,9 @@ def _breakout_quality(today_d: pd.DataFrame, level: float, price: float) -> tupl
         upper_wick = (h - max(o, c)) / rng
         prior_close = float(today_d["Close"].iloc[bar_idx - 1])
 
-        strong_close = c >= level * 1.001 and close_pos >= 0.70
-        body_ok = body >= 0.45
-        wick_ok = upper_wick <= 0.30
+        strong_close = c >= level * 1.001 and close_pos >= 0.65
+        body_ok = body >= 0.40
+        wick_ok = upper_wick <= 0.35
         follow = prior_close >= level * 0.997 or c >= prior_close * 1.002
         quality = (body * 0.4 + close_pos * 0.4 + (1 - min(upper_wick, 1)) * 0.2) * 100
         return bool(strong_close and body_ok and wick_ok and follow), float(quality)
@@ -2720,7 +2720,7 @@ def _detect_professional_new_setups(
         gap_pct = (session_open - prev_close) / prev_close * 100.0
         out["gap_pct"] = gap_pct
         # 17 — bullish Gap Continuation / Gap Reclaim.
-        if gap_pct >= 2.0:
+        if gap_pct >= 1.25:
             gap_abs = session_open - prev_close
             gap_mid = prev_close + gap_abs * 0.50
             out["gap_mid"] = gap_mid
@@ -2787,7 +2787,7 @@ def _detect_professional_new_setups(
             trigger = float(last["Close"]) >= pb_high * 1.001
             out.update(rs_reference_gain=ref_gain, rs_pullback_pct=pb_pct, rs_pullback_high=pb_high,
                        rs_higher_low=held_hl,
-                       rs_pullback=bool(ref_gain >= 1.0 and 0.0 < pb_pct <= 50.0 and held_hl and trigger))
+                       rs_pullback=bool(ref_gain >= 0.75 and 0.0 < pb_pct <= 60.0 and held_hl and trigger))
     except Exception as exc:
         log.warning("DAILY professional setup detection failed: %s", exc)
         return out
@@ -2939,13 +2939,13 @@ def analyze_daily(
     vwap_last_closed = float(vwap_closed_s.iloc[-1]) if len(vwap_closed_s) and pd.notna(vwap_closed_s.iloc[-1]) else vwap_last
     last_green = float(today_d["Close"].iloc[closed_idx]) >= float(today_d["Open"].iloc[closed_idx])
     mom = (price - float(c5.iloc[-6])) / float(c5.iloc[-6]) * 100 if len(c5) >= 6 else 0.0
-    live_ok = price >= e5 * 0.998 and above_vwap and (last_green or mom > 0.05) and r5 < 78
+    live_ok = price >= e5 * 0.998 and (last_green or mom > 0.05) and r5 < 78
+    # VWAP is strategy-specific: only VWAP Bounce requires VWAP in its own
+    # market permission gate; other structural setups are not globally blocked.
     # AUDIT ONLY: decompose the exact live gate without changing its logic.
     live_gate_reasons: list[str] = []
     if price < e5 * 0.998:
         live_gate_reasons.append("below_ema20_gate")
-    if not above_vwap:
-        live_gate_reasons.append("below_vwap_gate")
     if (not last_green) and mom <= 0.05:
         live_gate_reasons.append("last_candle_not_green")
         live_gate_reasons.append("momentum<=0.05")
@@ -2997,7 +2997,7 @@ def analyze_daily(
     retest_window = today_d.iloc[max(0, _closed_pos - 3):_closed_pos]
     retest_touch = bool(
         len(retest_window) > 0
-        and (retest_window["Low"].astype(float) <= level_high * 1.007).any()
+        and (retest_window["Low"].astype(float) <= level_high * 1.009).any()
         and (retest_window["High"].astype(float) >= level_high * 0.993).any()
     )
     near_level = retest_touch
@@ -3124,9 +3124,9 @@ def analyze_daily(
             resume_green = resume_close >= resume_open
             resume_above_pause = resume_close >= pause_close * 1.001
             momentum_continuation = bool(
-                impulse_gain >= 0.35
+                impulse_gain >= 0.30
                 and impulse_range_pct > 0
-                and pause_range_pct <= max(1.50, impulse_range_pct * 0.90)
+                and pause_range_pct <= max(1.50, impulse_range_pct * 0.95)
                 and pause_hold
                 and resume_green
                 and resume_above_pause
@@ -3149,8 +3149,8 @@ def analyze_daily(
             comp_width_pct = comp_range / max(price, 1e-9) * 100
             cur_body = abs(float(cur["Close"]) - float(cur["Open"]))
             cur_pos = (float(cur["Close"]) - float(cur["Low"])) / cur_range
-            expansion = cur_range >= max(med_range * 1.35, price * 0.003)
-            compression = comp_width_pct <= 2.2 and med_range > 0
+            expansion = cur_range >= max(med_range * 1.25, price * 0.0025)
+            compression = comp_width_pct <= 2.5 and med_range > 0
             comp_high = float(prev["High"].max()) if len(prev) else 0.0
             breakout_from_compression = bool(
                 comp_high > 0 and float(cur["Close"]) >= comp_high * 1.001
@@ -3161,8 +3161,8 @@ def analyze_daily(
             compression_expansion = bool(
                 compression and expansion and breakout_from_compression
                 and float(cur["Close"]) > float(cur["Open"])
-                and cur_pos >= 0.70
-                and cur_body / cur_range >= 0.45
+                and cur_pos >= 0.65
+                and cur_body / cur_range >= 0.40
             )
     except Exception:
         compression_expansion = False
@@ -3203,9 +3203,9 @@ def analyze_daily(
             impulse_range = max(impulse_high - float(impulse["Low"].min()), price * 0.001)
             flag_retrace = (impulse_high - flag_low) / impulse_range * 100
             flag_range = (flag_high - flag_low) / max(flag_high, 1e-9) * 100
-            flag_tight = flag_range <= 2.0 and flag_retrace <= 50.0
+            flag_tight = flag_range <= 2.5 and flag_retrace <= 55.0
             breakout_flag = closed_close >= flag_high * 1.001
-            bull_flag = bool(impulse_gain >= 1.0 and flag_tight and breakout_flag)
+            bull_flag = bool(impulse_gain >= 0.8 and flag_tight and breakout_flag)
     except Exception:
         bull_flag = False
 
@@ -3260,7 +3260,7 @@ def analyze_daily(
                 controlled_pullback = 0.50 <= pullback_from_high <= 8.0
                 not_chasing = ext_tmp <= 6.0
                 opening_drive_pullback = bool(
-                    len(later_bars) > 0 and drive_return >= 2.0
+                    len(later_bars) > 0 and drive_return >= 1.25
                     and controlled_pullback and reclaim_drive and not_chasing
                 )
     except Exception:
@@ -3343,8 +3343,8 @@ def analyze_daily(
             c_close = float(c["Close"].iloc[-1])
             c_break = c_close >= a_high * 1.001
             abc_continuation = bool(
-                a_gain >= 0.70
-                and 20.0 <= b_retrace <= 65.0
+                a_gain >= 0.50
+                and 15.0 <= b_retrace <= 70.0
                 and c_break and price >= a_high * 0.999
                 and c_last_green
             )
@@ -3393,7 +3393,7 @@ def analyze_daily(
             rs_vs_spy, rs_vs_qqq, rs_persistence, _rs_stock_return, _rs_valid = _aligned_relative_strength_metrics(
                 new_setup_df, spy60, qqq60, lookback=3, persistence_bars=3
             )
-            rs_strategy_ok = bool(_rs_valid and rs_vs_spy >= 1.0 and rs_vs_qqq >= 1.0 and rs_persistence >= 60.0)
+            rs_strategy_ok = bool(_rs_valid and rs_vs_spy >= 0.75 and rs_vs_qqq >= 0.75 and rs_persistence >= 50.0)
         except Exception as exc:
             log.debug("DAILY RS strategy benchmark fallback: %s", exc)
     rs_pullback=bool(rs_pullback and rs_strategy_ok)
@@ -3634,7 +3634,7 @@ def analyze_daily(
             if name == "سحب سيولة":
                 common(mom_min=0.05, vol_min=1.0, opening=False, ext_max=None)
             elif name == "سحب سيولة مع Displacement":
-                common(mom_min=0.08, vol_min=1.25, opening=True, ext_max=6.0 if "h4_state" in c else 3.5)
+                common(mom_min=0.06, vol_min=1.10, opening=True, ext_max=6.0 if "h4_state" in c else 3.5)
             elif name == "ضغط ثم انفجار":
                 common(mom_min=0.05, vol_min=1.20, opening=True, ext_max=4.0 if "m15_state" in c else 6.0)
             elif name == "استمرار الزخم":
@@ -3657,7 +3657,7 @@ def analyze_daily(
             elif name == "استمرار ABC":
                 common(mom_min=0.05, vol_min=1.05, opening=True, ext_max=3.5 if "m15_state" in c else 6.0)
             elif name == "استمرار/استعادة الفجوة":
-                add("الفجوة أقل من 2.00%", float(v("gap_pct",0.0) or 0.0) >= 2.0)
+                add("الفجوة أقل من 1.25%", float(v("gap_pct",0.0) or 0.0) >= 1.25)
                 add("لم يكتمل Hold/Failure للفجوة", bool(v("gap_setup",False)))
                 common(mom_min=0.03, vol_min=0.90, opening=False, ext_max=6.0 if "m15_state" not in c else 4.5)
             elif name == "استعادة بعد فشل كسر دعم":
@@ -3667,9 +3667,9 @@ def analyze_daily(
                 add("لم تتم استعادة الدعم", bool(v("failed_breakdown_reclaim",False)))
                 common(mom_min=0.03, vol_min=0.90, opening=False, ext_max=6.0 if "m15_state" not in c else 4.5)
             elif name == "ارتداد بعد تفوق نسبي":
-                add("التفوق مقابل SPY أقل من 1.00%", float(v("rs_vs_spy",0.0) or 0.0) >= 1.0)
-                add("التفوق مقابل QQQ أقل من 1.00%", float(v("rs_vs_qqq",0.0) or 0.0) >= 1.0)
-                add("استمرارية التفوق أقل من 60%", float(v("rs_persistence",0.0) or 0.0) >= 60.0)
+                add("التفوق مقابل SPY أقل من 0.75%", float(v("rs_vs_spy",0.0) or 0.0) >= 0.75)
+                add("التفوق مقابل QQQ أقل من 0.75%", float(v("rs_vs_qqq",0.0) or 0.0) >= 0.75)
+                add("استمرارية التفوق أقل من 50%", float(v("rs_persistence",0.0) or 0.0) >= 50.0)
                 add("Pullback أكبر من 50%", 0.0 < float(v("rs_pullback_pct",99.0) or 99.0) <= 50.0)
                 add("لم يحافظ Pullback على Higher Low", bool(v("rs_higher_low",False)))
                 add("لم يحدث Trigger", bool(v("rs_pullback",False)))
@@ -3795,7 +3795,7 @@ def analyze_daily(
             q = 0.60*match + 0.40*reclaim
             components = {"match": match, "reclaim": reclaim}
         elif name == "دخول بعد Opening Drive":
-            drive = clip((float(c.get("drive_return",0.0) or 0.0)-2.0)/2.0*100)
+            drive = clip((float(c.get("drive_return",0.0) or 0.0)-1.25)/1.75*100)
             pb = float(c.get("pullback_from_high", 99.0) or 99.0)
             pull = clip((8.0-abs(pb-2.0))/7.5*100)
             q = 0.60*drive + 0.40*pull
@@ -3844,14 +3844,14 @@ def analyze_daily(
             q = 0.30*a + 0.30*b + 0.40*cb
             components = {"a": a, "b": b, "c_break": cb}
         elif name == "استمرار/استعادة الفجوة":
-            gap = clip((float(c.get("gap_pct",0.0) or 0.0)-2.0)/3.0*100); hold = 100.0 if str(c.get("gap_mode","") or "") in {"continuation","reclaim"} else 0.0; trigger = 100.0 if c.get("gap_setup",False) else 0.0
+            gap = clip((float(c.get("gap_pct",0.0) or 0.0)-1.25)/3.0*100); hold = 100.0 if str(c.get("gap_mode","") or "") in {"continuation","reclaim"} else 0.0; trigger = 100.0 if c.get("gap_setup",False) else 0.0
             q=0.35*gap+0.25*hold+0.40*trigger; components={"gap_quality":gap,"gap_hold":hold,"gap_trigger":trigger}
         elif name == "استعادة بعد فشل كسر دعم":
             touches_n=int(c.get("failed_breakdown_touches",0) or 0); touches=clip(50.0 + (touches_n-2.0)/3.0*50.0) if touches_n >= 2 else 0.0
             depth=float(c.get("failed_breakdown_depth_atr",0.0) or 0.0); breakdown=clip((2.0-depth)/1.8*100.0) if depth > 0 else 0.0; reclaim=100.0 if c.get("failed_breakdown_reclaim",False) else 0.0
             q=0.25*touches+0.35*breakdown+0.40*reclaim; components={"support_quality":touches,"breakdown_quality":breakdown,"breakdown_reclaim":reclaim}
         elif name == "ارتداد بعد تفوق نسبي":
-            rsq=clip((min(float(c.get("rs_vs_spy",0.0) or 0.0),float(c.get("rs_vs_qqq",0.0) or 0.0))-1.0)/2.0*100); pb=clip((50.0-float(c.get("rs_pullback_pct",50.0) or 50.0))/50.0*100); hl=100.0 if c.get("rs_higher_low",False) else 0.0; trig=100.0 if c.get("rs_pullback",False) else 0.0
+            rsq=clip((min(float(c.get("rs_vs_spy",0.0) or 0.0),float(c.get("rs_vs_qqq",0.0) or 0.0))-0.75)/1.75*100); pb=clip((50.0-float(c.get("rs_pullback_pct",50.0) or 50.0))/50.0*100); hl=100.0 if c.get("rs_higher_low",False) else 0.0; trig=100.0 if c.get("rs_pullback",False) else 0.0
             q=0.30*rsq+0.25*pb+0.20*hl+0.25*trig; components={"rs_strength":rsq,"rs_pullback":pb,"rs_higher_low":hl,"rs_trigger":trig}
 
         else:  # دخول مبكر
@@ -4706,7 +4706,7 @@ def analyze_daily(
         and market_ok
         and trend_up
         and live_ok
-        and above_vwap
+        and (above_vwap if entry_type == "ارتداد VWAP" else True)
         and above_open
         and h4_state != "معاكس"
         and vol_ratio >= 0.95
@@ -4720,7 +4720,7 @@ def analyze_daily(
         and market_ok
         and trend_up
         and live_ok
-        and above_vwap
+        and (above_vwap if entry_type == "ارتداد VWAP" else True)
         and above_open
         and h4_state != "معاكس"
         and vol_ratio >= 1.0
@@ -5224,17 +5224,17 @@ def _daily_strategy_route_scores(*, price: float, trend: bool, above_vwap: bool,
     scores["استمرار ABC"]=(40 if abc else 0)+(20 if trend else 0)+min(15,max(0,mom)*3)
     scores["سحب سيولة مع Displacement"]=(45 if sweep and mom>0.5 else 0)+(20 if vol_ratio>=1.2 else 0)+(10 if trend else 0)
     gap_pct=((float(op.iloc[-1])-prev_close)/max(prev_close,1e-9))*100 if prev_close else 0.0
-    gap_proxy=gap_pct>=2.0 and price>=float(op.iloc[-1])*0.997
+    gap_proxy=gap_pct>=1.25 and price>=float(op.iloc[-1])*0.997
     failed_breakdown_proxy=bool(recent_low>0 and prev_close<=recent_low*0.998 and price>=recent_low*1.001)
     rs_proxy=bool(trend and mom>=0.75 and pullback)
-    scores["استمرار/استعادة الفجوة"]=(50 if gap_proxy else 0)+min(20,max(0,gap_pct-2.0)*10)+min(15,max(0,mom)*3)
+    scores["استمرار/استعادة الفجوة"]=(50 if gap_proxy else 0)+min(20,max(0,gap_pct-1.25)*10)+min(15,max(0,mom)*3)
     scores["استعادة بعد فشل كسر دعم"]=(50 if failed_breakdown_proxy else 0)+(15 if trend else 0)+min(15,max(0,vol_ratio-0.9)*10)
     scores["ارتداد بعد تفوق نسبي"]=(45 if rs_proxy else 0)+min(25,max(0,mom)*5)+(15 if above_vwap else 0)
     return {k:round(float(v),2) for k,v in scores.items()}
 
 
 def _prefilter_daily(symbol: str, audit_counts: dict[str, int] | None = None, audit_lock: Lock | None = None,
-                     data_audit_counts: dict[str, int] | None = None) -> tuple[float, dict[str, float], pd.DataFrame, pd.DataFrame] | None:
+                     data_audit_counts: dict[str, int] | None = None) -> tuple[float, dict[str, float], pd.DataFrame, pd.DataFrame, float] | None:
     """Stage 1: weekly + daily routing for the full universe."""
     def _audit_stage1(reason: str) -> None:
         if audit_counts is None:
@@ -5319,7 +5319,7 @@ def _prefilter_daily(symbol: str, audit_counts: dict[str, int] | None = None, au
 
 
 def _prefilter_daily_from_frames(symbol: str, weekly: pd.DataFrame, daily: pd.DataFrame, audit_counts: dict[str, int] | None = None, audit_lock: Lock | None = None,
-                                   data_audit_counts: dict[str, int] | None = None) -> tuple[float, dict[str, float], pd.DataFrame, pd.DataFrame] | None:
+                                   data_audit_counts: dict[str, int] | None = None) -> tuple[float, dict[str, float], pd.DataFrame, pd.DataFrame, float] | None:
     def _audit_stage1(reason: str) -> None:
         if audit_counts is None:
             return

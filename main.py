@@ -876,9 +876,11 @@ async def live_scan_job(context: ContextTypes.DEFAULT_TYPE) -> None:
         already = set(state["sent"])
         if len(already) >= DAILY_MAX:
             return
-        elapsed = minutes_since_last_alert(state)
-        if elapsed is not None and elapsed < ALERT_EVERY_MINUTES:
-            return
+        # IMPORTANT: scan cadence and alert cadence are independent.
+        # The scanner must continue evaluating the market every scheduled cycle;
+        # ALERT_EVERY_MINUTES only suppresses Telegram delivery after a prior alert.
+        # Keeping this cooldown before scan_symbols() silently stopped Daily scans
+        # for the whole cooldown window.
 
         # Daily V2 API: (symbols, names, min_score, limit).
         # Keep the automatic path aligned with the manual /scan command.
@@ -895,6 +897,16 @@ async def live_scan_job(context: ContextTypes.DEFAULT_TYPE) -> None:
             if s.symbol not in already and not COOL.is_blocked(s.symbol)
         ]
         if not fresh:
+            return
+
+        # Alert cooldown is checked only AFTER a complete scan. This preserves
+        # the configured alert spacing without stopping market evaluation.
+        elapsed = minutes_since_last_alert(state)
+        if elapsed is not None and elapsed < ALERT_EVERY_MINUTES:
+            log.info(
+                "DAILY ALERT COOLDOWN | scan_completed=true | remaining=%.1fm",
+                max(0.0, ALERT_EVERY_MINUTES - elapsed),
+            )
             return
 
         sig = fresh[0]
@@ -982,9 +994,9 @@ async def live_scan_intraday_job(context: ContextTypes.DEFAULT_TYPE) -> None:
         sent_i = list(state.get("sent_intraday") or [])
         if len(sent_i) >= INTRADAY_MAX:
             return
-        elapsed = minutes_since_last_intraday(state)
-        if elapsed is not None and elapsed < INTRADAY_EVERY_MINUTES:
-            return
+        # IMPORTANT: scan cadence and alert cadence are independent.
+        # INTRADAY_EVERY_MINUTES limits Telegram alerts only; it must never block
+        # scan_intraday() itself.
 
         hits = await asyncio.to_thread(
             scan_intraday,
@@ -1003,7 +1015,16 @@ async def live_scan_intraday_job(context: ContextTypes.DEFAULT_TYPE) -> None:
         if not fresh:
             return
 
-        # scan_intraday رتّب جميع الاستراتيجيات الـ19 بالفعل؛ نحافظ على ترتيبه
+        # Alert cooldown is checked only AFTER a complete scan.
+        elapsed = minutes_since_last_intraday(state)
+        if elapsed is not None and elapsed < INTRADAY_EVERY_MINUTES:
+            log.info(
+                "INTRADAY ALERT COOLDOWN | scan_completed=true | remaining=%.1fm",
+                max(0.0, INTRADAY_EVERY_MINUTES - elapsed),
+            )
+            return
+
+        # scan_intraday رتّب جميع الاستراتيجيات الـ20 بالفعل؛ نحافظ على ترتيبه
         # ولا نفرض أولوية يدوية على 3 استراتيجيات فقط هنا.
         sig = fresh[0]
         # لا نسجل الإشارة كـ"مُرسلة" قبل نجاح Telegram فعلياً.
@@ -1026,7 +1047,8 @@ async def live_scan_intraday_job(context: ContextTypes.DEFAULT_TYPE) -> None:
             f"{market_label} | نظام السوق\n"
             f"النوع: لحظي (ساعة + 5د)\n"
             f"{getattr(sig, 'entry_emoji', '🟢')} {getattr(sig, 'entry_type', 'دخول')}\n"
-            f"فاصل {INTRADAY_EVERY_MINUTES} د | يفضّل الخروج قبل الإغلاق"
+            + (f"نوع الدخول: {getattr(sig, 'strategy_trigger_detail', '')}\n" if getattr(sig, 'strategy_trigger_detail', '') else "")
+            + f"فاصل {INTRADAY_EVERY_MINUTES} د | يفضّل الخروج قبل الإغلاق"
         )
         body = format_intraday_ar(sig, INTRADAY_MIN_SCORE)
         delivered = False
