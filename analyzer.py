@@ -30,7 +30,7 @@ from stocks import MAX_AUTO_PRICE
 
 log = logging.getLogger("halal-bot.daily")
 
-DAILY_ANALYZER_VERSION = "20261002-BALANCED-STRATEGIES-V2"
+DAILY_ANALYZER_VERSION = "20261002-BALANCED-STRATEGIES-V3-CUMULATIVE-STRATEGY-AUDIT"
 log.info("DAILY ANALYZER VERSION | %s", DAILY_ANALYZER_VERSION)
 
 SKIP_OPEN_MIN = 0
@@ -178,26 +178,40 @@ def _commit_daily_audit(*, stage1_counts=None, stage1_passed=0, stage1_rejected=
             dst = strat.setdefault("blockers", {}).setdefault(strategy, {})
             for reason, count in reasons.items():
                 _daily_bump(dst, reason, count)
-        # STRATEGY_AUDIT_V1: diagnostic only. Every strategy and every blocker has its own counter.
+        # STRATEGY_AUDIT_V1: diagnostic only. Persist every per-symbol/per-strategy
+        # evaluation cumulatively; these counters never participate in trading.
         for _et, _detail in (strategy_audit or {}).items():
             _name = str(_et)
-            if bool(_detail.get("matched")):
-                if bool(_detail.get("primary")):
-                    _daily_bump(strat.setdefault("primary_selected", {}), _name)
-                else:
-                    _daily_bump(strat.setdefault("not_primary", {}), _name)
-                _weak = _detail.get("weak_confirmation_component")
-                if _weak:
-                    _daily_bump(strat.setdefault("confirmation_weakest", {}).setdefault(_name, {}), str(_weak))
-            else:
-                # matched/failed totals are already supplied by the existing daily
-                # strategy audit path; only exact blockers are new here.
-                _blockers = list(_detail.get("core_blockers") or []) or ["core_unexplained"]
-                for _reason in _blockers:
-                    _daily_bump(strat.setdefault("blockers", {}).setdefault(_name, {}), str(_reason))
-            for _gate, _reasons in (_detail.get("pipeline_rejects") or {}).items():
-                for _reason in (_reasons or [str(_gate)]):
-                    _daily_bump(strat.setdefault("pipeline_rejects", {}).setdefault(_name, {}).setdefault(str(_gate), {}), str(_reason))
+            _matched_n = int(_detail.get("matched_count", 0) or 0)
+            _failed_n = int(_detail.get("failed_count", 0) or 0)
+            if _matched_n:
+                _daily_bump(strat.setdefault("matched", {}), _name, _matched_n)
+            if _failed_n:
+                _daily_bump(strat.setdefault("failed", {}), _name, _failed_n)
+            _primary_n = int(_detail.get("primary_count", 0) or 0)
+            _not_primary_n = int(_detail.get("not_primary_count", 0) or 0)
+            if _primary_n:
+                _daily_bump(strat.setdefault("primary_selected", {}), _name, _primary_n)
+            if _not_primary_n:
+                _daily_bump(strat.setdefault("not_primary", {}), _name, _not_primary_n)
+            for _weak, _count in (_detail.get("confirmation_weakest", {}) or {}).items():
+                _daily_bump(
+                    strat.setdefault("confirmation_weakest", {}).setdefault(_name, {}),
+                    str(_weak), int(_count or 0)
+                )
+            for _reason, _count in (_detail.get("blockers", {}) or {}).items():
+                _daily_bump(
+                    strat.setdefault("blockers", {}).setdefault(_name, {}),
+                    str(_reason), int(_count or 0)
+                )
+            for _gate, _reasons in (_detail.get("pipeline_rejects", {}) or {}).items():
+                for _reason, _count in (_reasons or {}).items():
+                    _daily_bump(
+                        strat.setdefault("pipeline_rejects", {})
+                        .setdefault(_name, {})
+                        .setdefault(str(_gate), {}),
+                        str(_reason), int(_count or 0)
+                    )
         _save_daily_audit(data)
         return data
 
@@ -5618,20 +5632,45 @@ def scan_daily(
     stage2_gate_diag: dict[str, dict[str, int]] = {} 
     data_stage2_audit: dict[str, int] = {}
     strategy_audit_cycle: dict[str, dict] = {}
-    strategy_matched: dict[str, int] = {}
-    strategy_failed: dict[str, int] = {}
-    strategy_blockers: dict[str, dict[str, int]] = {}
     def _stage2_reason(gate: str, reason: str, diagnostic: bool = False) -> None:
         target = stage2_gate_diag if diagnostic else stage2_gate_reasons
         _daily_bump(target.setdefault(gate, {}), reason)
-    def _strategy_audit_from_signal(sig) -> None:
-        matched = set(getattr(sig, "matched_entry_types", []) or [])
-        scores_map = dict(getattr(sig, "strategy_scores", {}) or {})
-        for _et in ENTRY_TYPES:
-            if _et in matched:
-                _daily_bump(strategy_matched, _et)
+
+    def _merge_strategy_audit(_payload: dict[str, dict], _gate: str | None = None,
+                              _reasons: list[str] | None = None) -> None:
+        """Accumulate every symbol/strategy evaluation in this scan. Diagnostic only."""
+        for _et, _detail in (_payload or {}).items():
+            _name = str(_et)
+            _dst = strategy_audit_cycle.setdefault(_name, {
+                "matched_count": 0,
+                "failed_count": 0,
+                "primary_count": 0,
+                "not_primary_count": 0,
+                "blockers": {},
+                "confirmation_weakest": {},
+                "pipeline_rejects": {},
+            })
+            if bool(_detail.get("matched")):
+                _dst["matched_count"] += 1
+                if bool(_detail.get("primary")):
+                    _dst["primary_count"] += 1
+                else:
+                    _dst["not_primary_count"] += 1
+                _weak = _detail.get("weak_confirmation_component")
+                if _weak:
+                    _daily_bump(_dst.setdefault("confirmation_weakest", {}), str(_weak))
             else:
-                _daily_bump(strategy_failed, _et)
+                _dst["failed_count"] += 1
+                for _reason in (list(_detail.get("core_blockers") or []) or ["core_unexplained"]):
+                    _daily_bump(_dst.setdefault("blockers", {}), str(_reason))
+            if _gate and _detail.get("primary"):
+                for _reason in (_reasons or [_gate]):
+                    if str(_reason):
+                        _daily_bump(
+                            _dst.setdefault("pipeline_rejects", {})
+                            .setdefault(str(_gate), {}),
+                            str(_reason),
+                        )
     def one(item):
         _,_,sym,weekly,daily,vol_ratio=item
         try:
@@ -5677,7 +5716,6 @@ def scan_daily(
             _strategy_payload = _daily_strategy_audit_pop(_stage2_symbol)
             _merge_strategy_audit(_strategy_payload)
             stage2_scores.append((str(getattr(sig, "symbol", "?")), float(getattr(sig, "score", 0) or 0)))
-            _strategy_audit_from_signal(sig)
             raw_score = float(getattr(sig, "raw_score", sig.score) or 0.0)
             if raw_score < min_score:
                 stage2_rejects["score"] += 1
@@ -5792,9 +5830,6 @@ def scan_daily(
         stage2_gate_diag=stage2_gate_diag,
         data_stage1=stage1_data_audit_counts,
         data_stage2=data_stage2_audit,
-        strategy_matched=strategy_matched,
-        strategy_failed=strategy_failed,
-        strategy_blockers=strategy_blockers,
         strategy_audit=strategy_audit_cycle,
     )
     top_stage1 = sorted(cumulative_audit.get("stage1", {}).get("reasons", {}).items(), key=lambda x: x[1], reverse=True)[:8]
@@ -5803,7 +5838,8 @@ def scan_daily(
     _strat_failed_top = sorted((_strat.get("failed", {}) or {}).items(), key=lambda x: x[1], reverse=True)[:20]
     _strat_blocker_top = {k: sorted((v or {}).items(), key=lambda x: x[1], reverse=True)[:3] for k, v in (_strat.get("blockers", {}) or {}).items()}
     _weak_top = {k: sorted((v or {}).items(), key=lambda x: x[1], reverse=True)[:3] for k, v in (_strat.get("confirmation_weakest", {}) or {}).items()}
-    log.info("DAILY STRATEGY AUDIT CUMULATIVE | scans=%d | failed=%s | blockers_top=%s | weakest_confirmation=%s", cumulative_audit.get("scans", 0), _strat_failed_top, _strat_blocker_top, _weak_top)
+    _strat_matched_top = sorted((_strat.get("matched", {}) or {}).items(), key=lambda x: x[1], reverse=True)[:20]
+    log.info("DAILY STRATEGY AUDIT CUMULATIVE | scans=%d | matched=%s | failed=%s | blockers_top=%s | weakest_confirmation=%s", cumulative_audit.get("scans", 0), _strat_matched_top, _strat_failed_top, _strat_blocker_top, _weak_top)
     log.info("DAILY AUDIT CUMULATIVE | scans=%d | stage1_top=%s | stage2_top=%s", cumulative_audit.get("scans", 0), top_stage1, top_stage2)
 
     # Score distribution diagnostics only. These values are observational and
