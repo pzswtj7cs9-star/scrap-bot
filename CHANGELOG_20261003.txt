@@ -1,0 +1,9 @@
+SCRAP BOT ANALYZERS CLEAN FINAL — 2026-10-03
+
+1) Fixed Intraday Stage-2 UnboundLocalError: vwap_bounce was referenced by market gates before assignment. The exact existing VWAP formula was moved earlier; no threshold/formula change.
+2) Kept existing independent persistent audit files:
+   Daily: /var/data/daily_audit_counters.json
+   Intraday: /var/data/intraday_audit_counters.json
+3) Added one-time clean audit session marker: 20261003-CLEAN. Old counters are ignored once when this version first loads them; subsequent restarts continue the same session.
+4) No strategy, Score, VWAP formula, Gate, Risk, TP, Stop, or Final Execution logic was loosened/tightened.
+5) py_compile PASS for both analyzers.

@@ -31,7 +31,7 @@ from stocks import MAX_AUTO_PRICE
 log = logging.getLogger(__name__)
 
 # Deployment marker: proves which analyzer_intraday build Render actually loaded.
-INTRADAY_ANALYZER_VERSION = "20261002-CUMULATIVE-STRATEGY-AUDIT-V2"
+INTRADAY_ANALYZER_VERSION = "20261002-INTRADAY-STRATEGY20-MOMENTUM-IGNITION-V2-BALANCED"
 log.info("INTRADAY ANALYZER VERSION | %s", INTRADAY_ANALYZER_VERSION)
 
 SKIP_OPEN_MIN = 20
@@ -70,6 +70,7 @@ LEARNING_ALERT_FILE = Path("/var/data/intraday_learning_alert.json")
 
 # Diagnostic-only cumulative audit. Never participates in trading decisions.
 INTRADAY_AUDIT_FILE = Path("/var/data/intraday_audit_counters.json")
+INTRADAY_AUDIT_SESSION = "20261003-CLEAN"
 _AUDIT_LOCK = Lock()
 # Runtime-only bridge: analyze_intraday() records exact zero-match blockers so
 # scan_intraday() can persist them in the cumulative audit. Diagnostic only.
@@ -380,7 +381,7 @@ def _intraday_data_audit_pop(symbol: str) -> dict[str, int]:
 
 
 def _new_intraday_audit() -> dict:
-    return {"schema_version": 2, "updated_at": None, "scans": 0,
+    return {"schema_version": 2, "session_id": INTRADAY_AUDIT_SESSION, "updated_at": None, "scans": 0,
             "stage1": {"passed": 0, "rejected": 0, "reasons": {}},
             "stage2": {"deep_candidates": 0, "qualified": 0, "gates": {},
                         "reason_counts_by_gate": {},
@@ -402,6 +403,9 @@ def _load_intraday_audit() -> dict:
         if not INTRADAY_AUDIT_FILE.exists(): return base
         raw = json.loads(INTRADAY_AUDIT_FILE.read_text(encoding="utf-8"))
         if not isinstance(raw, dict): return base
+        if raw.get("session_id") != INTRADAY_AUDIT_SESSION:
+            log.info("INTRADAY AUDIT CLEAN SESSION RESET | old_session=%s | new_session=%s", raw.get("session_id"), INTRADAY_AUDIT_SESSION)
+            return base
         for key, value in raw.items():
             if key in base and isinstance(base[key], dict) and isinstance(value, dict):
                 base[key].update(value)
@@ -456,40 +460,27 @@ def _commit_intraday_audit(*, stage1_counts=None, stage1_passed=0, stage1_reject
             if ":" in str(reason):
                 tf, subreason = str(reason).split(":", 1)
                 _bump_reason(data_audit.setdefault("timeframes", {}).setdefault(tf, {}), subreason, count)
-        # STRATEGY_AUDIT_V1: diagnostic only. Persist every per-symbol/per-strategy
-        # evaluation cumulatively; these counters never participate in trading.
+        # STRATEGY_AUDIT_V1: diagnostic only. Every strategy and every blocker has its own counter.
+        strat = data.setdefault("strategy", {})
         for _et, _detail in (strategy_audit or {}).items():
             _name = str(_et)
-            _matched_n = int(_detail.get("matched_count", 0) or 0)
-            _failed_n = int(_detail.get("failed_count", 0) or 0)
-            if _matched_n:
-                _bump_reason(strat.setdefault("matched", {}), _name, _matched_n)
-            if _failed_n:
-                _bump_reason(strat.setdefault("failed", {}), _name, _failed_n)
-            _primary_n = int(_detail.get("primary_count", 0) or 0)
-            _not_primary_n = int(_detail.get("not_primary_count", 0) or 0)
-            if _primary_n:
-                _bump_reason(strat.setdefault("primary_selected", {}), _name, _primary_n)
-            if _not_primary_n:
-                _bump_reason(strat.setdefault("not_primary", {}), _name, _not_primary_n)
-            for _weak, _count in (_detail.get("confirmation_weakest", {}) or {}).items():
-                _bump_reason(
-                    strat.setdefault("confirmation_weakest", {}).setdefault(_name, {}),
-                    str(_weak), int(_count or 0)
-                )
-            for _reason, _count in (_detail.get("blockers", {}) or {}).items():
-                _bump_reason(
-                    strat.setdefault("blockers", {}).setdefault(_name, {}),
-                    str(_reason), int(_count or 0)
-                )
-            for _gate, _reasons in (_detail.get("pipeline_rejects", {}) or {}).items():
-                for _reason, _count in (_reasons or {}).items():
-                    _bump_reason(
-                        strat.setdefault("pipeline_rejects", {})
-                        .setdefault(_name, {})
-                        .setdefault(str(_gate), {}),
-                        str(_reason), int(_count or 0)
-                    )
+            if bool(_detail.get("matched")):
+                _bump_reason(strat.setdefault("matched", {}), _name)
+                if bool(_detail.get("primary")):
+                    _bump_reason(strat.setdefault("primary_selected", {}), _name)
+                else:
+                    _bump_reason(strat.setdefault("not_primary", {}), _name)
+                _weak = _detail.get("weak_confirmation_component")
+                if _weak:
+                    _bump_reason(strat.setdefault("confirmation_weakest", {}).setdefault(_name, {}), str(_weak))
+            else:
+                _bump_reason(strat.setdefault("failed", {}), _name)
+                _blockers = list(_detail.get("core_blockers") or []) or ["core_unexplained"]
+                for _reason in _blockers:
+                    _bump_reason(strat.setdefault("blockers", {}).setdefault(_name, {}), str(_reason))
+            for _gate, _reasons in (_detail.get("pipeline_rejects") or {}).items():
+                for _reason in (_reasons or [str(_gate)]):
+                    _bump_reason(strat.setdefault("pipeline_rejects", {}).setdefault(_name, {}).setdefault(str(_gate), {}), str(_reason))
         _save_intraday_audit(data)
         return data
 
@@ -3188,6 +3179,19 @@ def analyze_intraday(
     near_level = retest_touch
     ext_tmp = (price - e20) / e20 * 100 if e20 else 0.0
 
+    # Define VWAP setup before any market gate references vwap_bounce.
+    # This prevents Stage-2 UnboundLocalError while preserving the exact VWAP formula.
+    closed_close = float(today_5["Close"].iloc[closed_idx])
+    recent4 = today_5.iloc[max(0, _closed_pos - 4):_closed_pos]
+    vwap_touch = False
+    try:
+        rh = recent4["High"].astype(float)
+        rl = recent4["Low"].astype(float)
+        vwap_touch = bool(((rl <= vwap_last_closed * 1.006) & (rh >= vwap_last_closed * 0.994)).any())
+    except Exception:
+        vwap_touch = False
+    vwap_bounce = bool(vwap_touch and closed_close >= vwap_last_closed * 1.001)
+
     market_rel_spy = market_rel_qqq = market_rel_avg = 0.0
     stock_relative_strength = 0.0
     relative_strength_ok = False
@@ -3263,21 +3267,8 @@ def analyze_intraday(
 
     # Strategy Core: structural setup only. Generic confirmations are evaluated
     # separately below and contribute to Strategy Score instead of preventing a match.
-    # Latest completed candle close; define before any strategy uses it.
-    closed_close = float(today_5["Close"].iloc[closed_idx])
-
+    # Latest completed candle close is already defined before the market gates.
     retest = prior_break and near_level and closed_close >= level_high * 0.997
-
-    recent4 = today_5.iloc[max(0, _closed_pos - 4):_closed_pos]
-    closed_close = float(today_5["Close"].iloc[closed_idx])
-    vwap_touch = False
-    try:
-        rh = recent4["High"].astype(float)
-        rl = recent4["Low"].astype(float)
-        vwap_touch = bool(((rl <= vwap_last_closed * 1.006) & (rh >= vwap_last_closed * 0.994)).any())
-    except Exception:
-        vwap_touch = False
-    vwap_bounce = bool(vwap_touch and closed_close >= vwap_last_closed * 1.001)
 
     ema_touch = False
     try:
@@ -6149,41 +6140,18 @@ def scan_intraday(
     data_stage2_audit: dict[str, int] = {}
     strategy_audit_cycle: dict[str, dict] = {}
 
-    def _merge_strategy_audit(_payload: dict[str, dict], _gate: str | None = None,
-                              _reasons: list[str] | None = None) -> None:
-        """Accumulate every symbol/strategy evaluation in this scan. Diagnostic only."""
+    def _merge_strategy_audit(_payload: dict[str, dict], _gate: str | None = None, _reasons: list[str] | None = None) -> None:
         for _et, _detail in (_payload or {}).items():
-            _name = str(_et)
-            _dst = strategy_audit_cycle.setdefault(_name, {
-                "matched_count": 0,
-                "failed_count": 0,
-                "primary_count": 0,
-                "not_primary_count": 0,
-                "blockers": {},
-                "confirmation_weakest": {},
+            _dst = strategy_audit_cycle.setdefault(str(_et), {
+                "matched": bool(_detail.get("matched")),
+                "primary": bool(_detail.get("primary")),
+                "core_blockers": list(_detail.get("core_blockers") or []),
+                "confirmation_score": _detail.get("confirmation_score"),
+                "weak_confirmation_component": _detail.get("weak_confirmation_component"),
                 "pipeline_rejects": {},
             })
-            if bool(_detail.get("matched")):
-                _dst["matched_count"] += 1
-                if bool(_detail.get("primary")):
-                    _dst["primary_count"] += 1
-                else:
-                    _dst["not_primary_count"] += 1
-                _weak = _detail.get("weak_confirmation_component")
-                if _weak:
-                    _bump_reason(_dst.setdefault("confirmation_weakest", {}), str(_weak))
-            else:
-                _dst["failed_count"] += 1
-                for _reason in (list(_detail.get("core_blockers") or []) or ["core_unexplained"]):
-                    _bump_reason(_dst.setdefault("blockers", {}), str(_reason))
             if _gate and _detail.get("primary"):
-                for _reason in (_reasons or [_gate]):
-                    if str(_reason):
-                        _bump_reason(
-                            _dst.setdefault("pipeline_rejects", {})
-                            .setdefault(str(_gate), {}),
-                            str(_reason),
-                        )
+                _dst.setdefault("pipeline_rejects", {}).setdefault(str(_gate), []).extend([str(x) for x in (_reasons or [_gate]) if str(x)])
 
     def _record_stage2_gate(gate: str, reasons: list[str] | None = None) -> None:
         for reason in ([str(x) for x in (reasons or []) if str(x)] or [gate]):
@@ -6364,8 +6332,7 @@ def scan_intraday(
     _strat_failed_top = sorted((_strat.get("failed", {}) or {}).items(), key=lambda x: x[1], reverse=True)[:20]
     _strat_blocker_top = {k: sorted((v or {}).items(), key=lambda x: x[1], reverse=True)[:3] for k, v in (_strat.get("blockers", {}) or {}).items()}
     _weak_top = {k: sorted((v or {}).items(), key=lambda x: x[1], reverse=True)[:3] for k, v in (_strat.get("confirmation_weakest", {}) or {}).items()}
-    _strat_matched_top = sorted((_strat.get("matched", {}) or {}).items(), key=lambda x: x[1], reverse=True)[:20]
-    log.info("INTRADAY STRATEGY AUDIT CUMULATIVE | scans=%d | matched=%s | failed=%s | blockers_top=%s | weakest_confirmation=%s", cumulative_audit.get("scans", 0), _strat_matched_top, _strat_failed_top, _strat_blocker_top, _weak_top)
+    log.info("INTRADAY STRATEGY AUDIT CUMULATIVE | scans=%d | failed=%s | blockers_top=%s | weakest_confirmation=%s", cumulative_audit.get("scans", 0), _strat_failed_top, _strat_blocker_top, _weak_top)
     log.info("INTRADAY AUDIT CUMULATIVE | scans=%d | stage1_top=%s | stage2_top=%s", cumulative_audit.get("scans", 0), top_stage1, top_stage2)
     log.info(
         "STAGE 2: %d deep candidates completed; %d qualified signals | rejects=%s",
