@@ -38,7 +38,7 @@ SKIP_CLOSE_MIN = 0
 DAILY_MIN_SCORE = 82
 
 DAILY_AUDIT_FILE = Path("/var/data/daily_audit_counters.json")
-DAILY_AUDIT_SESSION = "20261003-CLEAN"
+DAILY_AUDIT_SESSION = "20261007-AUDIT-V1"
 _DAILY_AUDIT_LOCK = Lock()
 # Runtime-only bridge: analyze_daily() records the exact zero-match blockers so
 # scan_daily() can persist them in the cumulative audit. Diagnostic only.
@@ -77,7 +77,7 @@ def _daily_data_audit_pop(symbol: str) -> dict[str, int]:
 
 def _new_daily_audit() -> dict:
     return {
-        "schema_version": 2,
+        "schema_version": 3,
         "session_id": DAILY_AUDIT_SESSION,
         "updated_at": None,
         "scans": 0,
@@ -96,8 +96,9 @@ def _new_daily_audit() -> dict:
         "strategy": {
             "matched": {}, "failed": {}, "blockers": {},
             "confirmation_weakest": {}, "primary_selected": {},
-            "not_primary": {}, "pipeline_rejects": {}
+            "not_primary": {}, "pipeline_rejects": {}, "metric_stats": {}
         },
+        "rejection_outcomes": {"pending": [], "resolved": [], "summary": {}},
     }
 
 def _load_daily_audit() -> dict:
@@ -108,8 +109,8 @@ def _load_daily_audit() -> dict:
         raw = json.loads(DAILY_AUDIT_FILE.read_text(encoding="utf-8"))
         if not isinstance(raw, dict):
             return base
-        if int(raw.get("schema_version", 0) or 0) != 2:
-            log.info("DAILY AUDIT SCHEMA RESET | old=%s | new=2", raw.get("schema_version"))
+        if int(raw.get("schema_version", 0) or 0) != 3:
+            log.info("DAILY AUDIT SCHEMA RESET | old=%s | new=3", raw.get("schema_version"))
             return base
         if raw.get("session_id") != DAILY_AUDIT_SESSION:
             log.info("DAILY AUDIT CLEAN SESSION RESET | old_session=%s | new_session=%s", raw.get("session_id"), DAILY_AUDIT_SESSION)
@@ -137,15 +138,79 @@ def _daily_bump(counter: dict[str, int], reason: str, amount: int = 1) -> None:
     key = str(reason or "unknown")
     counter[key] = int(counter.get(key, 0) or 0) + int(amount or 0)
 
+
+def _queue_daily_rejection(events, symbol, strategy, gate, entry_price, source_date=None, reasons=None, context_numeric=None, source="stage2"):
+    try:
+        price=float(entry_price)
+        if not np.isfinite(price) or price<=0: return
+        created=datetime.now(timezone.utc)
+        events.append({"id":f"{str(symbol).upper()}|{strategy}|{created.strftime('%Y%m%d%H%M%S%f')}","created_at":created.isoformat(),"symbol":str(symbol).upper(),"strategy":str(strategy),"stage":str(source),"gate":str(gate),"entry_price":round(price,6),"source_session_date":str(source_date or ""),"reasons":[str(x) for x in (reasons or []) if str(x)],"context_numeric":dict(context_numeric or {})})
+    except Exception: return
+
+def _resolve_daily_rejection_outcomes(pending, daily_frames):
+    """Resolve a Daily rejection against the CLOSE of the SAME trading session.
+
+    Diagnostic-only: never waits and never fetches data. The event remains pending
+    until a later normal scan sees the source session after REGULAR_CLOSE in New York
+    time and the daily bar for that exact source date is available. We deliberately
+    do NOT use the next trading day as the outcome window.
+    """
+    still=[]; resolved=[]
+    now_utc=datetime.now(timezone.utc)
+    try:
+        now_ny=now_utc.astimezone(__import__('zoneinfo').ZoneInfo('America/New_York'))
+    except Exception:
+        now_ny=now_utc
+    today_ny=now_ny.date()
+    try:
+        close_time=REGULAR_CLOSE
+    except Exception:
+        close_time=time(16,0)
+    session_closed_today = bool(now_ny.time() >= close_time)
+    for ev in list(pending or []):
+        try:
+            src=str(ev.get("source_session_date") or "")
+            if not src: still.append(ev); continue
+            src_date=pd.Timestamp(src).date()
+            # Same-session outcome can only be finalized after that session closes.
+            # If the source date is today, never resolve it before the close.
+            if src_date > today_ny or (src_date == today_ny and not session_closed_today):
+                still.append(ev); continue
+            df=daily_frames.get(str(ev.get("symbol","")).upper())
+            if df is None or df.empty or "Close" not in df.columns: still.append(ev); continue
+            x=df.copy().sort_index(); idx=pd.DatetimeIndex(x.index)
+            idx=idx.tz_localize('UTC') if idx.tz is None else idx.tz_convert('America/New_York')
+            x.index=idx; x['Close']=pd.to_numeric(x['Close'],errors='coerce')
+            # IMPORTANT: exact source session only; never roll forward to the next day.
+            candidates=x[x.index.date == src_date]
+            if candidates.empty: still.append(ev); continue
+            row=candidates.iloc[-1]; exit_price=float(row['Close']); entry=float(ev.get('entry_price',0) or 0)
+            if not np.isfinite(exit_price) or entry<=0: still.append(ev); continue
+            # Do not resolve today's event from a still-forming daily bar.
+            if src_date == today_ny and not session_closed_today:
+                still.append(ev); continue
+            ret=(exit_price-entry)/entry*100.0
+            out=dict(ev); out.update({
+                "resolved_at":now_utc.isoformat(),
+                "outcome_session_date":str(src_date),
+                "outcome_window":"same_session_close",
+                "exit_price":round(exit_price,6),
+                "return_pct":round(ret,4),
+                "outcome":"favorable" if ret>0 else ("unfavorable" if ret<0 else "flat")
+            }); resolved.append(out)
+        except Exception:
+            still.append(ev)
+    return still,resolved
+
 def _commit_daily_audit(*, stage1_counts=None, stage1_passed=0, stage1_rejected=0,
                         stage2_deep=0, stage2_qualified=0, stage2_gate_counts=None,
                         stage2_gate_reasons=None, stage2_gate_diag=None,
                         data_stage1=None, data_stage2=None,
                         strategy_matched=None, strategy_failed=None, strategy_blockers=None,
-                        strategy_audit=None) -> dict:
+                        strategy_audit=None, outcome_events=None, outcome_resolved=None) -> dict:
     with _DAILY_AUDIT_LOCK:
         data = _load_daily_audit()
-        data["schema_version"] = 2
+        data["schema_version"] = 3
         data["scans"] = int(data.get("scans", 0) or 0) + 1
         data["updated_at"] = datetime.now(timezone.utc).isoformat()
         st1 = data.setdefault("stage1", {"passed": 0, "rejected": 0, "reasons": {}})
@@ -166,6 +231,20 @@ def _commit_daily_audit(*, stage1_counts=None, stage1_passed=0, stage1_rejected=
             dst = st2.setdefault("diagnostic_reason_counts_by_gate", {}).setdefault(gate, {})
             for reason, count in reasons.items():
                 _daily_bump(dst, reason, count)
+        ro=data.setdefault("rejection_outcomes", {"pending": [], "resolved": [], "summary": {}})
+        if outcome_events:
+            ids={str(x.get("id")) for x in ro.get("pending",[]) if isinstance(x,dict)}
+            for ev in outcome_events:
+                if str(ev.get("id")) not in ids: ro.setdefault("pending",[]).append(ev); ids.add(str(ev.get("id")))
+        if outcome_resolved:
+            rid={str(x.get("id")) for x in outcome_resolved if isinstance(x,dict)}; ro["pending"]=[x for x in ro.get("pending",[]) if str(x.get("id")) not in rid]
+            old={str(x.get("id")) for x in ro.get("resolved",[]) if isinstance(x,dict)}
+            for ev in outcome_resolved:
+                if str(ev.get("id")) in old: continue
+                ro.setdefault("resolved",[]).append(ev); old.add(str(ev.get("id")))
+                key=f"{ev.get('strategy')}|{ev.get('gate')}"; sm=ro.setdefault("summary",{}).setdefault(key,{"count":0,"favorable":0,"unfavorable":0,"flat":0,"sum_return_pct":0.0}); sm["count"]+=1; sm[str(ev.get("outcome"))]=sm.get(str(ev.get("outcome")),0)+1; sm["sum_return_pct"]+=float(ev.get("return_pct",0) or 0)
+            ro["resolved"]=ro["resolved"][-5000:]
+        ro["pending"]=ro.get("pending",[])[-10000:]
         data_audit = data.setdefault("data", {"stage1": {}, "stage2": {}, "timeframes": {}})
         for reason, count in (data_stage1 or {}).items():
             _daily_bump(data_audit.setdefault("stage1", {}), reason, count)
@@ -200,6 +279,20 @@ def _commit_daily_audit(*, stage1_counts=None, stage1_passed=0, stage1_rejected=
                 _blockers = list(_detail.get("core_blockers") or []) or ["core_unexplained"]
                 for _reason in _blockers:
                     _daily_bump(strat.setdefault("blockers", {}).setdefault(_name, {}), str(_reason))
+            _metric_dst = strat.setdefault("metric_stats", {}).setdefault(_name, {})
+            for _metric, _actual in (_detail.get("context_numeric") or {}).items():
+                try:
+                    _x = float(_actual)
+                    if not np.isfinite(_x):
+                        continue
+                    _m = _metric_dst.setdefault(str(_metric), {"count": 0, "min": _x, "max": _x, "sum": 0.0})
+                    _m["count"] = int(_m.get("count", 0) or 0) + 1
+                    _m["min"] = min(float(_m.get("min", _x)), _x)
+                    _m["max"] = max(float(_m.get("max", _x)), _x)
+                    _m["sum"] = float(_m.get("sum", 0.0) or 0.0) + _x
+                    _m["avg"] = _m["sum"] / max(1, _m["count"])
+                except Exception:
+                    continue
             for _gate, _reasons in (_detail.get("pipeline_rejects") or {}).items():
                 for _reason in (_reasons or [str(_gate)]):
                     _daily_bump(strat.setdefault("pipeline_rejects", {}).setdefault(_name, {}).setdefault(str(_gate), {}), str(_reason))
@@ -2662,7 +2755,12 @@ def _daily_volume_ratio_time_of_day(symbol: str, fetch_intraday, now_ny) -> floa
 
         baseline = float(pd.Series(prior[-20:]).mean())
         if baseline > 0 and np.isfinite(baseline) and np.isfinite(current):
-            return float(current / baseline)
+            _ratio = float(current / baseline)
+            log.info(
+                "DAILY VOLUME AUDIT METRICS | %s | ratio=%.4fx | current_cum_volume=%.0f | baseline_cum_volume=%.0f | completed_bars=%d | age=%.1fm",
+                symbol, _ratio, current, baseline, completed_bars_today, age_min,
+            )
+            return _ratio
 
         log.warning("DAILY VOLUME NEUTRAL | %s | invalid baseline/current", symbol)
         return 1.0
@@ -4338,6 +4436,13 @@ def analyze_daily(
                 except Exception:
                     _weak_name = None
             _blockers = [] if _matched else list(_competition_fail_reasons(_et) or [])
+            _context_numeric = {}
+            try:
+                for _ck, _cv in strategy_ctx.items():
+                    if isinstance(_cv, (int, float, np.integer, np.floating)) and not isinstance(_cv, bool) and np.isfinite(float(_cv)):
+                        _context_numeric[str(_ck)] = round(float(_cv), 6)
+            except Exception:
+                _context_numeric = {}
             payload[_et] = {
                 "matched": bool(_matched),
                 "primary": bool(_matched and primary == _et),
@@ -4346,6 +4451,7 @@ def analyze_daily(
                 "confirmation_score": round(float(_comp.get("confirmation_score", 0.0) or 0.0), 2),
                 "weak_confirmation_component": _weak_name,
                 "weak_confirmation_value": round(float(_cc.get(_weak_name, 0.0) or 0.0), 2) if _weak_name else None,
+                "context_numeric": _context_numeric,
                 "pipeline_rejects": {},
             }
         return payload
@@ -5393,6 +5499,7 @@ def _prefilter_daily(symbol: str, audit_counts: dict[str, int] | None = None, au
         route -= 1.0 if wrsi >= 80 else 0.0
         if vol_ratio < 0.55:
             _audit_stage1("low_volume_ratio<0.55x")
+            log.info("DAILY STAGE 1 REJECT | %s | low_volume_ratio=%.4fx<0.55x", symbol, vol_ratio)
             return None
         routes=_daily_strategy_route_scores(price=price, trend=trend, above_vwap=above_vwap, above_open=above_open, vol_ratio=vol_ratio, mom=mom, wrsi=wrsi, we20=we20, we50=we50, daily=daily, weekly=weekly)
         return route, routes, weekly, daily, float(vol_ratio)
@@ -5486,6 +5593,7 @@ def _prefilter_daily_from_frames(symbol: str, weekly: pd.DataFrame, daily: pd.Da
         route -= 1.0 if wrsi >= 80 else 0.0
         if vol_ratio < 0.55:
             _audit_stage1("low_volume_ratio<0.55x")
+            log.info("DAILY STAGE 1 REJECT | %s | low_volume_ratio=%.4fx<0.55x", symbol, vol_ratio)
             return None
         routes=_daily_strategy_route_scores(price=price, trend=trend, above_vwap=above_vwap, above_open=above_open, vol_ratio=vol_ratio, mom=mom, wrsi=wrsi, we20=we20, we50=we50, daily=daily, weekly=weekly)
         return route, routes, weekly, daily, float(vol_ratio)
@@ -5528,6 +5636,8 @@ def scan_daily(
     stage1_audit_rejected = 0
     stage1_audit_lock = Lock()
     log.info("DAILY V2 SCAN: %d symbols loaded", len(symbols))
+    daily_map = {}
+    weekly_map = {}
     try:
         from market_data import fetch_alpaca_bars_multi, alpaca_configured
         if alpaca_configured():
@@ -5605,6 +5715,19 @@ def scan_daily(
     log.info("STAGE 2 DAILY: top %d", len(finalists))
     results=[]
     stage2_scores = []
+    _daily_source_dates={}
+    for _it in finalists:
+        try:
+            _df=_it[4]; _daily_source_dates[str(_it[2]).upper()]=str(pd.Timestamp(_df.index[-1]).date()) if _df is not None and not _df.empty else ""
+        except Exception: _daily_source_dates[str(_it[2]).upper()]=""
+    rejection_outcome_events=[]; rejection_outcome_resolved=[]
+    try:
+        _prev=_load_daily_audit().get("rejection_outcomes",{}) or {}
+        _outcome_frames={str(k).upper(): v for k,v in (daily_map or {}).items()}
+        _outcome_frames.update({str(_it[2]).upper(): _it[4] for _it in finalists if len(_it)>4 and _it[4] is not None})
+        _, rejection_outcome_resolved=_resolve_daily_rejection_outcomes(list(_prev.get("pending",[]) or []), _outcome_frames)
+    except Exception as _exc:
+        log.debug("DAILY REJECTION OUTCOME RESOLVE SKIPPED | %s", _exc)
     # Diagnostics only: these counters do NOT change any selection rule.
     # Each finalist is counted at the first rejection gate it fails so /scan
     # reports exactly where Stage 2 candidates disappear.
@@ -5626,6 +5749,29 @@ def scan_daily(
     strategy_matched: dict[str, int] = {}
     strategy_failed: dict[str, int] = {}
     strategy_blockers: dict[str, dict[str, int]] = {}
+
+    def _merge_strategy_audit(_payload: dict[str, dict], _gate: str | None = None, _reasons: list[str] | None = None) -> None:
+        # Diagnostic-only aggregation. It never participates in trading decisions.
+        for _et, _detail in (_payload or {}).items():
+            _dst = strategy_audit_cycle.setdefault(str(_et), {
+                "matched": bool(_detail.get("matched")),
+                "primary": bool(_detail.get("primary")),
+                "core_blockers": list(_detail.get("core_blockers") or []),
+                "confirmation_score": _detail.get("confirmation_score"),
+                "weak_confirmation_component": _detail.get("weak_confirmation_component"),
+                "pipeline_rejects": {},
+            })
+            if _gate and _detail.get("primary"):
+                _dst.setdefault("pipeline_rejects", {}).setdefault(str(_gate), []).extend(
+                    [str(x) for x in (_reasons or [_gate]) if str(x)]
+                )
+
+    def _merge_and_queue(_payload,_gate=None,_reasons=None,_sig=None,_fallback_price=0.0):
+        _merge_strategy_audit(_payload,_gate,_reasons)
+        if _gate:
+            for _et,_detail in (_payload or {}).items():
+                _queue_daily_rejection(rejection_outcome_events,getattr(_sig,"symbol", ""),_et,_gate,float(getattr(_sig,"price",0) or _fallback_price),_daily_source_dates.get(str(getattr(_sig,"symbol","")).upper(),""),_reasons or _detail.get("core_blockers"),_detail.get("context_numeric"))
+
     def _stage2_reason(gate: str, reason: str, diagnostic: bool = False) -> None:
         target = stage2_gate_diag if diagnostic else stage2_gate_reasons
         _daily_bump(target.setdefault(gate, {}), reason)
@@ -5666,7 +5812,14 @@ def scan_daily(
                 _stage2_reason("no_signal", "analyze_daily_returned_none")
                 with _DAILY_NO_SIGNAL_LOCK:
                     _ns_blockers = dict(_DAILY_NO_SIGNAL_AUDIT.pop(_stage2_symbol, {}) or {})
-                _merge_strategy_audit(_daily_strategy_audit_pop(_stage2_symbol))
+                _ns_payload=_daily_strategy_audit_pop(_stage2_symbol)
+                _merge_strategy_audit(_ns_payload)
+                try:
+                    _src=_daily_source_dates.get(str(_stage2_symbol).upper(),"")
+                    _item_price=next((float(it[4]["Close"].iloc[-1]) for it in finalists if str(it[2]).upper()==str(_stage2_symbol).upper() and it[4] is not None and not it[4].empty and "Close" in it[4].columns),0.0)
+                except Exception: _src=""; _item_price=0.0
+                for _et,_detail in (_ns_payload or {}).items():
+                    _queue_daily_rejection(rejection_outcome_events,_stage2_symbol,_et,"no_signal",_item_price,_src,_detail.get("core_blockers"),_detail.get("context_numeric"))
                 for _reason, _count in _ns_blockers.items():
                     _stage2_reason("no_signal", _reason, diagnostic=True)
                 for _dr, _dc in _daily_data_audit_pop(_stage2_symbol).items():
@@ -5686,13 +5839,13 @@ def scan_daily(
             raw_score = float(getattr(sig, "raw_score", sig.score) or 0.0)
             if raw_score < min_score:
                 stage2_rejects["score"] += 1
-                _merge_strategy_audit(_strategy_payload, "score", ["raw_score_below_min"])
+                _merge_and_queue(_strategy_payload, "score", ["raw_score_below_min"], sig)
                 _stage2_reason("score", "raw_score_below_min")
                 _stage2_reason("score", f"raw_score<{min_score}", diagnostic=True)
                 continue
             if not sig.live_ok:
                 stage2_rejects["live_ok"] += 1
-                _merge_strategy_audit(_strategy_payload, "live_ok", list(getattr(sig, "live_gate_reasons", []) or ["live_ok_unexplained"]))
+                _merge_and_queue(_strategy_payload, "live_ok", list(getattr(sig, "live_gate_reasons", []) or ["live_ok_unexplained"]), sig)
                 # Exact sub-conditions are calculated beside the live gate itself.
                 live_reasons = list(getattr(sig, "live_gate_reasons", []) or [])
                 for rr in (live_reasons or ["live_ok_unexplained"]):
@@ -5700,7 +5853,7 @@ def scan_daily(
                 continue
             if not sig.quality_ok:
                 stage2_rejects["quality"] += 1
-                _merge_strategy_audit(_strategy_payload, "quality", list(getattr(sig, "quality_reasons", []) or ["quality_false"]))
+                _merge_and_queue(_strategy_payload, "quality", list(getattr(sig, "quality_reasons", []) or ["quality_false"]), sig)
                 qreasons = getattr(sig, "quality_reasons", None) or []
                 log.info(
                     "DAILY QUALITY REJECT | %s | score=%s | reasons=%s | q_ext=%.2f%% | q_atr=%.2f%% | q_atr_ready=%s | regime_ext=%.2f%% | regime_atr=%.2f%% | vol=%.2fx | h4=%s | market=%s | tp1R=%.2f",
@@ -5722,7 +5875,7 @@ def scan_daily(
                 continue
             if sig.news_state == "negative":
                 stage2_rejects["negative_news"] += 1
-                _merge_strategy_audit(_strategy_payload, "negative_news", ["negative_news"])
+                _merge_and_queue(_strategy_payload, "negative_news", ["negative_news"], sig)
                 _stage2_reason("negative_news", "negative_news")
                 continue
             # Validate current bid/ask only for the Stage-2 finalists.
@@ -5735,7 +5888,7 @@ def scan_daily(
                 sig.liquidity_ok = bool(liq.get("ok", False))
                 if not sig.liquidity_ok:
                     stage2_rejects["liquidity"] += 1
-                    _merge_strategy_audit(_strategy_payload, "liquidity", [str(getattr(sig, "liquidity_reason", "liquidity_false"))])
+                    _merge_and_queue(_strategy_payload, "liquidity", [str(getattr(sig, "liquidity_reason", "liquidity_false"))], sig)
                     _stage2_reason("liquidity", "liquidity_ok_false")
                     _stage2_reason("liquidity", f"spread={sig.spread_pct:.3f}%", diagnostic=True)
                     _stage2_reason("liquidity", f"slippage={sig.expected_slippage_pct:.3f}%", diagnostic=True)
@@ -5747,7 +5900,7 @@ def scan_daily(
                     )
                 if liq.get("quote_source") == "none" or float(liq.get("quote_age_min", 999) or 999) > QUOTE_MAX_AGE_MIN:
                     stage2_rejects["stale_or_no_quote"] += 1
-                    _merge_strategy_audit(_strategy_payload, "stale_or_no_quote", ["stale_or_no_quote"])
+                    _merge_and_queue(_strategy_payload, "stale_or_no_quote", ["stale_or_no_quote"], sig)
                     _stage2_reason("stale_or_no_quote", "quote_source_none" if liq.get("quote_source") == "none" else "quote_stale")
                     _stage2_reason("stale_or_no_quote", f"age>{QUOTE_MAX_AGE_MIN}m", diagnostic=True)
                     continue
@@ -5763,7 +5916,7 @@ def scan_daily(
             execution = _final_execution_snapshot(sig.symbol, sig.price, quote_snapshot=liq)
             if not execution.get("ok"):
                 stage2_rejects["final_execution"] += 1
-                _merge_strategy_audit(_strategy_payload, "final_execution", [str(execution.get("reason", "final_execution_false"))])
+                _merge_and_queue(_strategy_payload, "final_execution", [str(execution.get("reason", "final_execution_false"))], sig)
                 _stage2_reason("final_execution", "execution_ok_false")
                 _exec_reason = str(execution.get("reason", "unspecified") or "unspecified")
                 _stage2_reason("final_execution", f"reason:{_exec_reason}")
@@ -5801,6 +5954,7 @@ def scan_daily(
         strategy_failed=strategy_failed,
         strategy_blockers=strategy_blockers,
         strategy_audit=strategy_audit_cycle,
+        outcome_events=rejection_outcome_events, outcome_resolved=rejection_outcome_resolved,
     )
     top_stage1 = sorted(cumulative_audit.get("stage1", {}).get("reasons", {}).items(), key=lambda x: x[1], reverse=True)[:8]
     top_stage2 = {gate: sorted(reasons.items(), key=lambda x: x[1], reverse=True)[:5] for gate, reasons in cumulative_audit.get("stage2", {}).get("reason_counts_by_gate", {}).items()}

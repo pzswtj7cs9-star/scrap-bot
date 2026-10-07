@@ -70,7 +70,7 @@ LEARNING_ALERT_FILE = Path("/var/data/intraday_learning_alert.json")
 
 # Diagnostic-only cumulative audit. Never participates in trading decisions.
 INTRADAY_AUDIT_FILE = Path("/var/data/intraday_audit_counters.json")
-INTRADAY_AUDIT_SESSION = "20261003-CLEAN"
+INTRADAY_AUDIT_SESSION = "20261007-AUDIT-V1"
 _AUDIT_LOCK = Lock()
 # Runtime-only bridge: analyze_intraday() records exact zero-match blockers so
 # scan_intraday() can persist them in the cumulative audit. Diagnostic only.
@@ -381,7 +381,7 @@ def _intraday_data_audit_pop(symbol: str) -> dict[str, int]:
 
 
 def _new_intraday_audit() -> dict:
-    return {"schema_version": 2, "session_id": INTRADAY_AUDIT_SESSION, "updated_at": None, "scans": 0,
+    return {"schema_version": 3, "session_id": INTRADAY_AUDIT_SESSION, "updated_at": None, "scans": 0,
             "stage1": {"passed": 0, "rejected": 0, "reasons": {}},
             "stage2": {"deep_candidates": 0, "qualified": 0, "gates": {},
                         "reason_counts_by_gate": {},
@@ -394,8 +394,9 @@ def _new_intraday_audit() -> dict:
             "strategy": {
                 "matched": {}, "failed": {}, "blockers": {},
                 "confirmation_weakest": {}, "primary_selected": {},
-                "not_primary": {}, "pipeline_rejects": {}
-            }}
+                "not_primary": {}, "pipeline_rejects": {}, "metric_stats": {}
+            },
+            "rejection_outcomes": {"pending": [], "resolved": [], "summary": {}}}
 
 def _load_intraday_audit() -> dict:
     base = _new_intraday_audit()
@@ -428,14 +429,40 @@ def _bump_reason(counter: dict[str, int], reason: str, amount: int = 1) -> None:
     key = str(reason or "unknown")
     counter[key] = int(counter.get(key, 0) or 0) + int(amount or 0)
 
+
+def _queue_intraday_rejection(events, symbol, strategy, gate, entry_price, reasons=None, context_numeric=None, source="stage2"):
+    try:
+        price=float(entry_price)
+        if not np.isfinite(price) or price<=0: return
+        created=datetime.now(timezone.utc)
+        events.append({"id":f"{str(symbol).upper()}|{strategy}|{created.strftime('%Y%m%d%H%M%S%f')}","created_at":created.isoformat(),"due_at":(created+timedelta(minutes=5)).isoformat(),"symbol":str(symbol).upper(),"strategy":str(strategy),"stage":str(source),"gate":str(gate),"entry_price":round(price,6),"reasons":[str(x) for x in (reasons or []) if str(x)],"context_numeric":dict(context_numeric or {})})
+    except Exception: return
+
+def _resolve_intraday_rejection_outcomes(pending, frames, now_utc=None):
+    now_utc=now_utc or datetime.now(timezone.utc); still=[]; resolved=[]
+    for ev in list(pending or []):
+        try:
+            due=pd.Timestamp(ev.get("due_at")); due=due.tz_localize("UTC") if due.tzinfo is None else due.tz_convert("UTC")
+            if pd.Timestamp(now_utc)<due: still.append(ev); continue
+            df=frames.get(str(ev.get("symbol","")).upper())
+            if df is None or df.empty or "Close" not in df.columns: still.append(ev); continue
+            x=df.copy().sort_index(); idx=pd.DatetimeIndex(x.index); idx=idx.tz_localize("UTC") if idx.tz is None else idx.tz_convert("UTC"); x.index=idx; x["Close"]=pd.to_numeric(x["Close"],errors="coerce")
+            ends=x.index+pd.Timedelta(minutes=5); mask=(ends>=due)&(ends<=pd.Timestamp(now_utc))
+            if not bool(mask.any()): still.append(ev); continue
+            row=x.loc[mask].iloc[0]; exit_price=float(row["Close"]); entry=float(ev.get("entry_price",0) or 0)
+            if not np.isfinite(exit_price) or entry<=0: still.append(ev); continue
+            ret=(exit_price-entry)/entry*100.0; out=dict(ev); out.update({"resolved_at":datetime.now(timezone.utc).isoformat(),"outcome_time":pd.Timestamp(row.name).isoformat(),"exit_price":round(exit_price,6),"return_pct":round(ret,4),"outcome":"favorable" if ret>0 else ("unfavorable" if ret<0 else "flat")}); resolved.append(out)
+        except Exception: still.append(ev)
+    return still,resolved
+
 def _commit_intraday_audit(*, stage1_counts=None, stage1_passed=0, stage1_rejected=0,
                            stage2_deep=0, stage2_qualified=0, stage2_gate_counts=None,
                            stage2_gate_reasons=None, stage2_gate_diag=None,
                            data_stage1=None, data_stage2=None,
-                           strategy_audit=None) -> dict:
+                           strategy_audit=None, outcome_events=None, outcome_resolved=None) -> dict:
     with _AUDIT_LOCK:
         data = _load_intraday_audit()
-        data["schema_version"] = 2
+        data["schema_version"] = 3
         data["scans"] = int(data.get("scans", 0) or 0) + 1
         data["updated_at"] = datetime.now(timezone.utc).isoformat()
         st1 = data.setdefault("stage1", {"passed": 0, "rejected": 0, "reasons": {}})
@@ -452,6 +479,20 @@ def _commit_intraday_audit(*, stage1_counts=None, stage1_passed=0, stage1_reject
         for gate, reasons in (stage2_gate_diag or {}).items():
             dst = st2.setdefault("diagnostic_reason_counts_by_gate", {}).setdefault(gate, {})
             for reason, count in reasons.items(): _bump_reason(dst, reason, count)
+        ro=data.setdefault("rejection_outcomes", {"pending": [], "resolved": [], "summary": {}})
+        if outcome_events:
+            ids={str(x.get("id")) for x in ro.get("pending",[]) if isinstance(x,dict)}
+            for ev in outcome_events:
+                if str(ev.get("id")) not in ids: ro.setdefault("pending",[]).append(ev); ids.add(str(ev.get("id")))
+        if outcome_resolved:
+            rid={str(x.get("id")) for x in outcome_resolved if isinstance(x,dict)}; ro["pending"]=[x for x in ro.get("pending",[]) if str(x.get("id")) not in rid]
+            old={str(x.get("id")) for x in ro.get("resolved",[]) if isinstance(x,dict)}
+            for ev in outcome_resolved:
+                if str(ev.get("id")) in old: continue
+                ro.setdefault("resolved",[]).append(ev); old.add(str(ev.get("id")))
+                key=f"{ev.get('strategy')}|{ev.get('gate')}"; sm=ro.setdefault("summary",{}).setdefault(key,{"count":0,"favorable":0,"unfavorable":0,"flat":0,"sum_return_pct":0.0}); sm["count"]+=1; sm[str(ev.get("outcome"))]=sm.get(str(ev.get("outcome")),0)+1; sm["sum_return_pct"]+=float(ev.get("return_pct",0) or 0)
+            ro["resolved"]=ro["resolved"][-5000:]
+        ro["pending"]=ro.get("pending",[])[-10000:]
         data_audit = data.setdefault("data", {"stage1": {}, "stage2": {}, "timeframes": {}})
         for reason, count in (data_stage1 or {}).items():
             _bump_reason(data_audit.setdefault("stage1", {}), reason, count)
@@ -478,6 +519,20 @@ def _commit_intraday_audit(*, stage1_counts=None, stage1_passed=0, stage1_reject
                 _blockers = list(_detail.get("core_blockers") or []) or ["core_unexplained"]
                 for _reason in _blockers:
                     _bump_reason(strat.setdefault("blockers", {}).setdefault(_name, {}), str(_reason))
+            _metric_dst = strat.setdefault("metric_stats", {}).setdefault(_name, {})
+            for _metric, _actual in (_detail.get("context_numeric") or {}).items():
+                try:
+                    _x = float(_actual)
+                    if not np.isfinite(_x):
+                        continue
+                    _m = _metric_dst.setdefault(str(_metric), {"count": 0, "min": _x, "max": _x, "sum": 0.0})
+                    _m["count"] = int(_m.get("count", 0) or 0) + 1
+                    _m["min"] = min(float(_m.get("min", _x)), _x)
+                    _m["max"] = max(float(_m.get("max", _x)), _x)
+                    _m["sum"] = float(_m.get("sum", 0.0) or 0.0) + _x
+                    _m["avg"] = _m["sum"] / max(1, _m["count"])
+                except Exception:
+                    continue
             for _gate, _reasons in (_detail.get("pipeline_rejects") or {}).items():
                 for _reason in (_reasons or [str(_gate)]):
                     _bump_reason(strat.setdefault("pipeline_rejects", {}).setdefault(_name, {}).setdefault(str(_gate), {}), str(_reason))
@@ -3237,28 +3292,6 @@ def analyze_intraday(
     # الدرجة وشروط الجودة والاستثناء الخاص بالسهم القوي.
     setup_market_permission = market_condition in {"قوي", "مختلط", "إيجابي_تحت_VWAP", "ضعيف"}
 
-    # بوابة السوق التمهيدية للـScore: السوق القوي مسموح مباشرة، والمختلط فقط
-    # إذا اجتاز شروطه التمهيدية. السوق الضعيف لا يأخذ مكافأة السوق قبل حسم
-    # استثناء السهم القوي بعد اكتمال الدرجة.
-    positive_below_vwap_ok = bool(
-        market_condition == "إيجابي_تحت_VWAP"
-        and trend_up
-        and live_ok
-        and (above_vwap if vwap_bounce else (above_vwap or breakout_now or orb_breakout or momentum_continuation or compression_expansion or liquidity_sweep or liquidity_displacement or bull_flag or resistance_reclaim or opening_drive_pullback or hod_reclaim or orb_failed_reclaim or abc_continuation or gap_setup or failed_breakdown_reclaim or rs_pullback or momentum_ignition))
-        and above_open
-        and m15_state != "معاكس"
-        and vol_session_ratio >= 0.90
-        and not dump
-        and not chop
-        and ext_tmp <= 4.5
-    )
-
-    market_permission = bool(
-        market_condition == "قوي"
-        or mixed_market_ok
-        or positive_below_vwap_ok
-    )
-
     failed = (
         float(today_5["High"].max()) >= level_high * 1.001
         and price < level_high * 0.997
@@ -4602,6 +4635,13 @@ def analyze_intraday(
                 except Exception:
                     _weak_name = None
             _blockers = [] if _matched else list(_competition_fail_reasons(_et) or [])
+            _context_numeric = {}
+            try:
+                for _ck, _cv in strategy_ctx.items():
+                    if isinstance(_cv, (int, float, np.integer, np.floating)) and not isinstance(_cv, bool) and np.isfinite(float(_cv)):
+                        _context_numeric[str(_ck)] = round(float(_cv), 6)
+            except Exception:
+                _context_numeric = {}
             payload[_et] = {
                 "matched": bool(_matched),
                 "primary": bool(_matched and primary == _et),
@@ -4610,6 +4650,7 @@ def analyze_intraday(
                 "confirmation_score": round(float(_comp.get("confirmation_score", 0.0) or 0.0), 2),
                 "weak_confirmation_component": _weak_name,
                 "weak_confirmation_value": round(float(_cc.get(_weak_name, 0.0) or 0.0), 2) if _weak_name else None,
+                "context_numeric": _context_numeric,
                 "pipeline_rejects": {},
             }
         return payload
@@ -4841,6 +4882,27 @@ def analyze_intraday(
 
 
     entry_emoji = "🟡" if entry_type == "إعادة اختبار" else "🟢"
+
+    # FIX: evaluate Positive-under-VWAP permission only after all structural
+    # strategy booleans have been computed. The previous placement referenced
+    # strategy locals before assignment and could raise UnboundLocalError.
+    positive_below_vwap_ok = bool(
+        market_condition == "إيجابي_تحت_VWAP"
+        and trend_up
+        and live_ok
+        and (above_vwap if vwap_bounce else (above_vwap or breakout_now or orb_breakout or momentum_continuation or compression_expansion or liquidity_sweep or liquidity_displacement or bull_flag or resistance_reclaim or opening_drive_pullback or hod_reclaim or orb_failed_reclaim or abc_continuation or gap_setup or failed_breakdown_reclaim or rs_pullback or momentum_ignition))
+        and above_open
+        and m15_state != "معاكس"
+        and vol_session_ratio >= 0.90
+        and not dump
+        and not chop
+        and ext_tmp <= 4.5
+    )
+    market_permission = bool(
+        market_condition == "قوي"
+        or mixed_market_ok
+        or positive_below_vwap_ok
+    )
 
     reasons: list[str] = []
     warnings: list[str] = []
@@ -5807,7 +5869,10 @@ def _prefilter_intraday(
         # merely because it is not a generic trend/VWAP/momentum candidate.
         if vol_ratio < 0.65:
             _audit_stage1("low_volume_ratio<0.65x")
-            log.info("INTRADAY STAGE 1 REJECT | %s | low_volume_ratio=%.2fx<0.65x", symbol, vol_ratio)
+            log.info(
+                "INTRADAY STAGE 1 REJECT | %s | low_volume_ratio=%.4fx<0.65x | current_cum_volume=%.0f | baseline_cum_volume=%.0f | bars=%d",
+                symbol, vol_ratio, current_cum, baseline, n_bars,
+            )
             return None
         log.debug("INTRADAY STAGE 1 PASS | %s | route=%.1f | top_strategy=%s:%.1f", symbol, route_score, max(route_by_strategy, key=route_by_strategy.get), max(route_by_strategy.values()))
         return route_score, route_by_strategy, h1, m5
@@ -6139,6 +6204,12 @@ def scan_intraday(
     stage2_gate_diag: dict[str, dict[str, int]] = {}
     data_stage2_audit: dict[str, int] = {}
     strategy_audit_cycle: dict[str, dict] = {}
+    rejection_outcome_events=[]; rejection_outcome_resolved=[]
+    try:
+        _prev=_load_intraday_audit().get("rejection_outcomes",{}) or {}
+        _, rejection_outcome_resolved = _resolve_intraday_rejection_outcomes(list(_prev.get("pending",[]) or []), bulk_m5)
+    except Exception as _exc:
+        log.debug("INTRADAY REJECTION OUTCOME RESOLVE SKIPPED | %s", _exc)
 
     def _merge_strategy_audit(_payload: dict[str, dict], _gate: str | None = None, _reasons: list[str] | None = None) -> None:
         for _et, _detail in (_payload or {}).items():
@@ -6152,6 +6223,12 @@ def scan_intraday(
             })
             if _gate and _detail.get("primary"):
                 _dst.setdefault("pipeline_rejects", {}).setdefault(str(_gate), []).extend([str(x) for x in (_reasons or [_gate]) if str(x)])
+
+    def _merge_and_queue(_payload, _gate=None, _reasons=None, _sig=None, _fallback_price=0.0):
+        _merge_strategy_audit(_payload, _gate, _reasons)
+        if _gate:
+            for _et,_detail in (_payload or {}).items():
+                _queue_intraday_rejection(rejection_outcome_events,getattr(_sig,"symbol", ""),_et,_gate,float(getattr(_sig,"price",0) or _fallback_price),_reasons or _detail.get("core_blockers"),_detail.get("context_numeric"))
 
     def _record_stage2_gate(gate: str, reasons: list[str] | None = None) -> None:
         for reason in ([str(x) for x in (reasons or []) if str(x)] or [gate]):
@@ -6190,7 +6267,14 @@ def scan_intraday(
                 _record_stage2_gate("no_signal", ["analyze_intraday_return_none"])
                 with _INTRADAY_NO_SIGNAL_LOCK:
                     _ns_blockers = dict(_INTRADAY_NO_SIGNAL_AUDIT.pop(_stage2_symbol, {}) or {})
-                _merge_strategy_audit(_intraday_strategy_audit_pop(_stage2_symbol))
+                _ns_payload=_intraday_strategy_audit_pop(_stage2_symbol)
+                _merge_strategy_audit(_ns_payload)
+                try:
+                    _m5_df=next((it[4] for it in finalists if str(it[2]).upper()==str(_stage2_symbol).upper()),None)
+                    _fallback_price=float(_m5_df["Close"].iloc[-1]) if _m5_df is not None and not _m5_df.empty and "Close" in _m5_df.columns else 0.0
+                except Exception: _fallback_price=0.0
+                for _et,_detail in (_ns_payload or {}).items():
+                    _queue_intraday_rejection(rejection_outcome_events,_stage2_symbol,_et,"no_signal",_fallback_price,_detail.get("core_blockers"),_detail.get("context_numeric"))
                 _record_stage2_diag("no_signal", [f"{r}={c}" for r, c in _ns_blockers.items()])
                 for _dr, _dc in _intraday_data_audit_pop(_stage2_symbol).items():
                     _bump_reason(data_stage2_audit, _dr, _dc)
@@ -6210,7 +6294,7 @@ def scan_intraday(
 
             if float(getattr(sig, "raw_score", sig.score)) < min_score:
                 rejection_counts["score"] += 1
-                _merge_strategy_audit(_strategy_payload, "score", ["raw_score_below_min"])
+                _merge_and_queue(_strategy_payload, "score", ["raw_score_below_min"], sig)
                 _record_stage2_gate("score", reasons or [f"score<{min_score}"])
                 _record_stage2_diag("score", reasons)
                 rejection_samples.append(
@@ -6219,8 +6303,8 @@ def scan_intraday(
                 continue
             if not sig.live_ok:
                 rejection_counts["live_ok"] += 1
-                _merge_strategy_audit(_strategy_payload, "live_ok", live_reasons or ["live_ok_unexplained"])
                 live_reasons = list(getattr(sig, "live_gate_reasons", []) or [])
+                _merge_and_queue(_strategy_payload, "live_ok", live_reasons or ["live_ok_unexplained"], sig)
                 # Gate-specific cumulative audit: only exact failed live sub-conditions.
                 _record_stage2_gate("live_ok", live_reasons or ["live_ok_unexplained"])
                 _record_stage2_diag("live_ok", reasons)
@@ -6230,7 +6314,7 @@ def scan_intraday(
                 continue
             if not sig.quality_ok:
                 rejection_counts["quality"] += 1
-                _merge_strategy_audit(_strategy_payload, "quality", list(getattr(sig, "quality_reasons", []) or ["quality_false"]))
+                _merge_and_queue(_strategy_payload, "quality", list(getattr(sig, "quality_reasons", []) or ["quality_false"]), sig)
                 _record_stage2_gate("quality", reasons or ["quality=False_unexplained"])
                 _record_stage2_diag("quality", reasons)
                 rejection_samples.append(
@@ -6269,7 +6353,7 @@ def scan_intraday(
                 sig.warnings.append(f"Spread مرتفع {sig.spread_pct:.2f}%")
             if not sig.liquidity_ok:
                 rejection_counts["liquidity"] += 1
-                _merge_strategy_audit(_strategy_payload, "liquidity", [str(getattr(sig, "liquidity_reason", "liquidity_false"))])
+                _merge_and_queue(_strategy_payload, "liquidity", [str(getattr(sig, "liquidity_reason", "liquidity_false"))], sig)
                 _record_stage2_gate("liquidity", reasons or ["liquidity=False"])
                 _record_stage2_diag("liquidity", reasons)
                 rejection_samples.append(
@@ -6278,7 +6362,7 @@ def scan_intraday(
                 continue
             if liq.get("quote_source") == "none" or float(liq.get("quote_age_min", 999) or 999) > QUOTE_MAX_AGE_MIN:
                 rejection_counts["liquidity"] += 1
-                _merge_strategy_audit(_strategy_payload, "liquidity", ["stale_or_no_quote"])
+                _merge_and_queue(_strategy_payload, "liquidity", ["stale_or_no_quote"], sig)
                 _record_stage2_gate("liquidity", reasons or ["stale_or_no_quote"])
                 _record_stage2_diag("liquidity", reasons)
                 rejection_samples.append(
@@ -6290,7 +6374,7 @@ def scan_intraday(
             # لا يعيد حساب الوقف أو الأهداف ولا يغيّر سعر التحليل الأصلي (sig.price).
             execution = _final_execution_snapshot(sig.symbol, sig.price, quote_snapshot=liq)
             if not execution.get("ok"):
-                _merge_strategy_audit(_strategy_payload, "final_execution", [str(execution.get("reason", "final_execution_false"))])
+                _merge_and_queue(_strategy_payload, "final_execution", [str(execution.get("reason", "final_execution_false"))], sig)
                 _exec_reason = str(execution.get("reason", "unspecified") or "unspecified")
                 _exec_reasons = [f"reason:{_exec_reason}"]
                 if execution.get("quote_source") == "none":
@@ -6324,6 +6408,7 @@ def scan_intraday(
         stage2_gate_reasons=stage2_gate_reasons, stage2_gate_diag=stage2_gate_diag,
         data_stage1=stage1_data_audit_counts, data_stage2=data_stage2_audit,
         strategy_audit=strategy_audit_cycle,
+        outcome_events=rejection_outcome_events, outcome_resolved=rejection_outcome_resolved,
     )
     top_stage1 = sorted(cumulative_audit.get("stage1", {}).get("reasons", {}).items(), key=lambda x: x[1], reverse=True)[:8]
     top_stage2 = {gate: sorted(reasons.items(), key=lambda x: x[1], reverse=True)[:5]
