@@ -2944,6 +2944,7 @@ def analyze_daily(
     market_context: tuple[bool, str] | None = None,
     preloaded: tuple[pd.DataFrame, pd.DataFrame] | None = None,
     preloaded_volume_ratio: float | None = None,
+    preloaded_60m: pd.DataFrame | None = None,
 ) -> Optional[DailySignal]:
     from market_data import fetch_intraday
     from market_data import intraday_data_fresh
@@ -3004,7 +3005,11 @@ def analyze_daily(
     closed_end_pos = (len(today_d) + closed_idx) if closed_idx < 0 else closed_idx
     closed_prev_idx = closed_idx - 1 if abs(closed_idx) <= len(today_d) - 1 else -2
     try:
-        h4_60m = fetch_intraday(symbol, interval="60m", period="60d")
+        # Stage-2 performance hardening: the 60m structure is shared by the
+        # daily strategies and is preloaded in batch by scan_daily when Alpaca
+        # is available. This replaces one HTTP request per finalist with a
+        # bounded batch request, without changing any strategy condition.
+        h4_60m = preloaded_60m if preloaded_60m is not None else fetch_intraday(symbol, interval="60m", period="60d")
         ok_h4, h4_age_min = intraday_data_fresh(h4_60m, "60m", 240)
         if h4_60m is None:
             _daily_data_audit_record(symbol, "60m:h4_missing")
@@ -5716,6 +5721,49 @@ def scan_daily(
     results=[]
     stage2_scores = []
     _daily_source_dates={}
+
+    # Stage-2 performance hardening: make exactly ONE 60m batch attempt for
+    # the finalists. A partial batch is accepted as-is; only symbols missing
+    # from that response use the existing individual fallback inside
+    # analyze_daily(). If the batch call raises, there is NO second batch
+    # attempt: every finalist falls through to its normal individual path.
+    h4_60m_map: dict[str, pd.DataFrame] = {}
+    _stage2_60m_prefetch_started = time_module.monotonic()
+    _stage2_60m_batch_attempted = False
+    _stage2_60m_batch_failed = False
+    try:
+        from market_data import fetch_alpaca_bars_multi, alpaca_configured
+        if alpaca_configured() and finalists:
+            _stage2_60m_batch_attempted = True
+            _h4_start = datetime.now(timezone.utc) - timedelta(days=60 + 5)
+            _h4_end = datetime.now(timezone.utc)
+            h4_60m_map = fetch_alpaca_bars_multi(
+                [str(_it[2]).upper() for _it in finalists],
+                "1Hour", _h4_start, _h4_end, limit=1000, chunk_size=50,
+            ) or {}
+            h4_60m_map = {str(k).upper(): v for k, v in h4_60m_map.items()}
+            _missing_60m = [
+                str(_it[2]).upper() for _it in finalists
+                if str(_it[2]).upper() not in h4_60m_map
+            ]
+            log.info(
+                "DAILY STAGE 2 60M BATCH | requested=%d | received=%d | missing=%d | duration=%.1fs",
+                len(finalists), len(h4_60m_map), len(_missing_60m),
+                time_module.monotonic() - _stage2_60m_prefetch_started,
+            )
+            if _missing_60m:
+                log.info(
+                    "DAILY STAGE 2 60M INDIVIDUAL FALLBACK QUEUE | count=%d | symbols=%s",
+                    len(_missing_60m), ",".join(_missing_60m[:30]),
+                )
+    except Exception as _h4_batch_exc:
+        _stage2_60m_batch_failed = True
+        h4_60m_map = {}
+        log.warning(
+            "DAILY STAGE 2 60M BATCH FAILED ONCE | no_batch_retry=true | finalists=%d | individual_fallback=all | duration=%.1fs | %s",
+            len(finalists), time_module.monotonic() - _stage2_60m_prefetch_started,
+            str(_h4_batch_exc)[:220],
+        )
     for _it in finalists:
         try:
             _df=_it[4]; _daily_source_dates[str(_it[2]).upper()]=str(pd.Timestamp(_df.index[-1]).date()) if _df is not None and not _df.empty else ""
@@ -5789,6 +5837,10 @@ def scan_daily(
             return analyze_daily(
                 sym, names.get(sym,sym), True, market_context, (weekly,daily),
                 preloaded_volume_ratio=vol_ratio,
+                # Missing/failed batch data intentionally passes None here.
+                # analyze_daily() then performs its normal single-symbol
+                # 60m fallback for this symbol; no second batch is attempted.
+                preloaded_60m=h4_60m_map.get(str(sym).upper()),
             )
         except Exception as exc:
             log.warning("DAILY STAGE 2 EXCEPTION | %s | %s", sym, str(exc))
