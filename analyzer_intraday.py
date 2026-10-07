@@ -70,6 +70,8 @@ LEARNING_ALERT_FILE = Path("/var/data/intraday_learning_alert.json")
 
 # Diagnostic-only cumulative audit. Never participates in trading decisions.
 INTRADAY_AUDIT_FILE = Path("/var/data/intraday_audit_counters.json")
+INTRADAY_AUDIT_DETAIL_FILE = Path("/var/data/intraday_rejection_audit.jsonl")
+
 INTRADAY_AUDIT_SESSION = "20261007-AUDIT-V1"
 _AUDIT_LOCK = Lock()
 # Runtime-only bridge: analyze_intraday() records exact zero-match blockers so
@@ -416,6 +418,37 @@ def _load_intraday_audit() -> dict:
         log.warning("INTRADAY AUDIT LOAD FAILED | %s", str(exc))
         return base
 
+
+
+def _append_intraday_audit_detail(records) -> None:
+    """Persist detailed rejection/outcome evidence without retaining it in RAM.
+
+    Diagnostic-only. Any storage failure is swallowed so market scanning continues.
+    """
+    if not records:
+        return
+    try:
+        INTRADAY_AUDIT_DETAIL_FILE.parent.mkdir(parents=True, exist_ok=True)
+        with INTRADAY_AUDIT_DETAIL_FILE.open("a", encoding="utf-8") as fh:
+            for record in records:
+                fh.write(json.dumps(record, ensure_ascii=False, separators=(",", ":")) + "\n")
+    except Exception as exc:
+        log.warning("INTRADAY AUDIT DETAIL SAVE FAILED | %s", str(exc))
+
+
+def _compact_intraday_pending_event(ev):
+    """Keep only fields required for the 5-minute resolver; full evidence is on disk."""
+    return {
+        "id": str(ev.get("id", "")),
+        "created_at": str(ev.get("created_at", "")),
+        "due_at": str(ev.get("due_at", "")),
+        "symbol": str(ev.get("symbol", "")).upper(),
+        "strategy": str(ev.get("strategy", "")),
+        "stage": str(ev.get("stage", "")),
+        "gate": str(ev.get("gate", "")),
+        "entry_price": float(ev.get("entry_price", 0) or 0),
+    }
+
 def _save_intraday_audit(data: dict) -> None:
     try:
         INTRADAY_AUDIT_FILE.parent.mkdir(parents=True, exist_ok=True)
@@ -431,12 +464,34 @@ def _bump_reason(counter: dict[str, int], reason: str, amount: int = 1) -> None:
 
 
 def _queue_intraday_rejection(events, symbol, strategy, gate, entry_price, reasons=None, context_numeric=None, source="stage2"):
+    """Queue only compact resolver state; persist full evidence immediately.
+
+    Diagnostic-only. Full numeric evidence is written once to JSONL here so a
+    large Stage-2 rejection burst cannot duplicate every context_numeric dict in
+    the in-memory ``events`` list. Any audit I/O failure is swallowed.
+    """
     try:
         price=float(entry_price)
-        if not np.isfinite(price) or price<=0: return
+        if not np.isfinite(price) or price<=0:
+            return
         created=datetime.now(timezone.utc)
-        events.append({"id":f"{str(symbol).upper()}|{strategy}|{created.strftime('%Y%m%d%H%M%S%f')}","created_at":created.isoformat(),"due_at":(created+timedelta(minutes=5)).isoformat(),"symbol":str(symbol).upper(),"strategy":str(strategy),"stage":str(source),"gate":str(gate),"entry_price":round(price,6),"reasons":[str(x) for x in (reasons or []) if str(x)],"context_numeric":dict(context_numeric or {})})
-    except Exception: return
+        event_id=f"{str(symbol).upper()}|{strategy}|{created.strftime('%Y%m%d%H%M%S%f')}"
+        detail={
+            "id":event_id,
+            "created_at":created.isoformat(),
+            "due_at":(created+timedelta(minutes=5)).isoformat(),
+            "symbol":str(symbol).upper(),
+            "strategy":str(strategy),
+            "stage":str(source),
+            "gate":str(gate),
+            "entry_price":round(price,6),
+            "reasons":[str(x) for x in (reasons or []) if str(x)],
+            "context_numeric":dict(context_numeric or {}),
+        }
+        _append_intraday_audit_detail([{"type":"rejection","record":detail}])
+        events.append(_compact_intraday_pending_event(detail))
+    except Exception:
+        return
 
 def _resolve_intraday_rejection_outcomes(pending, frames, now_utc=None):
     now_utc=now_utc or datetime.now(timezone.utc); still=[]; resolved=[]
@@ -480,19 +535,26 @@ def _commit_intraday_audit(*, stage1_counts=None, stage1_passed=0, stage1_reject
             dst = st2.setdefault("diagnostic_reason_counts_by_gate", {}).setdefault(gate, {})
             for reason, count in reasons.items(): _bump_reason(dst, reason, count)
         ro=data.setdefault("rejection_outcomes", {"pending": [], "resolved": [], "summary": {}})
+        # Full rejection evidence is written at queue time. Only compact
+        # resolver state remains in RAM/main JSON.
         if outcome_events:
             ids={str(x.get("id")) for x in ro.get("pending",[]) if isinstance(x,dict)}
             for ev in outcome_events:
-                if str(ev.get("id")) not in ids: ro.setdefault("pending",[]).append(ev); ids.add(str(ev.get("id")))
+                eid=str(ev.get("id"))
+                if not eid or eid in ids:
+                    continue
+                ro.setdefault("pending",[]).append(_compact_intraday_pending_event(ev))
+                ids.add(eid)
         if outcome_resolved:
-            rid={str(x.get("id")) for x in outcome_resolved if isinstance(x,dict)}; ro["pending"]=[x for x in ro.get("pending",[]) if str(x.get("id")) not in rid]
-            old={str(x.get("id")) for x in ro.get("resolved",[]) if isinstance(x,dict)}
+            rid={str(x.get("id")) for x in outcome_resolved if isinstance(x,dict)}
+            ro["pending"]=[x for x in ro.get("pending",[]) if str(x.get("id")) not in rid]
             for ev in outcome_resolved:
-                if str(ev.get("id")) in old: continue
-                ro.setdefault("resolved",[]).append(ev); old.add(str(ev.get("id")))
-                key=f"{ev.get('strategy')}|{ev.get('gate')}"; sm=ro.setdefault("summary",{}).setdefault(key,{"count":0,"favorable":0,"unfavorable":0,"flat":0,"sum_return_pct":0.0}); sm["count"]+=1; sm[str(ev.get("outcome"))]=sm.get(str(ev.get("outcome")),0)+1; sm["sum_return_pct"]+=float(ev.get("return_pct",0) or 0)
-            ro["resolved"]=ro["resolved"][-5000:]
-        ro["pending"]=ro.get("pending",[])[-10000:]
+                _append_intraday_audit_detail([{"type":"outcome","record":ev}])
+                key=f"{ev.get('strategy')}|{ev.get('gate')}"
+                sm=ro.setdefault("summary",{}).setdefault(key,{"count":0,"favorable":0,"unfavorable":0,"flat":0,"sum_return_pct":0.0})
+                sm["count"]+=1; sm[str(ev.get("outcome"))]=sm.get(str(ev.get("outcome")),0)+1; sm["sum_return_pct"]+=float(ev.get("return_pct",0) or 0)
+        ro["resolved"] = []
+        ro["pending"] = ro.get("pending",[])[-2000:]
         data_audit = data.setdefault("data", {"stage1": {}, "stage2": {}, "timeframes": {}})
         for reason, count in (data_stage1 or {}).items():
             _bump_reason(data_audit.setdefault("stage1", {}), reason, count)
@@ -3292,6 +3354,28 @@ def analyze_intraday(
     # الدرجة وشروط الجودة والاستثناء الخاص بالسهم القوي.
     setup_market_permission = market_condition in {"قوي", "مختلط", "إيجابي_تحت_VWAP", "ضعيف"}
 
+    # بوابة السوق التمهيدية للـScore: السوق القوي مسموح مباشرة، والمختلط فقط
+    # إذا اجتاز شروطه التمهيدية. السوق الضعيف لا يأخذ مكافأة السوق قبل حسم
+    # استثناء السهم القوي بعد اكتمال الدرجة.
+    positive_below_vwap_ok = bool(
+        market_condition == "إيجابي_تحت_VWAP"
+        and trend_up
+        and live_ok
+        and (above_vwap if vwap_bounce else (above_vwap or breakout_now or orb_breakout or momentum_continuation or compression_expansion or liquidity_sweep or liquidity_displacement or bull_flag or resistance_reclaim or opening_drive_pullback or hod_reclaim or orb_failed_reclaim or abc_continuation or gap_setup or failed_breakdown_reclaim or rs_pullback or momentum_ignition))
+        and above_open
+        and m15_state != "معاكس"
+        and vol_session_ratio >= 0.90
+        and not dump
+        and not chop
+        and ext_tmp <= 4.5
+    )
+
+    market_permission = bool(
+        market_condition == "قوي"
+        or mixed_market_ok
+        or positive_below_vwap_ok
+    )
+
     failed = (
         float(today_5["High"].max()) >= level_high * 1.001
         and price < level_high * 0.997
@@ -4882,27 +4966,6 @@ def analyze_intraday(
 
 
     entry_emoji = "🟡" if entry_type == "إعادة اختبار" else "🟢"
-
-    # FIX: evaluate Positive-under-VWAP permission only after all structural
-    # strategy booleans have been computed. The previous placement referenced
-    # strategy locals before assignment and could raise UnboundLocalError.
-    positive_below_vwap_ok = bool(
-        market_condition == "إيجابي_تحت_VWAP"
-        and trend_up
-        and live_ok
-        and (above_vwap if vwap_bounce else (above_vwap or breakout_now or orb_breakout or momentum_continuation or compression_expansion or liquidity_sweep or liquidity_displacement or bull_flag or resistance_reclaim or opening_drive_pullback or hod_reclaim or orb_failed_reclaim or abc_continuation or gap_setup or failed_breakdown_reclaim or rs_pullback or momentum_ignition))
-        and above_open
-        and m15_state != "معاكس"
-        and vol_session_ratio >= 0.90
-        and not dump
-        and not chop
-        and ext_tmp <= 4.5
-    )
-    market_permission = bool(
-        market_condition == "قوي"
-        or mixed_market_ok
-        or positive_below_vwap_ok
-    )
 
     reasons: list[str] = []
     warnings: list[str] = []

@@ -38,6 +38,8 @@ SKIP_CLOSE_MIN = 0
 DAILY_MIN_SCORE = 82
 
 DAILY_AUDIT_FILE = Path("/var/data/daily_audit_counters.json")
+DAILY_AUDIT_DETAIL_FILE = Path("/var/data/daily_rejection_audit.jsonl")
+
 DAILY_AUDIT_SESSION = "20261007-AUDIT-V1"
 _DAILY_AUDIT_LOCK = Lock()
 # Runtime-only bridge: analyze_daily() records the exact zero-match blockers so
@@ -125,6 +127,38 @@ def _load_daily_audit() -> dict:
         log.warning("DAILY AUDIT LOAD FAILED | %s", str(exc))
         return base
 
+
+
+def _append_daily_audit_detail(records) -> None:
+    """Persist detailed rejection/outcome evidence without keeping it in RAM.
+
+    JSONL is append-only and diagnostic-only. A failure to write detail must never
+    stop Daily scanning, scoring, Stage 2, or Telegram alerts.
+    """
+    if not records:
+        return
+    try:
+        DAILY_AUDIT_DETAIL_FILE.parent.mkdir(parents=True, exist_ok=True)
+        with DAILY_AUDIT_DETAIL_FILE.open("a", encoding="utf-8") as fh:
+            for record in records:
+                fh.write(json.dumps(record, ensure_ascii=False, separators=(",", ":")) + "\n")
+    except Exception as exc:
+        log.warning("DAILY AUDIT DETAIL SAVE FAILED | %s", str(exc))
+
+
+def _compact_daily_pending_event(ev):
+    """Keep only fields required to resolve an outcome; full evidence is on disk."""
+    return {
+        "id": str(ev.get("id", "")),
+        "created_at": str(ev.get("created_at", "")),
+        "symbol": str(ev.get("symbol", "")).upper(),
+        "strategy": str(ev.get("strategy", "")),
+        "stage": str(ev.get("stage", "")),
+        "gate": str(ev.get("gate", "")),
+        "entry_price": float(ev.get("entry_price", 0) or 0),
+        "source_session_date": str(ev.get("source_session_date", "")),
+    }
+
 def _save_daily_audit(data: dict) -> None:
     try:
         DAILY_AUDIT_FILE.parent.mkdir(parents=True, exist_ok=True)
@@ -140,12 +174,34 @@ def _daily_bump(counter: dict[str, int], reason: str, amount: int = 1) -> None:
 
 
 def _queue_daily_rejection(events, symbol, strategy, gate, entry_price, source_date=None, reasons=None, context_numeric=None, source="stage2"):
+    """Queue only compact resolver state; persist full evidence immediately.
+
+    Diagnostic-only. Full numeric evidence is written once to JSONL here so a
+    large Stage-2 rejection burst cannot duplicate every context_numeric dict in
+    the in-memory ``events`` list. Any audit I/O failure is swallowed.
+    """
     try:
         price=float(entry_price)
-        if not np.isfinite(price) or price<=0: return
+        if not np.isfinite(price) or price<=0:
+            return
         created=datetime.now(timezone.utc)
-        events.append({"id":f"{str(symbol).upper()}|{strategy}|{created.strftime('%Y%m%d%H%M%S%f')}","created_at":created.isoformat(),"symbol":str(symbol).upper(),"strategy":str(strategy),"stage":str(source),"gate":str(gate),"entry_price":round(price,6),"source_session_date":str(source_date or ""),"reasons":[str(x) for x in (reasons or []) if str(x)],"context_numeric":dict(context_numeric or {})})
-    except Exception: return
+        event_id=f"{str(symbol).upper()}|{strategy}|{created.strftime('%Y%m%d%H%M%S%f')}"
+        detail={
+            "id":event_id,
+            "created_at":created.isoformat(),
+            "symbol":str(symbol).upper(),
+            "strategy":str(strategy),
+            "stage":str(source),
+            "gate":str(gate),
+            "entry_price":round(price,6),
+            "source_session_date":str(source_date or ""),
+            "reasons":[str(x) for x in (reasons or []) if str(x)],
+            "context_numeric":dict(context_numeric or {}),
+        }
+        _append_daily_audit_detail([{"type":"rejection","record":detail}])
+        events.append(_compact_daily_pending_event(detail))
+    except Exception:
+        return
 
 def _resolve_daily_rejection_outcomes(pending, daily_frames):
     """Resolve a Daily rejection against the CLOSE of the SAME trading session.
@@ -232,19 +288,26 @@ def _commit_daily_audit(*, stage1_counts=None, stage1_passed=0, stage1_rejected=
             for reason, count in reasons.items():
                 _daily_bump(dst, reason, count)
         ro=data.setdefault("rejection_outcomes", {"pending": [], "resolved": [], "summary": {}})
+        # Full rejection evidence is written at queue time. Only compact
+        # resolver state remains in RAM/main JSON.
         if outcome_events:
             ids={str(x.get("id")) for x in ro.get("pending",[]) if isinstance(x,dict)}
             for ev in outcome_events:
-                if str(ev.get("id")) not in ids: ro.setdefault("pending",[]).append(ev); ids.add(str(ev.get("id")))
+                eid=str(ev.get("id"))
+                if not eid or eid in ids:
+                    continue
+                ro.setdefault("pending",[]).append(_compact_daily_pending_event(ev))
+                ids.add(eid)
         if outcome_resolved:
-            rid={str(x.get("id")) for x in outcome_resolved if isinstance(x,dict)}; ro["pending"]=[x for x in ro.get("pending",[]) if str(x.get("id")) not in rid]
-            old={str(x.get("id")) for x in ro.get("resolved",[]) if isinstance(x,dict)}
+            rid={str(x.get("id")) for x in outcome_resolved if isinstance(x,dict)}
+            ro["pending"]=[x for x in ro.get("pending",[]) if str(x.get("id")) not in rid]
             for ev in outcome_resolved:
-                if str(ev.get("id")) in old: continue
-                ro.setdefault("resolved",[]).append(ev); old.add(str(ev.get("id")))
-                key=f"{ev.get('strategy')}|{ev.get('gate')}"; sm=ro.setdefault("summary",{}).setdefault(key,{"count":0,"favorable":0,"unfavorable":0,"flat":0,"sum_return_pct":0.0}); sm["count"]+=1; sm[str(ev.get("outcome"))]=sm.get(str(ev.get("outcome")),0)+1; sm["sum_return_pct"]+=float(ev.get("return_pct",0) or 0)
-            ro["resolved"]=ro["resolved"][-5000:]
-        ro["pending"]=ro.get("pending",[])[-10000:]
+                _append_daily_audit_detail([{"type":"outcome","record":ev}])
+                key=f"{ev.get('strategy')}|{ev.get('gate')}"
+                sm=ro.setdefault("summary",{}).setdefault(key,{"count":0,"favorable":0,"unfavorable":0,"flat":0,"sum_return_pct":0.0})
+                sm["count"]+=1; sm[str(ev.get("outcome"))]=sm.get(str(ev.get("outcome")),0)+1; sm["sum_return_pct"]+=float(ev.get("return_pct",0) or 0)
+        ro["resolved"] = []
+        ro["pending"] = ro.get("pending",[])[-2000:]
         data_audit = data.setdefault("data", {"stage1": {}, "stage2": {}, "timeframes": {}})
         for reason, count in (data_stage1 or {}).items():
             _daily_bump(data_audit.setdefault("stage1", {}), reason, count)
@@ -2944,7 +3007,6 @@ def analyze_daily(
     market_context: tuple[bool, str] | None = None,
     preloaded: tuple[pd.DataFrame, pd.DataFrame] | None = None,
     preloaded_volume_ratio: float | None = None,
-    preloaded_60m: pd.DataFrame | None = None,
 ) -> Optional[DailySignal]:
     from market_data import fetch_intraday
     from market_data import intraday_data_fresh
@@ -3005,11 +3067,7 @@ def analyze_daily(
     closed_end_pos = (len(today_d) + closed_idx) if closed_idx < 0 else closed_idx
     closed_prev_idx = closed_idx - 1 if abs(closed_idx) <= len(today_d) - 1 else -2
     try:
-        # Stage-2 performance hardening: the 60m structure is shared by the
-        # daily strategies and is preloaded in batch by scan_daily when Alpaca
-        # is available. This replaces one HTTP request per finalist with a
-        # bounded batch request, without changing any strategy condition.
-        h4_60m = preloaded_60m if preloaded_60m is not None else fetch_intraday(symbol, interval="60m", period="60d")
+        h4_60m = fetch_intraday(symbol, interval="60m", period="60d")
         ok_h4, h4_age_min = intraday_data_fresh(h4_60m, "60m", 240)
         if h4_60m is None:
             _daily_data_audit_record(symbol, "60m:h4_missing")
@@ -5721,49 +5779,6 @@ def scan_daily(
     results=[]
     stage2_scores = []
     _daily_source_dates={}
-
-    # Stage-2 performance hardening: make exactly ONE 60m batch attempt for
-    # the finalists. A partial batch is accepted as-is; only symbols missing
-    # from that response use the existing individual fallback inside
-    # analyze_daily(). If the batch call raises, there is NO second batch
-    # attempt: every finalist falls through to its normal individual path.
-    h4_60m_map: dict[str, pd.DataFrame] = {}
-    _stage2_60m_prefetch_started = time_module.monotonic()
-    _stage2_60m_batch_attempted = False
-    _stage2_60m_batch_failed = False
-    try:
-        from market_data import fetch_alpaca_bars_multi, alpaca_configured
-        if alpaca_configured() and finalists:
-            _stage2_60m_batch_attempted = True
-            _h4_start = datetime.now(timezone.utc) - timedelta(days=60 + 5)
-            _h4_end = datetime.now(timezone.utc)
-            h4_60m_map = fetch_alpaca_bars_multi(
-                [str(_it[2]).upper() for _it in finalists],
-                "1Hour", _h4_start, _h4_end, limit=1000, chunk_size=50,
-            ) or {}
-            h4_60m_map = {str(k).upper(): v for k, v in h4_60m_map.items()}
-            _missing_60m = [
-                str(_it[2]).upper() for _it in finalists
-                if str(_it[2]).upper() not in h4_60m_map
-            ]
-            log.info(
-                "DAILY STAGE 2 60M BATCH | requested=%d | received=%d | missing=%d | duration=%.1fs",
-                len(finalists), len(h4_60m_map), len(_missing_60m),
-                time_module.monotonic() - _stage2_60m_prefetch_started,
-            )
-            if _missing_60m:
-                log.info(
-                    "DAILY STAGE 2 60M INDIVIDUAL FALLBACK QUEUE | count=%d | symbols=%s",
-                    len(_missing_60m), ",".join(_missing_60m[:30]),
-                )
-    except Exception as _h4_batch_exc:
-        _stage2_60m_batch_failed = True
-        h4_60m_map = {}
-        log.warning(
-            "DAILY STAGE 2 60M BATCH FAILED ONCE | no_batch_retry=true | finalists=%d | individual_fallback=all | duration=%.1fs | %s",
-            len(finalists), time_module.monotonic() - _stage2_60m_prefetch_started,
-            str(_h4_batch_exc)[:220],
-        )
     for _it in finalists:
         try:
             _df=_it[4]; _daily_source_dates[str(_it[2]).upper()]=str(pd.Timestamp(_df.index[-1]).date()) if _df is not None and not _df.empty else ""
@@ -5837,10 +5852,6 @@ def scan_daily(
             return analyze_daily(
                 sym, names.get(sym,sym), True, market_context, (weekly,daily),
                 preloaded_volume_ratio=vol_ratio,
-                # Missing/failed batch data intentionally passes None here.
-                # analyze_daily() then performs its normal single-symbol
-                # 60m fallback for this symbol; no second batch is attempted.
-                preloaded_60m=h4_60m_map.get(str(sym).upper()),
             )
         except Exception as exc:
             log.warning("DAILY STAGE 2 EXCEPTION | %s | %s", sym, str(exc))
